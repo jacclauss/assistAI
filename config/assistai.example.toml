@@ -1,0 +1,45 @@
+# Agent definitions and tool ACLs.
+#
+# DESIGN ARTIFACT. Nothing here is loaded yet; the broker reads this in phase 3.
+# It is checked in now so the permission model is reviewable before any tool
+# exists to abuse. Copy to config/assistai.toml (gitignored) when phase 3 lands.
+
+[signal]
+# Dedicated bot number, never a personal one: signal-cli ignores messages from
+# its own account, so a personal number cannot text its own assistant.
+account = "+15555550100"
+dm_policy = "pairing"
+
+# Only these numbers are routed anywhere. Everyone else gets a pairing code.
+allow_from = ["+15555550101", "+15555550102"]
+
+[agents.jacob]
+binds_to = { channel = "signal", peer = "+15555550101" }
+reads = ["own", "shared"]
+writes = ["own", "shared:publish"]
+tools = []          # phase 5 adds: web_search, web_fetch
+
+[agents.spouse]
+binds_to = { channel = "signal", peer = "+15555550102" }
+reads = ["own", "shared"]
+writes = ["own", "shared:publish"]
+tools = []          # phase 5 adds: web_search, web_fetch
+
+[agents.organizer]
+binds_to = { channel = "signal", peer = "group:household" }
+reads = ["shared"]
+writes = ["shared"]
+tools = []
+# Deliberately never granted web access. This agent holds the broadest write
+# authority over household state, so it must never ingest untrusted content.
+web_access = false
+
+[broker]
+# Once an untrusted tool result enters a turn's scope, these sinks are refused
+# before execution rather than after.
+tainted_sinks_denied = ["shared:write", "shared:publish", "message:other_peer"]
+
+# Untrusted content is placed mid-prompt: models attend most strongly to the
+# head and tail of context, which is where injected instructions land hardest.
+untrusted_content_position = "middle"
+boundary_nonce = "per_process_random"

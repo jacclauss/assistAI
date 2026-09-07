@@ -1,0 +1,47 @@
+# Phase 1: the gateway plus Fireworks validation at startup.
+# Interactive chat runs on the host (`make chat`); the container is the daemon.
+#
+# Services arrive with their phases:
+#   phase 2  signal-cli   (bbernhard/signal-cli-rest-api, MODE=json-rpc)
+#   phase 5  searxng      + fetch/extract worker on an egress-restricted network
+#   phase 8  renderer     (headless Chromium, needs shm_size >= 1gb)
+
+name: assistai
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    image: assistai/gateway:local
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    networks:
+      - internal
+    volumes:
+      - gateway-state:/app/state
+      - ../manifest.toml:/app/manifest.toml:ro
+    # The gateway writes only to its state volume, so the rest of the
+    # filesystem can stay immutable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # No published ports. Nothing in this stack is reachable from the LAN;
+  # operator access is over SSH or a tailnet to loopback.
+  internal:
+    driver: bridge
+
+volumes:
+  gateway-state:

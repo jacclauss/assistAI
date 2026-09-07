@@ -1,0 +1,27 @@
+"""Typed failures. Messages must never include secrets."""
+
+from __future__ import annotations
+
+
+class AssistAIError(Exception):
+    """Base error for operator-facing failures."""
+
+
+class MissingAPIKeyError(AssistAIError):
+    """Fireworks credential is required for this command and was not set."""
+
+
+class ManifestError(AssistAIError):
+    """manifest.toml is missing, unreadable, or missing required pins."""
+
+
+class ModelNotAvailableError(AssistAIError):
+    """A pinned model ref is not callable on this Fireworks account."""
+
+
+class InferenceError(AssistAIError):
+    """The inference provider rejected or failed a request."""
+
+
+class ToolLoopError(AssistAIError):
+    """The agent loop could not complete a turn (malformed tools, round cap)."""

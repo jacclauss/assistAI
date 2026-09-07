@@ -1,0 +1,26 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Runtime state: agent stores, shared store, signal-cli account data
+state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Local config (config/assistai.example.toml is the tracked template)
+config/assistai.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
