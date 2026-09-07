@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 import assistai.__main__ as cli
@@ -28,6 +30,18 @@ def test_chat_once_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     cli.main(["chat", "--once", "ping", "--no-tools"])
 
     assert seen == [("ping", False)]
+
+
+def test_signal_health_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    async def fake_signal(args: argparse.Namespace) -> None:
+        seen.append(args.signal_command)
+
+    monkeypatch.setattr(cli, "_signal", fake_signal)
+    cli.main(["signal", "health"])
+
+    assert seen == ["health"]
 
 
 def test_assistai_error_exits_two(monkeypatch: pytest.MonkeyPatch) -> None:

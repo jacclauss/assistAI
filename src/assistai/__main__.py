@@ -11,6 +11,8 @@ from assistai.config import Settings
 from assistai.errors import AssistAIError
 from assistai.gateway import Gateway, install_signal_handlers
 from assistai.logging import configure_logging
+from assistai.signal.client import SignalClient
+from assistai.signal.numbers import normalize_e164
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -29,10 +31,24 @@ def main(argv: list[str] | None = None) -> None:
         help="do not advertise get_time; text-only completion",
     )
 
+    signal = sub.add_parser("signal", help="signal-cli setup and diagnostics")
+    signal_sub = signal.add_subparsers(dest="signal_command", required=True)
+    signal_sub.add_parser("health", help="check signal-cli and list accounts")
+    signal_sub.add_parser("link", help="print a device-link URI to scan from Signal")
+    register = signal_sub.add_parser("register", help="start SMS/voice registration")
+    register.add_argument("number", help="dedicated bot number in E.164")
+    register.add_argument("--captcha", default=None, help="token from signalcaptchas.org")
+    register.add_argument("--voice", action="store_true", help="call instead of SMS")
+    verify = signal_sub.add_parser("verify", help="complete registration with the SMS code")
+    verify.add_argument("number", help="dedicated bot number in E.164")
+    verify.add_argument("code", help="verification code")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "chat":
             asyncio.run(_chat(args.once, use_tools=not args.no_tools))
+        elif args.command == "signal":
+            asyncio.run(_signal(args))
         else:
             asyncio.run(_gateway())
     except AssistAIError as exc:
@@ -55,6 +71,42 @@ async def _chat(once: str | None, *, use_tools: bool) -> None:
         await chat_once(settings, once, use_tools=use_tools)
         return
     await chat_repl(settings, use_tools=use_tools)
+
+
+async def _signal(args: argparse.Namespace) -> None:
+    settings = Settings()
+    configure_logging(level=settings.log_level, console=True)
+    client = SignalClient(settings)
+    try:
+        if args.signal_command == "health":
+            await client.check()
+            accounts = await client.accounts()
+            print("signal-cli ok")
+            if accounts:
+                print("accounts: " + ", ".join(accounts))
+            else:
+                print("accounts: (none registered)")
+            return
+        if args.signal_command == "link":
+            uri = await client.link_uri(settings.signal_device_name)
+            print(uri)
+            print(
+                "Scan from Signal: Settings → Linked devices → Link new device.",
+                file=sys.stderr,
+            )
+            return
+        if args.signal_command == "register":
+            number = normalize_e164(args.number)
+            await client.register(number, captcha=args.captcha, voice=args.voice)
+            print(f"verification code sent to {number}")
+            return
+        if args.signal_command == "verify":
+            number = normalize_e164(args.number)
+            await client.verify(number, args.code)
+            print(f"registered {number}")
+            return
+    finally:
+        await client.aclose()
 
 
 if __name__ == "__main__":

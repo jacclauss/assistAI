@@ -1,8 +1,7 @@
 """The gateway daemon.
 
-Phase 0 implements the process lifecycle only: start, heartbeat, and graceful
-shutdown. Channel connections, agent routing, and the tool broker attach here in
-later phases.
+Owns process lifecycle, Fireworks validation, and the Signal receive loop.
+Agent routing and the tool broker attach here in phase 3.
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from typing import Protocol
 
 import structlog
 
@@ -17,12 +17,20 @@ from assistai import __version__
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
+from assistai.signal.channel import SignalChannel
+from assistai.signal.client import SignalClient, SignalTransport
+from assistai.signal.policy import AccessPolicy
+
+
+class ChannelRunner(Protocol):
+    async def run(self, stop: asyncio.Event) -> None: ...
+
 
 log = structlog.get_logger(__name__)
 
 
 class Gateway:
-    """Long-lived process that will own channel connections, routing, and policy."""
+    """Long-lived process that owns channel connections, routing, and policy."""
 
     def __init__(
         self,
@@ -30,10 +38,17 @@ class Gateway:
         *,
         client: FireworksClient | None = None,
         manifest: Manifest | None = None,
+        signal: SignalTransport | None = None,
+        channel: ChannelRunner | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
+        self._owns_client = client is None
         self._manifest = manifest
+        self._signal = signal
+        self._owns_signal = signal is None
+        self._channel = channel
+        self._channel_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
         self._beats = 0
         self.validated_refs: tuple[str, ...] = ()
@@ -58,8 +73,11 @@ class Gateway:
         )
         try:
             await self._validate_models()
+            await self._start_signal()
             await self._heartbeat_loop()
         finally:
+            await self._stop_signal()
+            await self._close_owned()
             log.info("gateway.stopped", beats=self._beats)
 
     async def _validate_models(self) -> None:
@@ -67,25 +85,78 @@ class Gateway:
         if self._settings.fireworks_api_key is None:
             log.warning("gateway.skip_model_validation", reason="no_api_key")
             return
-        owns_client = self._client is None
-        client = self._client or FireworksClient(self._settings)
+        if self._client is None:
+            self._client = FireworksClient(self._settings)
+            self._owns_client = True
         manifest = self._manifest or load_manifest(resolve_manifest_path(self._settings))
+        self._manifest = manifest
         refs = manifest.required_refs()
-        try:
-            await client.validate(refs)
-        finally:
-            if owns_client:
-                await client.aclose()
+        await self._client.validate(refs)
         self.validated_refs = refs
         log.info("gateway.models_validated", refs=list(refs))
+
+    async def _start_signal(self) -> None:
+        if self._settings.signal_account is None:
+            log.info("gateway.skip_signal", reason="no_account")
+            return
+        if self._channel is None:
+            if self._signal is None:
+                self._signal = SignalClient(self._settings)
+                self._owns_signal = True
+            await self._signal.wait_until_healthy(
+                self._settings.signal_startup_timeout_seconds, self._shutdown
+            )
+            await self._signal.check()
+            if not self._settings.allow_from:
+                log.warning(
+                    "gateway.signal_allowlist_empty",
+                    reason="set ASSISTAI_SIGNAL_ALLOW_FROM to approve pairing codes",
+                )
+            policy = AccessPolicy(
+                self._settings.allow_from,
+                persist_path=self._settings.state_dir / "signal-allowlist.json",
+                pairing_ttl_seconds=self._settings.signal_pairing_ttl_seconds,
+            )
+            self._channel = SignalChannel(
+                self._settings,
+                self._signal,
+                policy=policy,
+                fireworks=self._client,
+                manifest=self._manifest,
+            )
+        self._channel_task = asyncio.create_task(self._run_channel(self._channel))
+        log.info("gateway.signal_started", account=self._settings.signal_account)
+
+    async def _run_channel(self, channel: ChannelRunner) -> None:
+        try:
+            await channel.run(self._shutdown)
+        except Exception:
+            log.exception("signal.channel_failed")
+            self.request_shutdown("signal_channel_failed")
+
+    async def _stop_signal(self) -> None:
+        if self._channel_task is None:
+            return
+        self._shutdown.set()
+        try:
+            await asyncio.wait_for(self._channel_task, timeout=5)
+        except TimeoutError:
+            self._channel_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._channel_task
+        self._channel_task = None
+
+    async def _close_owned(self) -> None:
+        if self._owns_signal and self._signal is not None:
+            await self._signal.aclose()
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
 
     async def _heartbeat_loop(self) -> None:
         interval = self._settings.heartbeat_seconds
         while not self._shutdown.is_set():
             self._beats += 1
             log.info("gateway.heartbeat", beat=self._beats)
-            # Returns early when shutdown fires, so SIGTERM does not wait out
-            # the full interval.
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
 

@@ -16,6 +16,10 @@ def test_defaults_are_conservative() -> None:
     assert settings.max_tokens == 2048
     assert settings.max_tool_rounds == 4
     assert settings.manifest_path is None
+    assert settings.signal_account is None
+    assert settings.allow_from == ()
+    assert settings.signal_dm_policy == "pairing"
+    assert settings.signal_base_url == "http://signal-cli:8080"
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,3 +60,20 @@ def test_unknown_log_level_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_nonpositive_heartbeat_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(heartbeat_seconds=0)
+
+
+def test_signal_allow_from_parses_csv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASSISTAI_SIGNAL_ACCOUNT", "+1 (555) 555-0100")
+    monkeypatch.setenv("ASSISTAI_SIGNAL_ALLOW_FROM", "+15555550101, +1-555-555-0102")
+
+    settings = Settings()
+
+    assert settings.signal_account == "+15555550100"
+    assert settings.allow_from == ("+15555550101", "+15555550102")
+
+
+def test_invalid_signal_account_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASSISTAI_SIGNAL_ACCOUNT", "not-a-number")
+
+    with pytest.raises(ValidationError):
+        Settings()

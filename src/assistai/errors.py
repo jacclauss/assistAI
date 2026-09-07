@@ -25,3 +25,11 @@ class InferenceError(AssistAIError):
 
 class ToolLoopError(AssistAIError):
     """The agent loop could not complete a turn (malformed tools, round cap)."""
+
+
+class SignalError(AssistAIError):
+    """The signal-cli REST API rejected a request or is misconfigured."""
+
+
+class SignalUnavailableError(SignalError):
+    """signal-cli did not respond, or the configured account is not registered."""

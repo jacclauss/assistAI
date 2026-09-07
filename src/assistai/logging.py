@@ -20,6 +20,7 @@ def configure_logging(level: LogLevel = "info", console: bool = False) -> None:
     # httpx logs every request at INFO; that is noise in the REPL and on the Pi.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
 
     renderer: structlog.typing.Processor = (
         structlog.dev.ConsoleRenderer() if console else structlog.processors.JSONRenderer()

@@ -1,10 +1,14 @@
-# Phase 1: the gateway plus Fireworks validation at startup.
-# Interactive chat runs on the host (`make chat`); the container is the daemon.
+# Phase 2: gateway + signal-cli on a private network. No published ports.
 #
-# Services arrive with their phases:
-#   phase 2  signal-cli   (bbernhard/signal-cli-rest-api, MODE=json-rpc)
-#   phase 5  searxng      + fetch/extract worker on an egress-restricted network
-#   phase 8  renderer     (headless Chromium, needs shm_size >= 1gb)
+# First-time Signal setup (link or register) runs through the gateway image so
+# it can reach signal-cli without exposing 8080 on the LAN:
+#   make signal-link
+# Host-mode (`make run` talking to signal-cli) uses docker/compose.dev.yml,
+# which binds 8080 to 127.0.0.1 only.
+#
+# Later services:
+#   phase 5  searxng + fetch/extract on an egress-restricted network
+#   phase 8  renderer (headless Chromium, needs shm_size >= 1gb)
 
 name: assistai
 
@@ -15,18 +19,51 @@ services:
       dockerfile: docker/gateway.Dockerfile
     image: assistai/gateway:local
     restart: unless-stopped
+    depends_on:
+      signal-cli:
+        condition: service_healthy
     env_file:
       - ../.env
+    environment:
+      ASSISTAI_SIGNAL_BASE_URL: http://signal-cli:8080
+      ASSISTAI_STATE_DIR: /app/state
+      ASSISTAI_MANIFEST_PATH: /app/manifest.toml
     networks:
       - internal
     volumes:
       - gateway-state:/app/state
       - ../manifest.toml:/app/manifest.toml:ro
-    # The gateway writes only to its state volume, so the rest of the
-    # filesystem can stay immutable.
     read_only: true
     tmpfs:
       - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:0.100
+    restart: unless-stopped
+    environment:
+      MODE: json-rpc
+    volumes:
+      - signal-cli-config:/home/.local/share/signal-cli
+    networks:
+      - internal
+    # json-rpc mode boots the JVM before it listens. start_period covers that
+    # so the gateway is not started against a socket that is not up yet.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    # Writes account keys to the volume; do not make this service read-only.
     cap_drop:
       - ALL
     security_opt:
@@ -45,3 +82,4 @@ networks:
 
 volumes:
   gateway-state:
+  signal-cli-config:

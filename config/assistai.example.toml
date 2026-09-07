@@ -5,12 +5,18 @@
 # exists to abuse. Copy to config/assistai.toml (gitignored) when phase 3 lands.
 
 [signal]
+# Phase 2 reads these from the environment (ASSISTAI_SIGNAL_*), not this file.
+# They stay here so the permission model is reviewable in one place. Phase 3
+# will load the agent bindings from a copied config/assistai.toml.
+#
 # Dedicated bot number, never a personal one: signal-cli ignores messages from
 # its own account, so a personal number cannot text its own assistant.
 account = "+15555550100"
 dm_policy = "pairing"
 
-# Only these numbers are routed anywhere. Everyone else gets a pairing code.
+# Operators. Only these numbers are routed anywhere by default, and only these
+# may approve a pairing code with /approve NNNNNN. A number admitted through
+# pairing can reach its agent but cannot admit anyone else.
 allow_from = ["+15555550101", "+15555550102"]
 
 [agents.jacob]

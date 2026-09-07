@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose -f docker/docker-compose.yml
+COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yml
 
 .PHONY: help
 help: ## List targets
@@ -53,8 +54,12 @@ build: ## Build the gateway image for this machine
 	$(COMPOSE) build
 
 .PHONY: up
-up: ## Start the stack
+up: ## Start the stack (no published ports)
 	$(COMPOSE) up -d
+
+.PHONY: up-dev
+up-dev: ## Start the stack with signal-cli on 127.0.0.1:8080
+	$(COMPOSE_DEV) up -d
 
 .PHONY: down
 down: ## Stop the stack
@@ -63,6 +68,18 @@ down: ## Stop the stack
 .PHONY: logs
 logs: ## Follow gateway logs
 	$(COMPOSE) logs -f gateway
+
+.PHONY: logs-signal
+logs-signal: ## Follow signal-cli logs
+	$(COMPOSE) logs -f signal-cli
+
+.PHONY: signal-link
+signal-link: ## Print a device-link URI (scan from Signal on your phone)
+	$(COMPOSE) run --rm gateway python -m assistai signal link
+
+.PHONY: signal-health
+signal-health: ## Check signal-cli from inside the compose network
+	$(COMPOSE) run --rm gateway python -m assistai signal health
 
 .PHONY: build-pi
 build-pi: ## Build the arm64 image for the Raspberry Pi

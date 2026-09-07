@@ -17,7 +17,7 @@ import structlog
 from assistai.config import Settings
 from assistai.errors import InferenceError, MissingAPIKeyError, ModelNotAvailableError
 from assistai.inference.sse import DONE, SSEBuffer, parse_sse_json
-from assistai.inference.types import Completion, Message, TextDelta, ToolCall, ToolSpec
+from assistai.inference.types import Completion, Message, TextDelta, ToolCall, ToolSpec, Usage
 from assistai.manifest import ModelPin
 
 log = structlog.get_logger(__name__)
@@ -69,11 +69,14 @@ class FireworksClient:
             "max_tokens": 1,
             "stream": False,
         }
-        response = await self._http.post(
-            f"{self._settings.fireworks_base_url.rstrip('/')}/chat/completions",
-            headers=self._headers(),
-            json=payload,
-        )
+        try:
+            response = await self._http.post(
+                f"{self._settings.fireworks_base_url.rstrip('/')}/chat/completions",
+                headers=self._headers(),
+                json=payload,
+            )
+        except httpx.HTTPError as exc:
+            raise InferenceError(f"Fireworks is unreachable ({type(exc).__name__})") from exc
         if response.status_code == 404:
             raise ModelNotAvailableError(f"Fireworks does not serve {ref}")
         if response.status_code in {401, 403}:
@@ -94,30 +97,39 @@ class FireworksClient:
             "model": pin.ref,
             "messages": [message.to_openai() for message in messages],
             "max_tokens": self._settings.max_tokens,
-            "temperature": 0.2,
+            "temperature": self._settings.temperature,
             "stream": True,
+            # Ask for a final usage frame so spend is observable per turn.
+            "stream_options": {"include_usage": True},
         }
         if tools:
             body["tools"] = [tool.to_openai() for tool in tools]
         if pin.thinking:
             body["thinking"] = {"type": pin.thinking}
 
-        response = await self._http.post(
-            f"{self._settings.fireworks_base_url.rstrip('/')}/chat/completions",
-            headers=self._headers(),
-            json=body,
-        )
-        if response.status_code >= 400:
-            if response.status_code in {401, 403}:
-                raise InferenceError("Fireworks rejected the API key")
-            if response.status_code == 404:
-                raise ModelNotAvailableError(f"Fireworks does not serve {pin.ref}")
-            raise InferenceError(_http_error(response))
-
+        url = f"{self._settings.fireworks_base_url.rstrip('/')}/chat/completions"
         try:
-            return await _accumulate_stream(response, on_delta=on_delta)
-        except ValueError as exc:
-            raise InferenceError(str(exc)) from exc
+            # A streaming request, not a buffered post: on_delta must fire as
+            # tokens arrive, and the read timeout should apply per chunk rather
+            # than to the whole generation.
+            async with self._http.stream(
+                "POST", url, headers=self._headers(), json=body
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    if response.status_code in {401, 403}:
+                        raise InferenceError("Fireworks rejected the API key")
+                    if response.status_code == 404:
+                        raise ModelNotAvailableError(f"Fireworks does not serve {pin.ref}")
+                    raise InferenceError(_http_error(response))
+                try:
+                    return await _accumulate_stream(response, on_delta=on_delta)
+                except ValueError as exc:
+                    raise InferenceError(str(exc)) from exc
+        except httpx.HTTPError as exc:
+            # Timeouts and dropped connections are the common failure on a home
+            # network. Speak AssistAIError so callers can fall back.
+            raise InferenceError(f"Fireworks is unreachable ({type(exc).__name__})") from exc
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -170,72 +182,92 @@ def _http_error(response: httpx.Response) -> str:
     return f"Fireworks HTTP {response.status_code}: {body}"
 
 
+class _StreamState:
+    """Mutable accumulator threaded through the SSE frames of one response."""
+
+    def __init__(self) -> None:
+        self.content: list[str] = []
+        self.tools: dict[int, dict[str, str]] = {}
+        self.finish_reason: str | None = None
+        self.usage: Usage | None = None
+
+
 async def _accumulate_stream(
     response: httpx.Response,
     *,
     on_delta: DeltaCallback | None,
 ) -> Completion:
     buffer = SSEBuffer()
-    content_parts: list[str] = []
-    tool_acc: dict[int, dict[str, str]] = {}
-    finish_reason: str | None = None
+    state = _StreamState()
 
     async for chunk in response.aiter_text():
-        stop, finish_reason = _ingest(
-            buffer, chunk, content_parts, tool_acc, on_delta, finish_reason
-        )
-        if stop:
-            return _finish(content_parts, tool_acc, finish_reason)
-    _ingest(buffer, None, content_parts, tool_acc, on_delta, finish_reason)
-    return _finish(content_parts, tool_acc, finish_reason)
+        if _ingest(buffer, chunk, state, on_delta):
+            return _finish(state)
+    _ingest(buffer, None, state, on_delta)
+    return _finish(state)
 
 
 def _ingest(
     buffer: SSEBuffer,
     chunk: str | None,
-    content_parts: list[str],
-    tool_acc: dict[int, dict[str, str]],
+    state: _StreamState,
     on_delta: DeltaCallback | None,
-    finish_reason: str | None,
-) -> tuple[bool, str | None]:
+) -> bool:
     payloads = buffer.push(chunk) if chunk is not None else buffer.flush()
     for payload in payloads:
         if payload == DONE:
-            return True, finish_reason
+            return True
         event = parse_sse_json(payload)
         if event is None:
             continue
-        finish_reason = _apply_event(event, content_parts, tool_acc, on_delta) or finish_reason
-    return False, finish_reason
+        _apply_event(event, state, on_delta)
+    return False
 
 
 def _apply_event(
     event: dict[str, Any],
-    content_parts: list[str],
-    tool_acc: dict[int, dict[str, str]],
+    state: _StreamState,
     on_delta: DeltaCallback | None,
-) -> str | None:
+) -> None:
     error = event.get("error")
     if isinstance(error, dict):
         message = error.get("message", "provider error")
         raise InferenceError(f"Fireworks stream error: {message}")
+    usage = _parse_usage(event.get("usage"))
+    if usage is not None:
+        state.usage = usage
     choices = event.get("choices")
+    # The usage frame carries an empty choices list; that is not an error.
     if not isinstance(choices, list) or not choices:
-        return None
+        return
     choice = choices[0]
     if not isinstance(choice, dict):
-        return None
+        return
     delta = choice.get("delta") or {}
     if isinstance(delta, dict):
         text = delta.get("content")
         # reasoning_content is ignored on purpose: thinking must not leak to the user.
         if isinstance(text, str) and text:
-            content_parts.append(text)
+            state.content.append(text)
             if on_delta is not None:
                 on_delta(TextDelta(text=text))
-        _accumulate_tool_deltas(delta.get("tool_calls"), tool_acc)
+        _accumulate_tool_deltas(delta.get("tool_calls"), state.tools)
     reason = choice.get("finish_reason")
-    return reason if isinstance(reason, str) else None
+    if isinstance(reason, str):
+        state.finish_reason = reason
+
+
+def _parse_usage(raw: object) -> Usage | None:
+    if not isinstance(raw, dict):
+        return None
+    prompt = raw.get("prompt_tokens")
+    completion = raw.get("completion_tokens")
+    if not isinstance(prompt, int) and not isinstance(completion, int):
+        return None
+    return Usage(
+        prompt_tokens=prompt if isinstance(prompt, int) else 0,
+        completion_tokens=completion if isinstance(completion, int) else 0,
+    )
 
 
 def _accumulate_tool_deltas(deltas: object, tool_acc: dict[int, dict[str, str]]) -> None:
@@ -262,14 +294,10 @@ def _accumulate_tool_deltas(deltas: object, tool_acc: dict[int, dict[str, str]])
             slot["arguments"] += arguments
 
 
-def _finish(
-    content_parts: list[str],
-    tool_acc: dict[int, dict[str, str]],
-    finish_reason: str | None,
-) -> Completion:
+def _finish(state: _StreamState) -> Completion:
     calls: list[ToolCall] = []
-    for index in sorted(tool_acc):
-        slot = tool_acc[index]
+    for index in sorted(state.tools):
+        slot = state.tools[index]
         if not slot["name"]:
             raise InferenceError(f"streamed tool call {index} is missing a name")
         if not slot["id"]:
@@ -278,7 +306,12 @@ def _finish(
         calls.append(
             ToolCall(id=slot["id"], name=slot["name"], arguments=slot["arguments"] or "{}")
         )
-    return Completion(content="".join(content_parts), tool_calls=calls, finish_reason=finish_reason)
+    return Completion(
+        content="".join(state.content),
+        tool_calls=calls,
+        finish_reason=state.finish_reason,
+        usage=state.usage,
+    )
 
 
 def _assert_json_object(arguments: str, index: int) -> None:

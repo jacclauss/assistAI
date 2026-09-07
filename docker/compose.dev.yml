@@ -1,0 +1,9 @@
+# Local-only overlay. Binds signal-cli to loopback so `make run` on the host
+# can talk to it. Do not use this file on the Pi.
+#
+#   docker compose -f docker/docker-compose.yml -f docker/compose.dev.yml up -d
+
+services:
+  signal-cli:
+    ports:
+      - "127.0.0.1:8080:8080"

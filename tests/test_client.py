@@ -4,6 +4,11 @@ import json
 
 import httpx
 import pytest
+
+from assistai.config import Settings
+from assistai.errors import InferenceError, MissingAPIKeyError, ModelNotAvailableError
+from assistai.inference.client import FireworksClient
+from assistai.inference.types import Message
 from tests.fakes import (
     PRIMARY,
     QUARANTINE,
@@ -17,11 +22,6 @@ from tests.fakes import (
     text_event,
     tool_event,
 )
-
-from assistai.config import Settings
-from assistai.errors import InferenceError, MissingAPIKeyError, ModelNotAvailableError
-from assistai.inference.client import FireworksClient
-from assistai.inference.types import Message
 
 
 def test_missing_key_fails_closed() -> None:
@@ -187,4 +187,88 @@ async def test_stream_error_object() -> None:
     with pytest.raises(InferenceError, match="overloaded"):
         await client.complete(pin(), [Message(role="user", content="hi")])
 
+    await client.aclose()
+
+
+async def test_timeout_becomes_inference_error() -> None:
+    """Transport failures must speak AssistAIError so callers can fall back."""
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("too slow")
+
+    client = client_for(handler)
+    with pytest.raises(InferenceError, match="unreachable"):
+        await client.complete(pin(), [Message(role="user", content="hi")])
+    await client.aclose()
+
+
+async def test_connect_error_becomes_inference_error() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route")
+
+    client = client_for(handler)
+    with pytest.raises(InferenceError, match="unreachable"):
+        await client.complete(pin(), [Message(role="user", content="hi")])
+    await client.aclose()
+
+
+async def test_probe_transport_failure_becomes_inference_error() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route")
+
+    client = client_for(handler)
+    with pytest.raises(InferenceError, match="unreachable"):
+        await client.probe(PRIMARY)
+    await client.aclose()
+
+
+async def test_transport_error_does_not_echo_key() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("failed talking to host with key fw-secret")
+
+    client = client_for(handler)
+    with pytest.raises(InferenceError) as exc:
+        await client.complete(pin(), [Message(role="user", content="hi")])
+
+    assert "fw-secret" not in str(exc.value)
+    await client.aclose()
+
+
+async def test_usage_frame_is_captured() -> None:
+    """The final usage frame has an empty choices list; it must not be an error."""
+    client = client_for(
+        lambda _req: completion_stream(
+            text_event("ok", finish="stop"),
+            {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}},
+        )
+    )
+
+    result = await client.complete(pin(), [Message(role="user", content="hi")])
+
+    assert result.content == "ok"
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 11
+    assert result.usage.completion_tokens == 7
+    assert result.usage.total_tokens == 18
+    await client.aclose()
+
+
+async def test_usage_absent_when_provider_omits_it() -> None:
+    client = client_for(lambda _req: completion_stream(text_event("ok", finish="stop")))
+
+    result = await client.complete(pin(), [Message(role="user", content="hi")])
+
+    assert result.usage is None
+    await client.aclose()
+
+
+async def test_request_asks_for_usage_and_honors_temperature() -> None:
+    handler, seen = recorded(lambda _req: completion_stream(text_event("ok", finish="stop")))
+    client = client_for(handler, temperature=0.7)
+
+    await client.complete(pin(), [Message(role="user", content="hi")])
+
+    body = json.loads(seen[-1].content)
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["temperature"] == 0.7
     await client.aclose()

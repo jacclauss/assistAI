@@ -5,17 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from assistai.config import Settings
+from assistai.conversation import SYSTEM_PROMPT, last_assistant_text
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
 from assistai.inference.tools import default_registry
 from assistai.inference.types import Message, TextDelta
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
-
-SYSTEM_PROMPT = (
-    "You are AssistAI, a concise household assistant. "
-    "Use tools when they help answer the question. "
-    "Do not invent tool results."
-)
 
 
 async def chat_once(
@@ -51,7 +46,7 @@ async def chat_once(
         if owns_client:
             await client.aclose()
     write("\n")
-    return _last_assistant_text(messages)
+    return last_assistant_text(messages)
 
 
 async def chat_repl(
@@ -110,10 +105,3 @@ def _printer(write: Callable[[str], None]) -> Callable[[TextDelta], None]:
         write(delta.text)
 
     return on_delta
-
-
-def _last_assistant_text(messages: list[Message]) -> str:
-    for message in reversed(messages):
-        if message.role == "assistant" and not message.tool_calls:
-            return message.content or ""
-    return ""

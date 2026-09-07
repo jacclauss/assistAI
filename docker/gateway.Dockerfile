@@ -39,7 +39,9 @@ COPY --from=builder --chown=assistai:assistai /app/manifest.toml /app/manifest.t
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    ASSISTAI_MANIFEST_PATH=/app/manifest.toml
+    ASSISTAI_MANIFEST_PATH=/app/manifest.toml \
+    ASSISTAI_STATE_DIR=/app/state \
+    ASSISTAI_SIGNAL_BASE_URL=http://signal-cli:8080
 
 USER assistai
 

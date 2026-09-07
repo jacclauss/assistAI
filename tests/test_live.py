@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from assistai.chat import chat_once
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
+from assistai.inference.types import Message
 from assistai.manifest import load_manifest
 
 pytestmark = pytest.mark.live
@@ -62,3 +63,20 @@ async def test_validate_pinned_refs(live_settings: Settings, repo_root: Path) ->
         await client.validate(manifest.required_refs())
     finally:
         await client.aclose()
+
+
+async def test_provider_reports_token_usage(live_settings: Settings, repo_root: Path) -> None:
+    """stream_options must actually yield usage, or spend is invisible."""
+    manifest = load_manifest(repo_root / "manifest.toml")
+    client = FireworksClient(live_settings)
+    try:
+        completion = await client.complete(
+            manifest.primary,
+            [Message(role="user", content="Say hi.")],
+        )
+    finally:
+        await client.aclose()
+
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens > 0
+    assert completion.usage.total_tokens >= completion.usage.prompt_tokens

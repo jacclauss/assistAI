@@ -39,6 +39,13 @@ async def run_turn(
     rounds = 0
     while True:
         completion = await client.complete(pin, messages, tools, on_delta=on_delta)
+        if completion.usage is not None:
+            log.info(
+                "inference.usage",
+                model=pin.ref,
+                prompt_tokens=completion.usage.prompt_tokens,
+                completion_tokens=completion.usage.completion_tokens,
+            )
         assistant = Message(
             role="assistant",
             content=completion.content or None,

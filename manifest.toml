@@ -17,14 +17,15 @@ platforms = ["linux/amd64", "linux/arm64"]
 notes = "Base for the gateway image."
 
 [images.signal_cli]
-ref = "bbernhard/signal-cli-rest-api:latest"
+ref = "bbernhard/signal-cli-rest-api:0.100"
 digest = ""
 platforms = ["linux/amd64", "linux/arm64"]
 priority = "high"
 notes = """
 Phase 2. Must run with MODE=json-rpc for real-time receive; MODE=normal makes
 /v1/about look healthy while the receive WebSocket fails to upgrade.
-High priority for updates: upstream warns old signal-cli releases break as
+Pinned to 0.100 (2026-06-11), not latest: the update watcher will flag newer
+releases. High priority because upstream warns old signal-cli builds break as
 Signal's server APIs change.
 """
 

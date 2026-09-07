@@ -13,15 +13,16 @@ reasoning behind it.
 
 ## Status
 
-Phase 1 of 8. The gateway validates pinned Fireworks models at startup. A
-terminal REPL holds a multi-turn conversation, including a side-effect-free
-`get_time` tool so the tool-call loop can be exercised.
+Phase 2 of 8. The gateway validates pinned Fireworks models at startup and, when
+a bot number is configured, receives Signal DMs and replies. Unknown senders
+never reach the model: they get a pairing code that an already-allowed phone
+approves with `/approve NNNNNN`.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
 | 0 | Skeleton: packaging, container, logging, tests | done |
 | 1 | Fireworks inference loop | done |
-| 2 | Signal channel | |
+| 2 | Signal channel | done |
 | 3 | Three agents and the tool broker | |
 | 4 | Shared store with ACLs | |
 | 5 | Research tools: search, fetch, extract | |
@@ -50,9 +51,51 @@ Containerized:
 ```bash
 make lock                 # required before the first image build
 make build
-make up
+make up                   # gateway + signal-cli, no published ports
 make logs                 # ctrl-c to detach; `make down` to stop
 ```
+
+### Signal setup
+
+Use a dedicated bot number, never a personal one. `signal-cli` ignores messages
+from its own account, so a personal number cannot text its own assistant.
+
+1. Start the stack (`make up` or `make up-dev`).
+2. Link the container as a device of that number, from inside the compose
+   network so 8080 stays off the LAN:
+
+   ```bash
+   make signal-link
+   ```
+
+   Scan the printed URI from Signal → Settings → Linked devices.
+   To register a new number instead: `python -m assistai signal register +1…`
+   (usually needs a captcha from [signalcaptchas.org](https://signalcaptchas.org/registration/generate.html)).
+3. Set in `.env`:
+
+   ```
+   ASSISTAI_SIGNAL_ACCOUNT=+15555550100
+   ASSISTAI_SIGNAL_ALLOW_FROM=+15555550101
+   ```
+
+4. Restart the gateway. Text the bot number from the allowed phone.
+
+Unknown numbers receive a pairing code. Approve from an **operator** phone,
+meaning one listed in `ASSISTAI_SIGNAL_ALLOW_FROM`:
+
+```
+/approve 482193
+```
+
+A number admitted this way can talk to the bot but cannot approve anyone else,
+so letting one person in never hands out the ability to let others in.
+
+Per-sender limits cap what a single number can spend: 12 turns per minute and
+4000 characters per message by default. Strangers get at most 3 pairing replies
+per hour, so a flood cannot turn the bot number into an outbound spam source.
+
+`make up-dev` binds signal-cli to `127.0.0.1:8080` so host-mode `make run` can
+reach it. Do not use that overlay on the Pi.
 
 ## Layout
 

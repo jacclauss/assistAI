@@ -67,12 +67,25 @@ class Message:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """Token counts for one request. Absent unless the provider reports them."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True)
 class Completion:
     """A fully accumulated streamed (or probed) model response."""
 
     content: str
     tool_calls: list[ToolCall]
     finish_reason: str | None
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True)
