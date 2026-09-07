@@ -122,3 +122,28 @@ class ScriptedSocket:
 @asynccontextmanager
 async def scripted_ws(frames: Iterable[str | bytes]) -> AsyncIterator[ScriptedSocket]:
     yield ScriptedSocket(frames)
+
+
+class BlockingSocket:
+    """Yields its frames, then hangs like a real idle WebSocket.
+
+    A socket that ends on its own cannot show whether shutdown unblocks the
+    receive loop, which is the case that decides if the gateway can stop.
+    """
+
+    def __init__(self, frames: Iterable[str | bytes]) -> None:
+        self._frames = list(frames)
+        self._closed = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[str | bytes]:
+        for frame in self._frames:
+            yield frame
+        await self._closed.wait()
+
+    async def close(self) -> None:
+        self.closed = True
+        self._closed.set()

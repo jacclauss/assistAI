@@ -28,11 +28,13 @@ services:
       ASSISTAI_SIGNAL_BASE_URL: http://signal-cli:8080
       ASSISTAI_STATE_DIR: /app/state
       ASSISTAI_MANIFEST_PATH: /app/manifest.toml
+      ASSISTAI_AGENTS_CONFIG: /app/config/assistai.toml
     networks:
       - internal
     volumes:
       - gateway-state:/app/state
       - ../manifest.toml:/app/manifest.toml:ro
+      - ../config:/app/config:ro
     read_only: true
     tmpfs:
       - /tmp

@@ -45,6 +45,10 @@ run: ## Run the gateway on the host with console logs
 chat: ## Multi-turn Fireworks conversation on the terminal
 	ASSISTAI_LOG_CONSOLE=true uv run python -m assistai chat
 
+.PHONY: compare
+compare: ## Score primary and candidate models against get_time
+	ASSISTAI_LOG_CONSOLE=true uv run python -m assistai models compare
+
 .PHONY: live
 live: ## Run the optional live Fireworks tests (costs tokens)
 	ASSISTAI_LIVE=1 uv run pytest -q -m live -o addopts=

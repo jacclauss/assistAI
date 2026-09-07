@@ -38,12 +38,18 @@ class ToolCall:
 
 @dataclass
 class Message:
-    """One turn in the conversation sent to or received from the model."""
+    """One turn in the conversation sent to or received from the model.
+
+    ``untrusted`` is broker bookkeeping, never serialized: it marks content that
+    came from outside the household so taint survives past the turn that fetched
+    it. Attacker text stays in history until trimmed, so the taint must too.
+    """
 
     role: Role
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
+    untrusted: bool = False
 
     def to_openai(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": self.role}

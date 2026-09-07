@@ -41,7 +41,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     ASSISTAI_MANIFEST_PATH=/app/manifest.toml \
     ASSISTAI_STATE_DIR=/app/state \
-    ASSISTAI_SIGNAL_BASE_URL=http://signal-cli:8080
+    ASSISTAI_SIGNAL_BASE_URL=http://signal-cli:8080 \
+    ASSISTAI_AGENTS_CONFIG=/app/config/assistai.toml
 
 USER assistai
 

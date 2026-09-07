@@ -1,7 +1,7 @@
 """One conversation turn: stream a completion, run tools, stream again.
 
-The broker is not here yet. This loop only executes tools the caller put on
-the registry. Phase 3 will sit in front of ``registry.execute``.
+The loop only executes tools the caller put on the surface. The broker sits in
+front of ``execute`` and is what enforces per-agent ACLs.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import structlog
 
 from assistai.errors import ToolLoopError
 from assistai.inference.client import FireworksClient
-from assistai.inference.tools import ToolRegistry
+from assistai.inference.tools import ToolSurface
 from assistai.inference.types import Message, TextDelta
 from assistai.manifest import ModelPin
 
@@ -25,7 +25,7 @@ async def run_turn(
     client: FireworksClient,
     pin: ModelPin,
     messages: list[Message],
-    registry: ToolRegistry | None,
+    registry: ToolSurface | None,
     *,
     max_tool_rounds: int,
     on_delta: DeltaCallback | None = None,
@@ -37,6 +37,11 @@ async def run_turn(
     """
     tools = registry.specs() if registry is not None else None
     rounds = 0
+    # Anything the model says with untrusted output in context is derived from
+    # it. Marking those messages too keeps the conversation tainted after the
+    # raw tool result is trimmed away, since a summary can carry the injection
+    # just as well as the page did.
+    derived_from_untrusted = any(message.untrusted for message in messages)
     while True:
         completion = await client.complete(pin, messages, tools, on_delta=on_delta)
         if completion.usage is not None:
@@ -50,6 +55,7 @@ async def run_turn(
             role="assistant",
             content=completion.content or None,
             tool_calls=list(completion.tool_calls),
+            untrusted=derived_from_untrusted,
         )
         messages.append(assistant)
         if not completion.tool_calls:
@@ -62,4 +68,12 @@ async def run_turn(
         for call in completion.tool_calls:
             log.info("tool.invoked", name=call.name, call_id=call.id)
             result = await registry.execute(call)
-            messages.append(Message(role="tool", content=result, tool_call_id=call.id))
+            derived_from_untrusted = derived_from_untrusted or result.untrusted
+            messages.append(
+                Message(
+                    role="tool",
+                    content=result.content,
+                    tool_call_id=call.id,
+                    untrusted=result.untrusted,
+                )
+            )

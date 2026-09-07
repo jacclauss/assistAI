@@ -33,3 +33,7 @@ class SignalError(AssistAIError):
 
 class SignalUnavailableError(SignalError):
     """signal-cli did not respond, or the configured account is not registered."""
+
+
+class HouseholdConfigError(AssistAIError):
+    """config/assistai.toml is missing, unreadable, or internally inconsistent."""

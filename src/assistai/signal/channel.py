@@ -6,12 +6,13 @@ import asyncio
 
 import structlog
 
+from assistai.agents import AgentSpec, Household, system_prompt_for
+from assistai.broker import BoundSurface, Scope, ToolBroker
 from assistai.config import Settings
-from assistai.conversation import SYSTEM_PROMPT, last_assistant_text, safe_trim
+from assistai.conversation import last_assistant_text, safe_trim
 from assistai.errors import AssistAIError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
-from assistai.inference.tools import default_registry
 from assistai.inference.types import Message
 from assistai.manifest import Manifest
 from assistai.signal.client import SignalTransport
@@ -29,11 +30,18 @@ _PAIRING_HINT = (
     "Give this pairing code to the operator: {code}\n"
     "They reply /approve {code} from an operator phone."
 )
-_APPROVE_OK = "Approved {number}. They can message the bot now."
+_APPROVE_OK = (
+    "Approved {number}. They can message the bot, but they only reach an agent "
+    "once one is bound to their number in config/assistai.toml."
+)
 _APPROVE_BAD = "No pending pairing matches that code (expired or already used)."
 _APPROVE_DENIED = "Only an operator can approve pairing codes."
 _TOO_LONG = "That message is too long ({actual} characters, limit {limit}). Send a shorter one."
 _TOO_FAST = "You are sending faster than I can answer. Try again in a minute."
+_UNBOUND = (
+    "This number is allowed to message the bot, but no agent is bound to it. "
+    "The operator has to add a binding in config/assistai.toml."
+)
 
 
 class SignalChannel:
@@ -51,13 +59,16 @@ class SignalChannel:
         policy: AccessPolicy,
         fireworks: FireworksClient | None,
         manifest: Manifest | None,
+        household: Household,
+        broker: ToolBroker,
     ) -> None:
         self._settings = settings
         self._signal = signal
         self._policy = policy
         self._fireworks = fireworks
         self._manifest = manifest
-        self._registry = default_registry()
+        self._household = household
+        self._broker = broker
         self._histories: dict[str, list[Message]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._turns = RateLimiter(settings.signal_rate_limit_per_minute, 60.0)
@@ -105,6 +116,16 @@ class SignalChannel:
         if code is not None:
             await self._handle_approve(inbound, code)
             return
+        # Resolve the agent before spending any budget, so a number with no
+        # binding is told that rather than being rate limited into confusion.
+        agent = self._household.agent_for_signal_dm(inbound.sender)
+        if agent is None:
+            log.info("signal.unbound", sender=inbound.sender)
+            # Still metered: the answer is free of model cost but not of Signal
+            # traffic, and a loop on the other end should not be amplified.
+            if self._turns.allow(inbound.sender):
+                await self._safe_send(inbound.sender, _UNBOUND)
+            return
         limit = self._settings.signal_max_inbound_chars
         if len(inbound.text) > limit:
             log.info("signal.rejected_long", sender=inbound.sender, chars=len(inbound.text))
@@ -117,7 +138,43 @@ class SignalChannel:
             await self._safe_send(inbound.sender, _TOO_FAST)
             return
         async with self._slots:
-            await self._converse(inbound)
+            await self._converse(inbound, agent)
+
+    async def _converse(self, inbound: InboundText, agent: AgentSpec) -> None:
+        if self._fireworks is None or self._manifest is None:
+            await self._safe_send(inbound.sender, _NOT_CONFIGURED)
+            return
+        messages = self._history(agent.name, system_prompt_for(agent))
+        # Taint carries across turns: untrusted text fetched last message is
+        # still in this history, so a privileged sink must stay refused.
+        surface: BoundSurface = self._broker.for_agent(agent, Scope.from_history(messages))
+        # A failed turn can leave an assistant tool-call with no result, which
+        # the provider rejects forever after. Roll the whole turn back instead.
+        baseline = len(messages)
+        messages.append(Message(role="user", content=inbound.text))
+        try:
+            await run_turn(
+                self._fireworks,
+                self._manifest.primary,
+                messages,
+                surface,
+                max_tool_rounds=self._settings.max_tool_rounds,
+            )
+        except AssistAIError:
+            log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
+            del messages[baseline:]
+            await self._safe_send(inbound.sender, _UNAVAILABLE)
+            return
+        reply = last_assistant_text(messages)
+        if not reply:
+            reply = _UNAVAILABLE
+        await self._safe_send(inbound.sender, reply)
+        safe_trim(messages, _HISTORY_KEEP)
+
+    def _history(self, agent_name: str, prompt: str) -> list[Message]:
+        if agent_name not in self._histories:
+            self._histories[agent_name] = [Message(role="system", content=prompt)]
+        return self._histories[agent_name]
 
     async def _handle_approve(self, inbound: InboundText, code: str) -> None:
         try:
@@ -138,39 +195,6 @@ class SignalChannel:
             return
         code = self._policy.request_pair(inbound.sender)
         await self._safe_send(inbound.sender, _PAIRING_HINT.format(code=code))
-
-    async def _converse(self, inbound: InboundText) -> None:
-        if self._fireworks is None or self._manifest is None:
-            await self._safe_send(inbound.sender, _NOT_CONFIGURED)
-            return
-        messages = self._history(inbound.sender)
-        # A failed turn can leave an assistant tool-call with no result, which
-        # the provider rejects forever after. Roll the whole turn back instead.
-        baseline = len(messages)
-        messages.append(Message(role="user", content=inbound.text))
-        try:
-            await run_turn(
-                self._fireworks,
-                self._manifest.primary,
-                messages,
-                self._registry,
-                max_tool_rounds=self._settings.max_tool_rounds,
-            )
-        except AssistAIError:
-            log.exception("signal.turn_failed", sender=inbound.sender)
-            del messages[baseline:]
-            await self._safe_send(inbound.sender, _UNAVAILABLE)
-            return
-        reply = last_assistant_text(messages)
-        if not reply:
-            reply = _UNAVAILABLE
-        await self._safe_send(inbound.sender, reply)
-        safe_trim(messages, _HISTORY_KEEP)
-
-    def _history(self, sender: str) -> list[Message]:
-        if sender not in self._histories:
-            self._histories[sender] = [Message(role="system", content=SYSTEM_PROMPT)]
-        return self._histories[sender]
 
     def _lock_for(self, sender: str) -> asyncio.Lock:
         lock = self._locks.get(sender)

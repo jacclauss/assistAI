@@ -7,10 +7,12 @@ import asyncio
 import sys
 
 from assistai.chat import chat_once, chat_repl
+from assistai.compare import compare_models, format_report
 from assistai.config import Settings
 from assistai.errors import AssistAIError
 from assistai.gateway import Gateway, install_signal_handlers
 from assistai.logging import configure_logging
+from assistai.manifest import load_manifest, resolve_manifest_path
 from assistai.signal.client import SignalClient
 from assistai.signal.numbers import normalize_e164
 
@@ -43,12 +45,18 @@ def main(argv: list[str] | None = None) -> None:
     verify.add_argument("number", help="dedicated bot number in E.164")
     verify.add_argument("code", help="verification code")
 
+    models = sub.add_parser("models", help="compare pinned models against real tool schemas")
+    models_sub = models.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser("compare", help="score primary and candidates on get_time")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "chat":
             asyncio.run(_chat(args.once, use_tools=not args.no_tools))
         elif args.command == "signal":
             asyncio.run(_signal(args))
+        elif args.command == "models":
+            asyncio.run(_models(args))
         else:
             asyncio.run(_gateway())
     except AssistAIError as exc:
@@ -107,6 +115,18 @@ async def _signal(args: argparse.Namespace) -> None:
             return
     finally:
         await client.aclose()
+
+
+async def _models(args: argparse.Namespace) -> None:
+    settings = Settings()
+    configure_logging(level=settings.log_level, console=True)
+    if args.models_command != "compare":
+        return
+    manifest = load_manifest(resolve_manifest_path(settings))
+    results = await compare_models(settings, manifest)
+    print(format_report(results))
+    if not any(row.available and row.tool_called for row in results):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

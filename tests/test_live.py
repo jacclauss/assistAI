@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from assistai.chat import chat_once
+from assistai.compare import compare_models
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.inference.types import Message
@@ -80,3 +81,16 @@ async def test_provider_reports_token_usage(live_settings: Settings, repo_root: 
     assert completion.usage is not None
     assert completion.usage.prompt_tokens > 0
     assert completion.usage.total_tokens >= completion.usage.prompt_tokens
+
+
+async def test_primary_calls_get_time_through_the_broker(
+    live_settings: Settings, repo_root: Path
+) -> None:
+    """The bake-off schema must work on the pinned primary, or phase 3 is fiction."""
+    loaded = load_manifest(repo_root / "manifest.toml")
+    results = await compare_models(live_settings, loaded, pins=(loaded.primary,))
+
+    assert results[0].available is True
+    assert results[0].tool_called is True
+    assert results[0].arguments_valid is True
+    assert results[0].finished is True

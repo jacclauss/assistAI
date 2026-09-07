@@ -1,20 +1,51 @@
-"""First-party tools available in the phase-1 loop.
+"""First-party tools and the surface the agent loop talks to.
 
-The broker and per-agent ACLs arrive in phase 3. Until then the REPL may use
-``get_time`` so the tool-call plumbing can be exercised against a real model.
-The tool is side-effect free.
+The REPL still uses the full catalog so tool-call plumbing can be exercised.
+Signal agents see only what the broker allowlists, which is empty until
+phase 5. ``get_time`` stays side-effect free.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
+
+import structlog
 
 from assistai.inference.types import ToolCall, ToolSpec
 
+log = structlog.get_logger(__name__)
+
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str] | str]
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """What the model sees, plus whether it came from outside the household."""
+
+    content: str
+    untrusted: bool = False
+
+
+class ToolSurface(Protocol):
+    """What ``run_turn`` needs. The broker and the REPL registry both qualify."""
+
+    def specs(self) -> list[ToolSpec]: ...
+
+    async def execute(self, call: ToolCall) -> ToolResult: ...
+
+
+GET_TIME_SPEC = ToolSpec(
+    name="get_time",
+    description=(
+        "Return the current UTC time as an ISO-8601 timestamp. "
+        "Use this when the user asks what time it is."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+)
 
 
 class ToolRegistry:
@@ -28,41 +59,43 @@ class ToolRegistry:
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
 
+    def names(self) -> frozenset[str]:
+        return frozenset(self._specs)
+
+    def spec(self, name: str) -> ToolSpec | None:
+        return self._specs.get(name)
+
     def specs(self) -> list[ToolSpec]:
         return list(self._specs.values())
 
-    async def execute(self, call: ToolCall) -> str:
+    async def execute(self, call: ToolCall) -> ToolResult:
         handler = self._handlers.get(call.name)
         if handler is None:
-            return json.dumps({"error": "unknown_tool", "name": call.name})
+            return ToolResult(json.dumps({"error": "unknown_tool", "name": call.name}))
         try:
             arguments = json.loads(call.arguments) if call.arguments else {}
         except json.JSONDecodeError:
-            return json.dumps({"error": "invalid_arguments"})
+            return ToolResult(json.dumps({"error": "invalid_arguments"}))
         if not isinstance(arguments, dict):
-            return json.dumps({"error": "invalid_arguments"})
-        result = handler(arguments)
-        if isinstance(result, str):
-            return result
-        return await result
+            return ToolResult(json.dumps({"error": "invalid_arguments"}))
+        # A raising handler must not escape as a bare exception: the turn would
+        # abort with an unanswered tool call already in history, which the
+        # provider rejects on every later message.
+        try:
+            result = handler(arguments)
+            content = result if isinstance(result, str) else await result
+        except Exception:
+            log.exception("tool.failed", name=call.name)
+            return ToolResult(json.dumps({"error": "tool_failed", "name": call.name}))
+        return ToolResult(content)
 
 
 def default_registry() -> ToolRegistry:
-    """The phase-1 REPL tool set: clock only."""
+    """The REPL tool set: clock only. Signal agents do not get this by default."""
     registry = ToolRegistry()
-    registry.register(
-        ToolSpec(
-            name="get_time",
-            description=(
-                "Return the current UTC time as an ISO-8601 timestamp. "
-                "Use this when the user asks what time it is."
-            ),
-            parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        ),
-        _get_time,
-    )
+    registry.register(GET_TIME_SPEC, get_time)
     return registry
 
 
-def _get_time(_arguments: dict[str, Any]) -> str:
+def get_time(_arguments: dict[str, Any]) -> str:
     return json.dumps({"utc": datetime.now(UTC).isoformat()})

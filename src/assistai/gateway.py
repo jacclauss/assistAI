@@ -1,7 +1,7 @@
 """The gateway daemon.
 
 Owns process lifecycle, Fireworks validation, and the Signal receive loop.
-Agent routing and the tool broker attach here in phase 3.
+Agent routing and the tool broker attach here.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from typing import Protocol
 import structlog
 
 from assistai import __version__
+from assistai.agents import Household, load_household, resolve_household_path
+from assistai.broker import ToolBroker, builtin_catalog
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
@@ -40,6 +42,8 @@ class Gateway:
         manifest: Manifest | None = None,
         signal: SignalTransport | None = None,
         channel: ChannelRunner | None = None,
+        household: Household | None = None,
+        broker: ToolBroker | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -48,6 +52,8 @@ class Gateway:
         self._signal = signal
         self._owns_signal = signal is None
         self._channel = channel
+        self._household = household
+        self._broker = broker
         self._channel_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
         self._beats = 0
@@ -112,6 +118,20 @@ class Gateway:
                     "gateway.signal_allowlist_empty",
                     reason="set ASSISTAI_SIGNAL_ALLOW_FROM to approve pairing codes",
                 )
+            household = self._household or load_household(
+                resolve_household_path(self._settings),
+                known_tools=builtin_catalog().names(),
+            )
+            self._household = household
+            unbound = [
+                number
+                for number in self._settings.allow_from
+                if household.agent_for_signal_dm(number) is None
+            ]
+            if unbound:
+                log.warning("gateway.allow_from_unbound", numbers=unbound)
+            broker = self._broker or ToolBroker(builtin_catalog(), household.broker)
+            self._broker = broker
             policy = AccessPolicy(
                 self._settings.allow_from,
                 persist_path=self._settings.state_dir / "signal-allowlist.json",
@@ -123,6 +143,8 @@ class Gateway:
                 policy=policy,
                 fireworks=self._client,
                 manifest=self._manifest,
+                household=household,
+                broker=broker,
             )
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         log.info("gateway.signal_started", account=self._settings.signal_account)
@@ -139,7 +161,10 @@ class Gateway:
             return
         self._shutdown.set()
         try:
-            await asyncio.wait_for(self._channel_task, timeout=5)
+            await asyncio.wait_for(
+                self._channel_task,
+                timeout=self._settings.shutdown_grace_seconds,
+            )
         except TimeoutError:
             self._channel_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

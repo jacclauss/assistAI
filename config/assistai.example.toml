@@ -1,35 +1,42 @@
 # Agent definitions and tool ACLs.
 #
-# DESIGN ARTIFACT. Nothing here is loaded yet; the broker reads this in phase 3.
-# It is checked in now so the permission model is reviewable before any tool
-# exists to abuse. Copy to config/assistai.toml (gitignored) when phase 3 lands.
+# DESIGN ARTIFACT that phase 3 now loads. Copy to config/assistai.toml
+# (gitignored) and put real numbers in. The gateway refuses to start Signal
+# without that file: two people texting the bot must reach two different agents.
+#
+# Being on ASSISTAI_SIGNAL_ALLOW_FROM is not enough to get an agent. Pairing
+# admits a number; this file decides who they become.
 
 [signal]
-# Phase 2 reads these from the environment (ASSISTAI_SIGNAL_*), not this file.
-# They stay here so the permission model is reviewable in one place. Phase 3
-# will load the agent bindings from a copied config/assistai.toml.
+# Phase 2 still reads these from the environment (ASSISTAI_SIGNAL_*), not this
+# file. They stay here so the permission model is reviewable in one place.
 #
 # Dedicated bot number, never a personal one: signal-cli ignores messages from
 # its own account, so a personal number cannot text its own assistant.
 account = "+15555550100"
 dm_policy = "pairing"
 
-# Operators. Only these numbers are routed anywhere by default, and only these
-# may approve a pairing code with /approve NNNNNN. A number admitted through
-# pairing can reach its agent but cannot admit anyone else.
+# Operators. Only these numbers may approve a pairing code with /approve NNNNNN.
+# Pairing admits a number to the bot; it does not give it an agent. Until a
+# binding below names that number, it reaches nothing.
 allow_from = ["+15555550101", "+15555550102"]
+
+# web_access defaults to false. Only the two personal agents opt in, and only
+# they will get the phase 5 research tools.
 
 [agents.jacob]
 binds_to = { channel = "signal", peer = "+15555550101" }
 reads = ["own", "shared"]
 writes = ["own", "shared:publish"]
 tools = []          # phase 5 adds: web_search, web_fetch
+web_access = true
 
 [agents.spouse]
 binds_to = { channel = "signal", peer = "+15555550102" }
 reads = ["own", "shared"]
 writes = ["own", "shared:publish"]
 tools = []          # phase 5 adds: web_search, web_fetch
+web_access = true
 
 [agents.organizer]
 binds_to = { channel = "signal", peer = "group:household" }

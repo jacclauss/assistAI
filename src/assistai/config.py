@@ -1,8 +1,7 @@
 """Runtime configuration.
 
 Operator-facing settings come from the environment. Agent definitions and tool
-ACLs will be loaded from ``config/assistai.toml`` in phase 3; see
-``config/assistai.example.toml`` for the intended shape.
+ACLs are loaded from ``config/assistai.toml``; see ``config/assistai.example.toml``.
 """
 
 from __future__ import annotations
@@ -38,6 +37,9 @@ class Settings(BaseSettings):
     log_console: bool = False
     heartbeat_seconds: float = Field(default=60.0, gt=0)
     state_dir: Path = Path("state")
+    # How long a channel gets to drain after SIGTERM. Docker kills at 10s by
+    # default, so anything longer means being killed rather than exiting.
+    shutdown_grace_seconds: float = Field(default=5.0, gt=0)
 
     # Read from FIREWORKS_API_KEY rather than the ASSISTAI_ prefix, so the same
     # variable name works for any tooling that expects the provider default.
@@ -53,6 +55,9 @@ class Settings(BaseSettings):
     # Concurrent model turns across all senders. The Pi has finite memory and
     # every turn is billable.
     max_concurrent_turns: int = Field(default=4, gt=0)
+
+    # Agent roster. Required once Signal is on; the REPL does not need it.
+    agents_config_path: Path | None = None
 
     # Signal is off until an account is set. The default URL is the compose
     # service name; host-mode against compose.dev binds 127.0.0.1:8080.

@@ -19,7 +19,9 @@ Fireworks AI, built to move from a development Mac to a Raspberry Pi 5 appliance
 **The tool broker is the security boundary, not the agent process.**
 
 Agents cannot execute code. They act only through brokered tools with explicit
-per-agent allowlists. This makes the agent loop an LLM conversation with no
+per-agent allowlists. Every grant is opt-in, including `web_access`: an agent
+added to the roster without a stated position on the internet does not get it.
+This makes the agent loop an LLM conversation with no
 independent authority, so per-agent containers would add Pi overhead without
 buying isolation. Instead, the components that touch untrusted input or
 untrusted code get their own containers and their own network.
@@ -113,9 +115,15 @@ Three tiers, in increasing order of cost and risk.
 Browsing admits attacker-controlled text into model context. Four layers:
 
 **Taint tracking with blocked sinks.** Every tool result carries a trusted or
-untrusted label. Once untrusted content enters a turn's scope, the broker
-refuses privileged sinks (writes to shared, messages to the other person, any
-state mutation) *before* the tool executes. The agent can still read, summarize,
+untrusted label, and the label is stored on the message. Taint is therefore
+scoped to the conversation, not the turn: attacker text stays in history after
+the turn that fetched it, so "fetch a poisoned page now, ask for a write in the
+next innocent-looking message" has to fail too. Assistant replies written with
+untrusted content in context inherit the label, because a summary carries an
+injection as well as the page does. Taint clears only when every labelled
+message has fallen out of the trimmed window. While tainted, the broker refuses
+privileged sinks (writes to shared, messages to the other person, any state
+mutation) *before* the tool executes. The agent can still read, summarize,
 and answer.
 
 **Quarantined summarizer.** Heavy pages are read by a separate cheap Fireworks

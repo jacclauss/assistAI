@@ -13,17 +13,17 @@ reasoning behind it.
 
 ## Status
 
-Phase 2 of 8. The gateway validates pinned Fireworks models at startup and, when
-a bot number is configured, receives Signal DMs and replies. Unknown senders
-never reach the model: they get a pairing code that an already-allowed phone
-approves with `/approve NNNNNN`.
+Phase 3 of 8. Two Signal numbers reach two agents with distinct identities and
+empty tool allowlists. The broker is the security boundary: a tool the model
+invents is refused before any handler runs. Pairing still admits a number; it
+does not assign an agent.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
 | 0 | Skeleton: packaging, container, logging, tests | done |
 | 1 | Fireworks inference loop | done |
 | 2 | Signal channel | done |
-| 3 | Three agents and the tool broker | |
+| 3 | Three agents and the tool broker | done |
 | 4 | Shared store with ACLs | |
 | 5 | Research tools: search, fetch, extract | |
 | 6 | Update watcher | |
@@ -78,7 +78,16 @@ from its own account, so a personal number cannot text its own assistant.
    ASSISTAI_SIGNAL_ALLOW_FROM=+15555550101
    ```
 
-4. Restart the gateway. Text the bot number from the allowed phone.
+4. Copy the agent roster and put real numbers in:
+
+   ```
+   cp config/assistai.example.toml config/assistai.toml
+   ```
+
+   Each Signal DM binding is a different agent. Pairing admits a number; it does
+   not give them someone else's assistant, and an allowed number with no binding
+   reaches no agent at all. Every permission is opt-in, `web_access` included.
+   Restart the gateway. Text the bot from a bound phone.
 
 Unknown numbers receive a pairing code. Approve from an **operator** phone,
 meaning one listed in `ASSISTAI_SIGNAL_ALLOW_FROM`:
@@ -94,6 +103,10 @@ Per-sender limits cap what a single number can spend: 12 turns per minute and
 4000 characters per message by default. Strangers get at most 3 pairing replies
 per hour, so a flood cannot turn the bot number into an outbound spam source.
 
+`make compare` scores the primary and every candidate in `manifest.toml` against
+the real `get_time` schema. That is the check that matters for swapping models;
+published benchmarks do not predict our JSON.
+
 `make up-dev` binds signal-cli to `127.0.0.1:8080` so host-mode `make run` can
 reach it. Do not use that overlay on the Pi.
 
@@ -102,7 +115,7 @@ reach it. Do not use that overlay on the Pi.
 ```
 docs/architecture.md      design, threat model, phase plan
 manifest.toml             pinned external dependencies; the update watcher reads this
-config/                   agent definitions and tool ACLs (example is a design artifact)
+config/                   agent roster; copy assistai.example.toml to assistai.toml
 docker/                   Dockerfile and compose
 src/assistai/             gateway source
 tests/                    test suite

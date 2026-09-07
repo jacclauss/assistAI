@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import httpx
 import pytest
 
 from assistai.errors import SignalError, SignalUnavailableError
 from assistai.signal.client import SignalClient, WebSocketConnection
-from tests.signal_fakes import http_signal, scripted_ws, signal_settings
+from tests.signal_fakes import BlockingSocket, http_signal, scripted_ws, signal_settings
 
 
 def _about(mode: str = "json-rpc") -> httpx.Response:
@@ -268,3 +269,220 @@ async def test_register_and_verify_paths() -> None:
     assert "15555550100" in seen[0]
     assert "verify" in seen[1]
     assert "123-456" in seen[1]
+
+
+async def test_health_reports_a_bad_status() -> None:
+    client = http_signal(lambda _request: httpx.Response(500, text="boom"))
+
+    with pytest.raises(SignalUnavailableError, match="HTTP 500"):
+        await client.check()
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(httpx.Response(409, text="already linked"), id="http-error"),
+        pytest.param(httpx.Response(200, text="not json"), id="not-json"),
+        pytest.param(httpx.Response(200, json={"other": "field"}), id="missing-uri"),
+        pytest.param(httpx.Response(200, json={"device_link_uri": ""}), id="blank-uri"),
+    ],
+)
+async def test_link_uri_rejects_unusable_responses(response: httpx.Response) -> None:
+    """A silent empty string here would send the operator to scan nothing."""
+    client = http_signal(lambda _request: response)
+
+    with pytest.raises(SignalError):
+        await client.link_uri("assistai")
+    await client.aclose()
+
+
+async def test_register_surfaces_a_captcha_demand() -> None:
+    """The 402 body is the operator's instruction, so it has to reach them."""
+    client = http_signal(
+        lambda _request: httpx.Response(402, text="Captcha required for verification")
+    )
+
+    with pytest.raises(SignalError, match="Captcha required"):
+        await client.register("+15555550100", captcha=None, voice=False)
+    await client.aclose()
+
+
+async def test_verify_surfaces_a_bad_code() -> None:
+    client = http_signal(lambda _request: httpx.Response(400, text="invalid verification code"))
+
+    with pytest.raises(SignalError, match="HTTP 400"):
+        await client.verify("+15555550100", "000000")
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(httpx.Response(500, text="boom"), id="server-error"),
+        pytest.param(httpx.Response(200, text="not json"), id="not-json"),
+        pytest.param(httpx.Response(200, json={"accounts": []}), id="not-a-list"),
+    ],
+)
+async def test_accounts_fails_loudly_when_it_cannot_list(response: httpx.Response) -> None:
+    """`signal health` must not print an empty roster it never actually read."""
+    client = http_signal(lambda _request: response)
+
+    with pytest.raises(SignalError, match="could not list"):
+        await client.accounts()
+    await client.aclose()
+
+
+async def test_accounts_drops_non_string_entries() -> None:
+    client = http_signal(lambda _request: httpx.Response(200, json=["+15555550100", 7, None]))
+
+    assert await client.accounts() == ["+15555550100"]
+    await client.aclose()
+
+
+async def test_check_tolerates_an_accounts_endpoint_that_fails() -> None:
+    """Not being able to list is not proof the account is missing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(204)
+        if request.url.path == "/v1/about":
+            return httpx.Response(200, text="not json")
+        return httpx.Response(500)
+
+    client = http_signal(handler)
+    await client.check()
+    await client.aclose()
+
+
+@pytest.mark.parametrize("method", ["send", "receive_url"])
+async def test_no_account_configured_is_a_clear_error(method: str) -> None:
+    client = http_signal(lambda _request: httpx.Response(200), signal_account=None)
+
+    with pytest.raises(SignalError, match="ASSISTAI_SIGNAL_ACCOUNT"):
+        if method == "send":
+            await client.send("+15555550101", "hi")
+        else:
+            client.receive_url()
+    await client.aclose()
+
+
+async def test_receive_without_an_account_is_a_clear_error() -> None:
+    client = http_signal(lambda _request: httpx.Response(200), signal_account=None)
+
+    with pytest.raises(SignalError, match="ASSISTAI_SIGNAL_ACCOUNT"):
+        async for _ in client.receive(asyncio.Event()):
+            raise AssertionError("should not yield")
+    await client.aclose()
+
+
+async def test_send_transport_failure_is_a_signal_error() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    client = http_signal(handler)
+    with pytest.raises(SignalError, match="send failed"):
+        await client.send("+15555550101", "hi")
+    await client.aclose()
+
+
+async def test_receive_reconnects_after_a_dropped_socket() -> None:
+    """The Pi's Wi-Fi will drop. A dropped socket must not end the process.
+
+    json-rpc mode discards anything that arrives while no client is attached,
+    so a receive loop that exits on the first disconnect loses every message
+    until someone notices.
+    """
+    attempts = {"n": 0}
+
+    def connect(_url: str) -> AbstractAsyncContextManager[WebSocketConnection]:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("connection reset")
+        return scripted_ws([json.dumps({"envelope": {"sourceNumber": "+15555550101"}})])
+
+    client = SignalClient(signal_settings(), http=httpx.AsyncClient(), connect=connect)
+    stop = asyncio.Event()
+    got: list[object] = []
+    async for payload in client.receive(stop):
+        got.append(payload)
+        stop.set()
+
+    assert attempts["n"] == 2
+    assert got == [{"envelope": {"sourceNumber": "+15555550101"}}]
+    await client.aclose()
+
+
+async def test_receive_stops_reconnecting_once_shutdown_is_requested() -> None:
+    attempts = {"n": 0}
+    stop = asyncio.Event()
+
+    def connect(_url: str) -> AbstractAsyncContextManager[WebSocketConnection]:
+        attempts["n"] += 1
+        stop.set()
+        raise OSError("connection reset")
+
+    client = SignalClient(signal_settings(), http=httpx.AsyncClient(), connect=connect)
+    got = [payload async for payload in client.receive(stop)]
+
+    assert got == []
+    assert attempts["n"] == 1
+    await client.aclose()
+
+
+async def test_shutdown_unblocks_an_idle_socket() -> None:
+    """An idle WebSocket never ends on its own.
+
+    Without the stop watcher, ``receive`` would sit in ``async for`` forever
+    and the gateway would hang on SIGTERM until the runtime killed it.
+    """
+    sockets: list[BlockingSocket] = []
+    stop = asyncio.Event()
+
+    @asynccontextmanager
+    async def connect_blocking(_url: str) -> AsyncIterator[BlockingSocket]:
+        socket = BlockingSocket([json.dumps({"ok": True})])
+        sockets.append(socket)
+        yield socket
+
+    client = SignalClient(
+        signal_settings(),
+        http=httpx.AsyncClient(),
+        connect=connect_blocking,
+    )
+
+    async def drain() -> list[object]:
+        return [payload async for payload in client.receive(stop)]
+
+    task = asyncio.create_task(drain())
+    await asyncio.sleep(0.02)
+    assert not task.done()
+
+    stop.set()
+    got = await asyncio.wait_for(task, timeout=1)
+
+    assert got == [{"ok": True}]
+    assert sockets[0].closed is True
+    await client.aclose()
+
+
+async def test_receive_decodes_bytes_and_skips_junk() -> None:
+    """signal-cli sends text frames, but a proxy in between may not."""
+    frames: list[str | bytes] = [
+        b"\xff\xfe not utf-8",
+        "   ",
+        json.dumps({"ok": 1}).encode(),
+    ]
+
+    def connect(_url: str) -> AbstractAsyncContextManager[WebSocketConnection]:
+        return scripted_ws(frames)
+
+    client = SignalClient(signal_settings(), http=httpx.AsyncClient(), connect=connect)
+    stop = asyncio.Event()
+    got: list[object] = []
+    async for payload in client.receive(stop):
+        got.append(payload)
+        stop.set()
+
+    assert got == [{"ok": 1}]
+    await client.aclose()

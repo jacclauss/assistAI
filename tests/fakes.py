@@ -10,6 +10,7 @@ import httpx
 
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
+from assistai.inference.tools import ToolSurface
 from assistai.inference.types import ToolCall
 from assistai.manifest import Manifest, ModelPin
 
@@ -148,3 +149,11 @@ def recorded(handler: Handler) -> tuple[Handler, list[httpx.Request]]:
 
 def tool_call(name: str = "get_time", arguments: str = "{}") -> ToolCall:
     return ToolCall(id="call_1", name=name, arguments=arguments)
+
+
+async def body(surface: ToolSurface, call: ToolCall) -> dict[str, Any]:
+    """Execute a call and decode what the model would see."""
+    result = await surface.execute(call)
+    parsed = json.loads(result.content)
+    assert isinstance(parsed, dict)
+    return parsed

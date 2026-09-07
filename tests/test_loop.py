@@ -5,8 +5,8 @@ import pytest
 
 from assistai.errors import ToolLoopError
 from assistai.inference.loop import run_turn
-from assistai.inference.tools import default_registry
-from assistai.inference.types import Message
+from assistai.inference.tools import GET_TIME_SPEC, ToolResult, default_registry
+from assistai.inference.types import Message, ToolCall, ToolSpec
 from tests.fakes import (
     client_for,
     completion_stream,
@@ -47,6 +47,54 @@ async def test_tool_then_final_answer() -> None:
     assert messages[2].tool_call_id == "call_1"
     assert "utc" in (messages[2].content or "")
     assert messages[-1].content == "It is noon UTC."
+    assert messages[2].untrusted is False
+    await client.aclose()
+
+
+async def test_untrusted_results_are_marked_in_history() -> None:
+    """The mark is what lets the next turn know the conversation is tainted."""
+
+    class Untrusting:
+        def specs(self) -> list[ToolSpec]:
+            return [GET_TIME_SPEC]
+
+        async def execute(self, call: ToolCall) -> ToolResult:
+            return ToolResult('{"page": "from the open internet"}', untrusted=True)
+
+    client = client_for(
+        sequence(
+            completion_stream(
+                tool_event(call_id="call_1", name="get_time", arguments="{}", finish="tool_calls")
+            ),
+            completion_stream(text_event("done", finish="stop")),
+        )
+    )
+    messages = [Message(role="user", content="look it up")]
+
+    await run_turn(client, pin(), messages, Untrusting(), max_tool_rounds=2)
+
+    tool_message = next(message for message in messages if message.role == "tool")
+    assert tool_message.untrusted is True
+    # The summary is derived from the page, so trimming the raw result must not
+    # quietly clear the taint.
+    assert messages[-1].role == "assistant"
+    assert messages[-1].untrusted is True
+    assert messages[1].untrusted is False
+    await client.aclose()
+
+
+async def test_a_later_turn_inherits_taint_from_context() -> None:
+    """Trimming the fetched page must not launder the model's summary of it."""
+    client = client_for(lambda _req: completion_stream(text_event("sure", finish="stop")))
+    messages = [
+        Message(role="user", content="look it up"),
+        Message(role="tool", content="untrusted page", tool_call_id="c1", untrusted=True),
+    ]
+
+    await run_turn(client, pin(), messages, None, max_tool_rounds=2)
+
+    assert messages[-1].role == "assistant"
+    assert messages[-1].untrusted is True
     await client.aclose()
 
 
