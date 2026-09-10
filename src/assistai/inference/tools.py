@@ -1,8 +1,8 @@
 """First-party tools and the surface the agent loop talks to.
 
-The REPL still uses the full catalog so tool-call plumbing can be exercised.
-Signal agents see only what the broker allowlists, which is empty until
-phase 5. ``get_time`` stays side-effect free.
+The broker is the only production path to a handler, including the terminal
+REPL. ``ToolRegistry`` is the catalog the broker wraps; tests talk to it
+directly. ``get_time`` stays side-effect free.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class ToolResult:
 
 
 class ToolSurface(Protocol):
-    """What ``run_turn`` needs. The broker and the REPL registry both qualify."""
+    """What ``run_turn`` needs. The broker is the production implementation."""
 
     def specs(self) -> list[ToolSpec]: ...
 
@@ -91,7 +91,7 @@ class ToolRegistry:
 
 
 def default_registry() -> ToolRegistry:
-    """The REPL tool set: clock only. Signal agents do not get this by default."""
+    """Unbrokered catalog for registry tests. Production paths use the broker."""
     registry = ToolRegistry()
     registry.register(GET_TIME_SPEC, get_time)
     return registry

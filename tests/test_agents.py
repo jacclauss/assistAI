@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from assistai.agents import load_household, resolve_household_path
+from assistai.agents import BrokerPolicy, load_household, local_agent, resolve_household_path
 from assistai.broker import builtin_catalog
 from assistai.config import Settings
 from assistai.errors import HouseholdConfigError
+from tests.agent_fakes import agent as household_agent
+from tests.agent_fakes import household as make_household
 
 
 def _write(path: Path, body: str) -> Path:
@@ -21,7 +23,7 @@ def test_example_roster_loads(repo_root: Path) -> None:
         known_tools=builtin_catalog().names(),
     )
 
-    assert {agent.name for agent in household.agents} == {"jacob", "spouse", "organizer"}
+    assert {agent.name for agent in household.agents} == {"jacob", "spouse"}
     jacob = household.agent_for_signal_dm("+15555550101")
     spouse = household.agent_for_signal_dm("+15555550102")
     assert jacob is not None and spouse is not None
@@ -30,11 +32,11 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert household.agent_for_signal_dm("+15555550199") is None
     assert jacob.tools == ()
     assert spouse.tools == ()
-    organizer = next(agent for agent in household.agents if agent.name == "organizer")
-    assert organizer.web_access is False
-    assert organizer.binding.peer == "group:household"
+    assert jacob.writes == ()
+    assert spouse.writes == ()
     assert jacob.web_access is True
     assert spouse.web_access is True
+    assert all(agent.binding.is_signal_dm for agent in household.agents)
 
 
 def test_web_access_is_off_unless_asked_for(tmp_path: Path) -> None:
@@ -175,9 +177,9 @@ binds_to = { channel = "signal", peer = "+15555550102" }
             id="blank-peer",
         ),
         pytest.param(
-            '[agents.jacob]\nbinds_to = { channel = "signal", peer = "group:Household!" }\n',
-            "not a group id",
-            id="bad-group-id",
+            '[agents.jacob]\nbinds_to = { channel = "signal", peer = "group:household" }\n',
+            "must bind to a Signal DM",
+            id="group-binding",
         ),
         pytest.param(
             _TWO_GOOD_AGENTS + 'reads = "own"\n',
@@ -229,27 +231,7 @@ def test_broker_defaults_deny_the_standard_sinks(tmp_path: Path) -> None:
 
     household = load_household(path)
 
-    assert household.broker.tainted_sinks_denied == frozenset(
-        {"shared:write", "shared:publish", "message:other_peer"}
-    )
-
-
-def test_a_group_binding_is_not_a_dm(tmp_path: Path) -> None:
-    """The organizer must not be reachable by texting the bot directly."""
-    path = _write(
-        tmp_path / "group.toml",
-        _TWO_GOOD_AGENTS
-        + """
-[agents.organizer]
-binds_to = { channel = "signal", peer = "group:household" }
-""",
-    )
-
-    household = load_household(path)
-
-    organizer = next(agent for agent in household.agents if agent.name == "organizer")
-    assert organizer.binding.is_signal_dm is False
-    assert household.dm_peers() == ("+15555550101", "+15555550102")
+    assert household.broker == BrokerPolicy.defaults()
 
 
 def test_peers_are_normalized_before_matching(tmp_path: Path) -> None:
@@ -292,6 +274,22 @@ def test_missing_config_names_the_example_to_copy() -> None:
     """The error is the only instruction an operator gets at this point."""
     with pytest.raises(HouseholdConfigError, match=r"assistai\.example\.toml"):
         resolve_household_path(Settings())
+
+
+def test_local_agent_is_not_reachable_over_signal() -> None:
+    """Stuffing the REPL spec into a Household still cannot bind a phone number."""
+    repl = local_agent("repl")
+    home = make_household(
+        household_agent("jacob", "+15555550101"),
+        household_agent("spouse", "+15555550102"),
+        repl,
+    )
+
+    assert repl.binding.is_signal_dm is False
+    assert repl.web_access is False
+    assert repl.tools == ("get_time",)
+    assert home.agent_for_signal_dm(repl.binding.peer) is None
+    assert repl.binding.peer not in home.dm_peers()
 
 
 def test_get_time_is_allowed_on_an_acl(tmp_path: Path) -> None:

@@ -37,3 +37,7 @@ class SignalUnavailableError(SignalError):
 
 class HouseholdConfigError(AssistAIError):
     """config/assistai.toml is missing, unreadable, or internally inconsistent."""
+
+
+class StoreError(AssistAIError):
+    """The state database is missing, unreadable, or newer than this build."""

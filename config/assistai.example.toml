@@ -1,14 +1,16 @@
 # Agent definitions and tool ACLs.
 #
-# DESIGN ARTIFACT that phase 3 now loads. Copy to config/assistai.toml
-# (gitignored) and put real numbers in. The gateway refuses to start Signal
-# without that file: two people texting the bot must reach two different agents.
+# Copy to config/assistai.toml (gitignored) and put real numbers in. The
+# gateway refuses to start Signal without that file: two people texting the
+# bot must reach two different agents.
 #
 # Being on ASSISTAI_SIGNAL_ALLOW_FROM is not enough to get an agent. That list
-# is who may talk to the bot; this file decides who they become.
+# is who may talk to the bot; this file decides who they become. Every agent
+# binds to a Signal DM. There is no organizer on this roster: when it exists
+# it will be a process, not a number anyone texts.
 
 [signal]
-# Phase 2 still reads these from the environment (ASSISTAI_SIGNAL_*), not this
+# These are still read from the environment (ASSISTAI_SIGNAL_*), not this
 # file. They stay here so the permission model is reviewable in one place.
 #
 # Dedicated bot number, never a personal one: signal-cli ignores messages from
@@ -22,35 +24,27 @@ dm_policy = "allowlist"
 # give the admitted number an agent until a binding below names it.
 allow_from = ["+15555550101", "+15555550102"]
 
-# web_access defaults to false. Only the two personal agents opt in, and only
-# they will get the phase 5 research tools.
+# web_access defaults to false. Only the two personal agents opt in; research
+# tools (phase 8) will still be refused unless they also appear on `tools`.
 
 [agents.jacob]
 binds_to = { channel = "signal", peer = "+15555550101" }
 reads = ["own", "shared"]
-writes = ["own", "shared:publish"]
-tools = []          # phase 5 adds: web_search, web_fetch
+writes = []         # mail file/draft and relay land later as staged tools
+tools = []          # phase 8 adds: web_search, web_fetch
 web_access = true
 
 [agents.spouse]
 binds_to = { channel = "signal", peer = "+15555550102" }
 reads = ["own", "shared"]
-writes = ["own", "shared:publish"]
-tools = []          # phase 5 adds: web_search, web_fetch
+writes = []
+tools = []
 web_access = true
 
-[agents.organizer]
-binds_to = { channel = "signal", peer = "group:household" }
-reads = ["shared"]
-writes = ["shared"]
-tools = []
-# Deliberately never granted web access. This agent holds the broadest write
-# authority over household state, so it must never ingest untrusted content.
-web_access = false
-
 [broker]
-# Once an untrusted tool result enters a turn's scope, these sinks are refused
-# before execution rather than after.
+# Once an untrusted tool result enters a conversation, these sinks are refused
+# before execution rather than after. Relay is not a free message:other_peer
+# tool; when it lands it will stage first.
 tainted_sinks_denied = ["shared:write", "shared:publish", "message:other_peer"]
 
 # Untrusted content is placed mid-prompt: models attend most strongly to the

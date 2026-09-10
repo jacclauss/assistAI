@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     signal_max_inbound_chars: int = Field(default=4000, gt=0)
     signal_pairing_replies_per_hour: int = Field(default=3, gt=0)
 
+    # Conversation window. Count is the working context; age is how long taint
+    # (and ordinary memory) is allowed to live on disk after the last message.
+    history_keep: int = Field(default=30, gt=0)
+    history_max_age_seconds: float = Field(default=14 * 24 * 3600, gt=0)
+
     @field_validator("signal_account", mode="before")
     @classmethod
     def _account(cls, value: object) -> object:

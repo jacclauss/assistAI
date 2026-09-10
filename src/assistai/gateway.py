@@ -22,6 +22,7 @@ from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
 from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
+from assistai.store import Store, store_path
 
 
 class ChannelRunner(Protocol):
@@ -54,6 +55,8 @@ class Gateway:
         self._channel = channel
         self._household = household
         self._broker = broker
+        self._store: Store | None = None
+        self._owns_store = False
         self._channel_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
         self._beats = 0
@@ -132,9 +135,13 @@ class Gateway:
                 log.warning("gateway.allow_from_unbound", numbers=unbound)
             broker = self._broker or ToolBroker(builtin_catalog(), household.broker)
             self._broker = broker
+            store = Store(store_path(self._settings.state_dir))
+            self._store = store
+            self._owns_store = True
+            store.import_legacy_allowlist(self._settings.state_dir / "signal-allowlist.json")
             policy = AccessPolicy(
                 self._settings.allow_from,
-                persist_path=self._settings.state_dir / "signal-allowlist.json",
+                store=store,
                 pairing_ttl_seconds=self._settings.signal_pairing_ttl_seconds,
             )
             self._channel = SignalChannel(
@@ -145,6 +152,7 @@ class Gateway:
                 manifest=self._manifest,
                 household=household,
                 broker=broker,
+                store=store,
             )
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         log.info("gateway.signal_started", account=self._settings.signal_account)
@@ -176,6 +184,8 @@ class Gateway:
             await self._signal.aclose()
         if self._owns_client and self._client is not None:
             await self._client.aclose()
+        if self._owns_store and self._store is not None:
+            self._store.close()
 
     async def _heartbeat_loop(self) -> None:
         interval = self._settings.heartbeat_seconds

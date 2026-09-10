@@ -1,8 +1,9 @@
 """Household agents: identity, Signal bindings, and tool ACLs.
 
 Loaded from ``config/assistai.toml``. Being allowed to message the bot is not
-the same as having an agent: pairing admits a number, this file decides who
-they become. Unbound numbers never reach a model.
+the same as having an agent: the allowlist admits a number, this file decides
+who they become. Unbound numbers never reach a model. Every agent binds to a
+Signal DM; an organizer process is not a Signal identity.
 """
 
 from __future__ import annotations
@@ -17,14 +18,18 @@ from assistai.errors import HouseholdConfigError
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
 
 _AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-_GROUP_PEER = re.compile(r"^group:[a-z][a-z0-9_-]{0,63}$")
 
 _DEFAULT_TAINT_SINKS = frozenset({"shared:write", "shared:publish", "message:other_peer"})
 
 
 @dataclass(frozen=True)
 class Binding:
-    """Where this agent is reachable. DMs are E.164; group routing is unbuilt."""
+    """Where this agent is reachable.
+
+    Household agents are Signal DMs. The REPL and bake-off use ``local``, which
+    ``is_signal_dm`` rejects, so stuffing that spec into a Household cannot
+    make a phone number reach it.
+    """
 
     channel: str
     peer: str
@@ -52,6 +57,10 @@ class BrokerPolicy:
 
     tainted_sinks_denied: frozenset[str]
 
+    @classmethod
+    def defaults(cls) -> BrokerPolicy:
+        return cls(tainted_sinks_denied=_DEFAULT_TAINT_SINKS)
+
 
 @dataclass(frozen=True)
 class Household:
@@ -68,6 +77,18 @@ class Household:
 
     def dm_peers(self) -> tuple[str, ...]:
         return tuple(agent.binding.peer for agent in self.agents if agent.binding.is_signal_dm)
+
+
+def local_agent(name: str, *, tools: tuple[str, ...] = ("get_time",)) -> AgentSpec:
+    """Not reachable over Signal. Used by the terminal REPL and the bake-off."""
+    return AgentSpec(
+        name=name,
+        binding=Binding(channel="local", peer=name),
+        reads=(),
+        writes=(),
+        tools=tools,
+        web_access=False,
+    )
 
 
 def system_prompt_for(agent: AgentSpec) -> str:
@@ -174,9 +195,9 @@ def _parse_binding(name: str, raw: object) -> Binding:
         raise HouseholdConfigError(f"agents.{name}.binds_to.peer must be a non-empty string")
     peer = peer.strip()
     if peer.startswith("group:"):
-        if not _GROUP_PEER.fullmatch(peer):
-            raise HouseholdConfigError(f"agents.{name}.binds_to.peer is not a group id: {peer}")
-        return Binding(channel="signal", peer=peer)
+        raise HouseholdConfigError(
+            f"agents.{name} must bind to a Signal DM; group routing is not built"
+        )
     try:
         return Binding(channel="signal", peer=normalize_e164(peer))
     except InvalidNumberError as exc:
@@ -187,12 +208,12 @@ def _parse_binding(name: str, raw: object) -> Binding:
 
 def _parse_broker(raw: object) -> BrokerPolicy:
     if raw is None:
-        return BrokerPolicy(tainted_sinks_denied=_DEFAULT_TAINT_SINKS)
+        return BrokerPolicy.defaults()
     if not isinstance(raw, dict):
         raise HouseholdConfigError("broker must be a table")
     sinks = raw.get("tainted_sinks_denied")
     if sinks is None:
-        return BrokerPolicy(tainted_sinks_denied=_DEFAULT_TAINT_SINKS)
+        return BrokerPolicy.defaults()
     if not isinstance(sinks, list) or not all(isinstance(item, str) and item for item in sinks):
         raise HouseholdConfigError("broker.tainted_sinks_denied must be a list of strings")
     return BrokerPolicy(tainted_sinks_denied=frozenset(sinks))

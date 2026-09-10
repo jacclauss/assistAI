@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import structlog
 
 from assistai.agents import AgentSpec, Household, system_prompt_for
 from assistai.broker import BoundSurface, Scope, ToolBroker
 from assistai.config import Settings
-from assistai.conversation import last_assistant_text, safe_trim
-from assistai.errors import AssistAIError
+from assistai.conversation import apply_window, last_assistant_text
+from assistai.errors import AssistAIError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
 from assistai.inference.types import Message
@@ -19,11 +20,12 @@ from assistai.signal.client import SignalTransport
 from assistai.signal.envelopes import InboundText, parse_inbound
 from assistai.signal.policy import AccessPolicy
 from assistai.signal.ratelimit import RateLimiter
+from assistai.store import Store
 
 log = structlog.get_logger(__name__)
 
-_HISTORY_KEEP = 30
 _UNAVAILABLE = "I could not reach the model just now. Try again in a moment."
+_SAVE_FAILED = "I could not save that just now. Try again in a moment."
 _NOT_CONFIGURED = "Inference is not configured on this gateway yet."
 _PAIRING_HINT = (
     "This number is not authorized.\n\n"
@@ -61,6 +63,7 @@ class SignalChannel:
         manifest: Manifest | None,
         household: Household,
         broker: ToolBroker,
+        store: Store,
     ) -> None:
         self._settings = settings
         self._signal = signal
@@ -69,6 +72,7 @@ class SignalChannel:
         self._manifest = manifest
         self._household = household
         self._broker = broker
+        self._store = store
         self._histories: dict[str, list[Message]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._turns = RateLimiter(settings.signal_rate_limit_per_minute, 60.0)
@@ -144,14 +148,19 @@ class SignalChannel:
         if self._fireworks is None or self._manifest is None:
             await self._safe_send(inbound.sender, _NOT_CONFIGURED)
             return
-        messages = self._history(agent.name, system_prompt_for(agent))
+        try:
+            messages = self._history(agent.name, system_prompt_for(agent))
+        except StoreError:
+            log.exception("store.history_unreadable", agent=agent.name)
+            await self._safe_send(inbound.sender, _UNAVAILABLE)
+            return
         # Taint carries across turns: untrusted text fetched last message is
         # still in this history, so a privileged sink must stay refused.
         surface: BoundSurface = self._broker.for_agent(agent, Scope.from_history(messages))
         # A failed turn can leave an assistant tool-call with no result, which
         # the provider rejects forever after. Roll the whole turn back instead.
         baseline = len(messages)
-        messages.append(Message(role="user", content=inbound.text))
+        messages.append(Message(role="user", content=inbound.text, created_at=time.time()))
         try:
             await run_turn(
                 self._fireworks,
@@ -168,12 +177,41 @@ class SignalChannel:
         reply = last_assistant_text(messages)
         if not reply:
             reply = _UNAVAILABLE
+        windowed = messages[:]
+        apply_window(
+            windowed,
+            keep=self._settings.history_keep,
+            max_age_seconds=self._settings.history_max_age_seconds,
+        )
+        try:
+            self._store.save_history(agent.name, windowed)
+        except StoreError:
+            log.exception("store.save_failed", agent=agent.name)
+            del messages[baseline:]
+            await self._safe_send(inbound.sender, _SAVE_FAILED)
+            return
+        messages[:] = windowed
         await self._safe_send(inbound.sender, reply)
-        safe_trim(messages, _HISTORY_KEEP)
 
     def _history(self, agent_name: str, prompt: str) -> list[Message]:
         if agent_name not in self._histories:
-            self._histories[agent_name] = [Message(role="system", content=prompt)]
+            loaded = self._store.load_history(agent_name)
+            messages = [Message(role="system", content=prompt), *loaded]
+            windowed = messages[:]
+            apply_window(
+                windowed,
+                keep=self._settings.history_keep,
+                max_age_seconds=self._settings.history_max_age_seconds,
+            )
+            if len(windowed) < len(messages):
+                try:
+                    self._store.save_history(agent_name, windowed)
+                except StoreError:
+                    log.exception("store.save_failed", agent=agent_name)
+                    self._histories[agent_name] = messages
+                    return messages
+                messages = windowed
+            self._histories[agent_name] = messages
         return self._histories[agent_name]
 
     async def _handle_approve(self, inbound: InboundText, code: str) -> None:
@@ -182,6 +220,10 @@ class SignalChannel:
         except PermissionError:
             log.warning("signal.approve_denied", sender=inbound.sender)
             await self._safe_send(inbound.sender, _APPROVE_DENIED)
+            return
+        except StoreError:
+            log.exception("store.admit_failed", sender=inbound.sender)
+            await self._safe_send(inbound.sender, _SAVE_FAILED)
             return
         reply = _APPROVE_OK.format(number=approved) if approved else _APPROVE_BAD
         await self._safe_send(inbound.sender, reply)

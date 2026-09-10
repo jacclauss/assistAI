@@ -6,6 +6,7 @@ front of ``execute`` and is what enforces per-agent ACLs.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import structlog
@@ -56,6 +57,7 @@ async def run_turn(
             content=completion.content or None,
             tool_calls=list(completion.tool_calls),
             untrusted=derived_from_untrusted,
+            created_at=time.time(),
         )
         messages.append(assistant)
         if not completion.tool_calls:
@@ -75,5 +77,6 @@ async def run_turn(
                     content=result.content,
                     tool_call_id=call.id,
                     untrusted=result.untrusted,
+                    created_at=time.time(),
                 )
             )

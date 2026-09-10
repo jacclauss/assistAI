@@ -40,9 +40,11 @@ class ToolCall:
 class Message:
     """One turn in the conversation sent to or received from the model.
 
-    ``untrusted`` is broker bookkeeping, never serialized: it marks content that
-    came from outside the household so taint survives past the turn that fetched
-    it. Attacker text stays in history until trimmed, so the taint must too.
+    ``untrusted`` and ``created_at`` are broker bookkeeping, never serialized
+    to the provider. ``untrusted`` marks content that came from outside the
+    household so taint survives past the turn that fetched it. ``created_at``
+    is a unix timestamp so the history window can expire by age, not only
+    by count. Both persist in SQLite so a reboot cannot clear them.
     """
 
     role: Role
@@ -50,6 +52,7 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     untrusted: bool = False
+    created_at: float | None = None
 
     def to_openai(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": self.role}

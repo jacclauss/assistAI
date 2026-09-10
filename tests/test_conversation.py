@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from assistai.conversation import last_assistant_text, safe_trim
+from assistai.conversation import apply_window, last_assistant_text, safe_trim
 from assistai.inference.types import Message, ToolCall
 
 
@@ -79,3 +79,43 @@ def test_last_assistant_text_skips_tool_requests() -> None:
 
 def test_last_assistant_text_when_absent() -> None:
     assert last_assistant_text([Message(role="user", content="hi")]) == ""
+
+
+def test_age_trim_drops_old_untrusted_messages() -> None:
+    """Taint clears when the labelled messages fall out of the window."""
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="old fetch", created_at=1.0, untrusted=True),
+        Message(role="assistant", content="poisoned", created_at=2.0, untrusted=True),
+        Message(role="user", content="new", created_at=100.0),
+        Message(role="assistant", content="fresh", created_at=101.0),
+    ]
+
+    apply_window(messages, keep=30, max_age_seconds=10, now=110.0)
+
+    assert [message.content for message in messages] == ["sys", "new", "fresh"]
+    assert not any(message.untrusted for message in messages)
+
+
+def test_age_trim_does_not_split_a_tool_exchange() -> None:
+    messages = [Message(role="system", content="sys")]
+    messages += [
+        Message(role="user", content="old", created_at=1.0),
+        Message(role="assistant", content="ok", created_at=2.0),
+    ]
+    messages += [
+        Message(role="user", content="fetch", created_at=50.0),
+        Message(
+            role="assistant",
+            tool_calls=[ToolCall(id="c1", name="web_fetch", arguments="{}")],
+            created_at=51.0,
+        ),
+        Message(role="tool", content="page", tool_call_id="c1", untrusted=True, created_at=52.0),
+        Message(role="assistant", content="summary", untrusted=True, created_at=53.0),
+    ]
+
+    apply_window(messages, keep=30, max_age_seconds=10, now=60.0)
+
+    _valid(messages)
+    assert messages[1].content == "fetch"
+    assert any(message.untrusted for message in messages)

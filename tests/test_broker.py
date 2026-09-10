@@ -188,8 +188,8 @@ async def test_a_clean_history_does_not_taint() -> None:
 
 
 async def test_web_access_false_hides_and_denies_web_tools() -> None:
-    organizer = agent(
-        "organizer",
+    guest = agent(
+        "guest",
         "+15555550103",
         tools=("web_search",),
         web_access=False,
@@ -201,8 +201,8 @@ async def test_web_access_false_hides_and_denies_web_tools() -> None:
         trusted=False,
         web=True,
     )
-    broker = ToolBroker(catalog, household(agent("jacob", "+15555550101"), organizer).broker)
-    surface = broker.for_agent(organizer)
+    broker = ToolBroker(catalog, household(agent("jacob", "+15555550101"), guest).broker)
+    surface = broker.for_agent(guest)
 
     assert surface.specs() == []
     denied = await body(surface, ToolCall(id="c1", name="web_search", arguments="{}"))

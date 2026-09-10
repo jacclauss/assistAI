@@ -5,17 +5,17 @@ through Fireworks AI. Developed on a Mac, deployed to a Raspberry Pi 5 as an
 always-on appliance.
 
 Two people text a dedicated bot number. Each reaches their own assistant, with
-different read, write, and tool permissions enforced by a broker. An organizer
-process may hold shared state and jobs; nobody texts it.
+different read, write, and tool permissions enforced by a broker. There is no
+third chat; an organizer process may hold shared state later, and nobody texts it.
 
 See [docs/prd.md](docs/prd.md) for what this is for, and
 [docs/architecture.md](docs/architecture.md) for how it is built.
 
 ## Status
 
-Phase 3 of 13. Two Signal numbers reach two agents with distinct identities and
-empty tool allowlists. Unknown numbers hear nothing. The broker is the security
-boundary: a tool the model invents is refused before any handler runs.
+Phase 4 of 13. Two Signal numbers reach two agents with distinct identities.
+History, untrusted labels, and the pairing allowlist live in SQLite, so a
+reboot cannot forget a conversation or silently clear taint.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -23,7 +23,7 @@ boundary: a tool the model invents is refused before any handler runs.
 | 1 | Fireworks inference loop | done |
 | 2 | Signal channel | done |
 | 3 | Two agents and the tool broker | done |
-| 4 | Durable history, taint, and allowlist | |
+| 4 | Durable history, taint, and allowlist | done |
 | 5 | Staged actions: propose, confirm, execute | |
 | 6 | Relay, including attachments | |
 | 7 | Jobs: schedules and TTL'd watches | |

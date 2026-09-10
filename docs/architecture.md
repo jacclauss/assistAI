@@ -98,9 +98,7 @@ An **organizer** is deferred to the shared-store phase. When it arrives it is a
 process, not a Signal identity: it owns structured household state and never
 browses, preserving the rule that the component with the broadest write
 authority never ingests the open web. Nobody texts it, and relays do not pass
-through it. The `group:household` binding in `config/assistai.example.toml` is
-a placeholder from the phase-3 design and must be removed, because the current
-`AgentSpec` shape assumes every agent is Signal-reachable.
+through it. The roster is two Signal DMs; a group binding is rejected at load.
 
 Shared state is a SQLite database with typed tables and enforced ACLs, not a
 directory of files. A workspace directory is a default working directory, not a
@@ -301,14 +299,11 @@ documented blast radius in comparable projects.
 
 ## Deltas from the current build
 
-Phase 3 shipped assumptions the PRD overturns. These are the concrete changes:
+Phase 3 shipped assumptions the PRD overturns. These are the concrete changes
+that remain:
 
-- `SignalChannel._histories` is an in-memory dict. History and its untrusted
-  labels must move to SQLite, or a reboot clears taint.
 - `receive_url()` sets `ignore_attachments=true`. Relay needs attachments.
 - The channel replies only to inbound messages. Jobs need an outbound path.
-- `config/assistai.example.toml` binds `organizer` to `group:household`. The
-  organizer is not a Signal identity; that binding goes away.
 - The broker knows `sink` but has no staging concept. Staged actions are new.
 
 ## Build phases

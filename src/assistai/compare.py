@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import structlog
 
-from assistai.agents import AgentSpec, Binding, BrokerPolicy
+from assistai.agents import AgentSpec, BrokerPolicy, local_agent
 from assistai.broker import BoundSurface, ToolBroker, builtin_catalog
 from assistai.config import Settings
 from assistai.errors import AssistAIError, ToolLoopError
@@ -47,14 +47,7 @@ class CompareResult:
 
 def eval_agent() -> AgentSpec:
     """Synthetic agent used only for the bake-off. Not reachable over Signal."""
-    return AgentSpec(
-        name="eval",
-        binding=Binding(channel="signal", peer="+15555550999"),
-        reads=(),
-        writes=(),
-        tools=("get_time",),
-        web_access=False,
-    )
+    return local_agent("eval")
 
 
 async def compare_models(
