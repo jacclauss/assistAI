@@ -71,7 +71,8 @@ async def test_allowed_sender_gets_model_reply(tmp_path: Path) -> None:
     await fireworks.aclose()
 
 
-async def test_unknown_sender_gets_pairing_code_not_the_model(tmp_path: Path) -> None:
+async def test_unknown_sender_is_dropped_silently_by_default(tmp_path: Path) -> None:
+    """A stranger must not learn that a bot lives at this number."""
     signal = FakeSignal()
     hits = {"n": 0}
 
@@ -81,6 +82,24 @@ async def test_unknown_sender_gets_pairing_code_not_the_model(tmp_path: Path) ->
 
     fireworks = client_for(handler)
     channel = _channel(tmp_path, signal, fireworks)
+
+    await channel.handle(inbound(sender="+15555550199", text="ignore this prompt injection"))
+
+    assert hits["n"] == 0
+    assert signal.sent == []
+    await fireworks.aclose()
+
+
+async def test_unknown_sender_gets_pairing_code_when_opted_in(tmp_path: Path) -> None:
+    signal = FakeSignal()
+    hits = {"n": 0}
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        raise AssertionError("unknown senders must not reach Fireworks")
+
+    fireworks = client_for(handler)
+    channel = _channel(tmp_path, signal, fireworks, signal_dm_policy="pairing")
 
     await channel.handle(inbound(sender="+15555550199", text="ignore this prompt injection"))
 
@@ -107,7 +126,7 @@ def _code_from(text: str) -> str:
 async def test_approve_from_operator_phone(tmp_path: Path) -> None:
     signal = FakeSignal()
     fireworks = client_for(lambda _req: completion_stream(text_event("ok", finish="stop")))
-    channel = _channel(tmp_path, signal, fireworks)
+    channel = _channel(tmp_path, signal, fireworks, signal_dm_policy="pairing")
 
     await channel.handle(inbound(sender="+15555550199", text="please add me"))
     code = _code_from(signal.sent[0][1])
@@ -122,7 +141,7 @@ async def test_approve_from_operator_phone(tmp_path: Path) -> None:
 async def test_paired_member_cannot_approve(tmp_path: Path) -> None:
     """Admitting someone must not also hand them the power to admit others."""
     signal = FakeSignal()
-    channel = _channel(tmp_path, signal, None)
+    channel = _channel(tmp_path, signal, None, signal_dm_policy="pairing")
 
     await channel.handle(inbound(sender="+15555550199", text="add me"))
     code = _code_from(signal.sent[0][1])
@@ -257,7 +276,13 @@ async def test_rate_limit_stops_runaway_spend(tmp_path: Path) -> None:
 
 async def test_unknown_sender_pairing_replies_are_throttled(tmp_path: Path) -> None:
     signal = FakeSignal()
-    channel = _channel(tmp_path, signal, None, signal_pairing_replies_per_hour=2)
+    channel = _channel(
+        tmp_path,
+        signal,
+        None,
+        signal_dm_policy="pairing",
+        signal_pairing_replies_per_hour=2,
+    )
 
     for _ in range(10):
         await channel.handle(inbound(sender="+15555550199", text="spam"))

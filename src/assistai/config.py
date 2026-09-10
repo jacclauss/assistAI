@@ -66,7 +66,9 @@ class Settings(BaseSettings):
     # Stored as a comma-separated string so pydantic-settings does not
     # JSON-decode the env var (it would for a tuple/list type).
     signal_allow_from: str = ""
-    signal_dm_policy: DmPolicy = "pairing"
+    # Unknown numbers get silence, not a pairing hint. Opt into pairing if a
+    # guest should be able to request access without you editing config.
+    signal_dm_policy: DmPolicy = "allowlist"
     signal_device_name: str = "assistai"
     signal_pairing_ttl_seconds: float = Field(default=900.0, gt=0)
     signal_reconnect_seconds: float = Field(default=2.0, gt=0)

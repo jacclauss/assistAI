@@ -1,8 +1,9 @@
 """Sender allowlist and pairing.
 
-Unknown numbers never reach the model. Under ``pairing`` they get a short-lived
-code that only an *operator* can approve with ``/approve NNNNNN``. Under
-``allowlist`` they are dropped silently.
+Unknown numbers never reach the model. The default, ``allowlist``, drops them
+silently so a stranger never learns a bot lives here. Under ``pairing`` they
+get a short-lived code that only an *operator* can approve with
+``/approve NNNNNN``.
 
 Operators are exactly the numbers in ``ASSISTAI_SIGNAL_ALLOW_FROM``. Numbers
 admitted by pairing can talk to their agent but cannot admit anyone else,

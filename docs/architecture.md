@@ -3,6 +3,9 @@
 A self-hosted, multi-agent assistant reachable over Signal, running open models via
 Fireworks AI, built to move from a development Mac to a Raspberry Pi 5 appliance.
 
+Product requirements live in [prd.md](prd.md). This file is how we build it.
+If they disagree, the PRD wins and this file is wrong.
+
 ## Design decisions
 
 | Decision | Choice | Rationale |
@@ -10,21 +13,34 @@ Fireworks AI, built to move from a development Mac to a Raspberry Pi 5 appliance
 | Language | Python 3.12 | Maintainer fluency on security-critical code; strongest HTML extraction ecosystem |
 | Transport | Signal via `signal-cli` | Only messaging channel required |
 | Inference | Fireworks AI | OpenAI-compatible, open-weight models |
+| Mail | Gmail API | The household's mail already lives there |
+| Calendar | iCloud shared calendar over CalDAV | The household's calendar already lives there; not worth a migration |
+| Durable state | One SQLite file in the state volume | History, taint, jobs, and staged actions must survive a reboot |
+| Scheduling | In-process asyncio scheduler | One box, few jobs; a second daemon buys nothing |
 | Search | Self-hosted SearXNG | No third party sees household queries; no API key |
 | Headless browser | Deferred | Fetch + extract covers most research at a fraction of the cost |
 | Target host | Raspberry Pi 5, 8 GB | Gateway, signal-cli, and SearXNG concurrently, with headroom |
 
-## Security boundary
+## Security boundaries
 
-**The tool broker is the security boundary, not the agent process.**
+There are two, and they answer different questions.
 
-Agents cannot execute code. They act only through brokered tools with explicit
-per-agent allowlists. Every grant is opt-in, including `web_access`: an agent
-added to the roster without a stated position on the internet does not get it.
-This makes the agent loop an LLM conversation with no
-independent authority, so per-agent containers would add Pi overhead without
-buying isolation. Instead, the components that touch untrusted input or
-untrusted code get their own containers and their own network.
+**The tool broker decides what an agent may attempt.** Agents cannot execute
+code. They act only through brokered tools with explicit per-agent allowlists.
+Every grant is opt-in, including `web_access`: an agent added to the roster
+without a stated position on the internet does not get it. This makes the agent
+loop an LLM conversation with no independent authority, so per-agent containers
+would add Pi overhead without buying isolation. Instead, the components that
+touch untrusted input or untrusted code get their own containers and network.
+
+**Staging decides what actually happens.** Anything that mutates a mailbox or
+crosses to the other person's phone is proposed, shown, and executed only on a
+human yes. The broker can be fooled by a convincing model; a person reading
+"archive these 6" cannot be fooled into approving a list they can see.
+
+Narrow provider scopes are the third leg and cheaper than both: send and delete
+are not requested from Google at all, so no bug in either layer can escalate
+into a sent or destroyed mail.
 
 If code execution is ever added, that is the point at which per-agent runner
 containers become necessary. Revisit this decision then, not before.
@@ -32,57 +48,173 @@ containers become necessary. Revisit this decision then, not before.
 ## Topology
 
 ```
-   your phone            her phone
-        \                   /
-         \                 /
-      Signal (dedicated bot number)
-                 |
-        +--------v---------+
-        |  signal-cli      |  container, MODE=json-rpc
-        +--------+---------+
-                 | REST/WS, private docker network
-        +--------v------------------------------+
-        |  GATEWAY  (Python, loopback only)     |
-        |                                       |
-        |   router  -->  sender allowlist       |
-        |                + pairing              |
-        |      |                                |
-        |   +--v---+  +--------+  +----------+  |
-        |   |jacob |  | spouse |  |organizer |  |  agent workers
-        |   +--+---+  +---+----+  +----+-----+  |
-        |      +----------+------------+        |
-        |            +----v-----+               |
-        |            |  BROKER  |  ACL + taint  |
-        |            +----+-----+               |
-        +-----------------+---------------------+
-                          |
-        +---------+-------+----+--------------+
-        |         |            |              |
-   +----v---+ +---v----+  +----v-----+  +-----v------+
-   | stores | |searxng |  |  fetch   |  |  renderer  |
-   | SQLite | |        |  | +extract |  | (deferred) |
-   +--------+ +--------+  +----------+  +------------+
-                          +--- egress-restricted net --+
-                          |
-                    Fireworks API
+   your phone                her phone
+        \                       /
+         Signal (dedicated bot number)
+                    |
+          +---------v--------+
+          |  signal-cli      |  container, MODE=json-rpc
+          +---------+--------+
+                    | REST/WS + attachments, private network
+   +----------------v-------------------------------+
+   |  GATEWAY  (Python, no published ports)         |
+   |                                                |
+   |   router --> sender allowlist                  |
+   |        |                                       |
+   |   +----v----+   +--------+                     |
+   |   | jacob   |   | spouse |   agent loops       |
+   |   +----+----+   +---+----+                     |
+   |        +------------+                          |
+   |               |                                |
+   |        +------v------+  ACL + taint            |
+   |        |   BROKER    |  + staged actions       |
+   |        +------+------+                         |
+   |               |                                |
+   |   scheduler --+  report-only jobs              |
+   +---------------+--------------------------------+
+                   |
+   +-------+-------+--------+---------+-----------+
+   |       |                |         |           |
++--v---+ +-v-----+ +--------v+ +------v-+ +-------v--+
+|state | | gmail | | icloud  | | searxng| | fetch    |
+|SQLite| | API   | | CalDAV  | |        | | +extract |
++------+ +-------+ +---------+ +--------+ +----------+
+                                 +-- egress-restricted --+
+                                            |
+                                      Fireworks API
 ```
 
 ## Agents and permissions
 
-| Agent | Binds to | Reads | Writes | Web access |
+| Agent | Binds to | Reads | Writes | Web |
 | --- | --- | --- | --- | --- |
-| `jacob` | your Signal DM | own store, shared | own store, publish to shared | yes |
-| `spouse` | her Signal DM | own store, shared | own store, publish to shared | yes |
-| `organizer` | group chat, scheduled | shared only | shared | **no** |
+| `jacob` | his Signal DM | own history, own Gmail, shared calendar | Gmail file/draft (staged), relay (staged) | yes |
+| `spouse` | her Signal DM | own history, own Gmail, shared calendar | Gmail file/draft (staged), relay (staged) | yes |
 
-The asymmetry is deliberate. The agent holding the most write authority over
-household data never ingests untrusted content, and the agents that browse can
-only *propose* to shared state through an explicit publish call. This removes
-the highest-value injection path structurally rather than defensively.
+Two agents are the product. Each is bound to exactly one number and reaches
+nothing else.
+
+An **organizer** is deferred to the shared-store phase. When it arrives it is a
+process, not a Signal identity: it owns structured household state and never
+browses, preserving the rule that the component with the broadest write
+authority never ingests the open web. Nobody texts it, and relays do not pass
+through it. The `group:household` binding in `config/assistai.example.toml` is
+a placeholder from the phase-3 design and must be removed, because the current
+`AgentSpec` shape assumes every agent is Signal-reachable.
 
 Shared state is a SQLite database with typed tables and enforced ACLs, not a
 directory of files. A workspace directory is a default working directory, not a
 sandbox: absolute paths escape it.
+
+## Providers
+
+| Need | Provider | Auth |
+| --- | --- | --- |
+| Mail | Gmail API | Google OAuth per person; refresh token in the state volume |
+| Calendar | iCloud shared calendar | CalDAV with an app-specific password |
+
+Two vendors is the intended setup, not an accident. Collapsing the household
+onto Google is the fallback if Apple auth on a headless Pi proves unworkable,
+not the plan.
+
+Credentials are per person and selected by agent: jacob's tools use jacob's
+token. The operator has filesystem access to both. That is an accepted property
+of a single-box household appliance, not something the broker can fix.
+
+Requested Gmail scopes cover read, label, archive, star, move, and draft.
+`send` and permanent `delete` are never requested, so the capability does not
+exist in the process at all.
+
+## Persistence
+
+Everything that must outlive a reboot is in one SQLite file in the gateway
+state volume:
+
+- conversation history per agent, including the untrusted label on each message
+- pending staged actions
+- job definitions, schedules, TTLs, and last-run state
+- relay records
+- the sender allowlist (today a separate JSON file)
+
+Two consequences worth stating plainly. A restart does not forget that a relay
+happened, so her assistant can still answer "what did he send me yesterday?"
+And a restart does not launder taint: in-memory history meant a reboot silently
+cleared every untrusted label, which was a real hole once mail and the web are
+in scope.
+
+History is a window per agent, bounded by count and age. Taint clears when the
+labelled messages fall out of that window — the same rule as before, now
+durable rather than incidental.
+
+The file holds mail summaries, relayed documents, and provider tokens. It is
+not encrypted at rest; the Pi's disk is the trust boundary.
+
+## Staged actions
+
+Mail filing and relay are the same primitive.
+
+A tool marked as staging never executes when the model calls it. The broker
+records the **resolved call** — tool name and arguments, not the model's prose —
+and returns a proposal for the user. The next inbound message either confirms
+it or does not. On yes, the gateway executes the stored call, so what the user
+approved is exactly what runs. The model does not get a second chance to
+re-render the action between the preview and the execution.
+
+Properties that matter:
+
+- One proposal may cover many items, so "archive these 6" costs one
+  confirmation rather than six.
+- Proposals expire, and a newer proposal replaces an older one, so a stale yes
+  cannot fire something the user has forgotten about.
+- Under taint the proposal is labelled as having been suggested while untrusted
+  content was in context. The human is the check, so they should know that a
+  page or a mail is what asked for this.
+- A scheduled job never stages and waits. Jobs report.
+
+## Jobs
+
+The model does not get raw cron or a shell. It gets brokered job objects,
+stored in SQLite and inspectable in conversation.
+
+| Kind | Chatter | Lifetime |
+| --- | --- | --- |
+| Schedule (daily digest) | Always messages the owner | Until cancelled |
+| Watch (e.g. flights) | Silent unless it finds, fails, or expires | Required TTL |
+
+Jobs are **report-only**. A job may read — mail, calendar, the web — and it
+messages the owner with what it found. It never files, drafts, writes, or
+relays, because nobody is present to approve a staged action at 7am. If a
+digest suggests filing, the user stages that from their reply, where they can
+see the list.
+
+A job runs as one agent, with that agent's ACL and that person's credentials.
+Failures (auth, network, tool error) message the owner; there is no silent
+skip. An empty schedule run still messages, because the person asked for a
+check at that time. An empty watch stays quiet. A watch without a TTL is
+rejected at creation.
+
+Job output is appended to the owner's conversation history, so "what was in the
+digest?" works without re-fetching.
+
+This makes the channel no longer strictly reply-to-inbound: the gateway may
+send to a bound number with no inbound trigger. Those sends go only to bound
+numbers and are metered separately from user turns, so a misbehaving job cannot
+consume a person's conversational rate limit.
+
+## Attachments
+
+Relay carries documents and images, so the receive path cannot keep
+`ignore_attachments=true`. Inbound attachments are downloaded to a size-capped
+scratch area, checked against a MIME allowlist, and treated as untrusted input
+exactly like a fetched page.
+
+Text extraction runs in the same isolated extractor as web pages, so a
+malformed PDF or image cannot exploit a parser inside the gateway. Mail HTML
+goes through that same extractor for the same reason.
+
+What persists is the extracted text plus the file's identity (name, type,
+size), not the binary. Her assistant can discuss the document next week without
+the gateway hoarding files.
 
 ## Model selection
 
@@ -95,7 +227,7 @@ MiniMax M3 is primary. DeepSeek V4 Flash runs the quarantined summarizer, chosen
 for native structured output and for being a different model lineage than the
 primary, so one injection technique is less likely to defeat both layers.
 
-Swapping the model must stay a one-line manifest change. Phase 3 runs the
+Swapping the model must stay a one-line manifest change. `make compare` runs the
 candidates in `models.candidates` against the real tool schemas, because
 benchmarks do not predict how a model handles a specific toolset.
 
@@ -112,19 +244,22 @@ Three tiers, in increasing order of cost and risk.
 
 ## Prompt injection defenses
 
-Browsing admits attacker-controlled text into model context. Four layers:
+Browsing, mail, and relayed attachments all admit attacker-controlled text into
+model context. Five layers:
 
-**Taint tracking with blocked sinks.** Every tool result carries a trusted or
-untrusted label, and the label is stored on the message. Taint is therefore
-scoped to the conversation, not the turn: attacker text stays in history after
-the turn that fetched it, so "fetch a poisoned page now, ask for a write in the
-next innocent-looking message" has to fail too. Assistant replies written with
+**Staged actions.** The outermost layer, and the only one an attacker cannot
+argue with. A poisoned mail that says "archive everything from the bank"
+produces a visible proposal listing those messages, and the person says no.
+
+**Taint tracking.** Every tool result carries a trusted or untrusted label, and
+the label is stored on the message and persisted with it. Taint is scoped to
+the conversation, not the turn: attacker text stays in history after the turn
+that fetched it, so "fetch a poisoned page now, ask for a write in the next
+innocent-looking message" has to fail too. Assistant replies written with
 untrusted content in context inherit the label, because a summary carries an
 injection as well as the page does. Taint clears only when every labelled
-message has fallen out of the trimmed window. While tainted, the broker refuses
-privileged sinks (writes to shared, messages to the other person, any state
-mutation) *before* the tool executes. The agent can still read, summarize,
-and answer.
+message has fallen out of the window. While tainted, the broker refuses any
+mutation that is not going through staging, and marks the proposals that do.
 
 **Quarantined summarizer.** Heavy pages are read by a separate cheap Fireworks
 call that emits a structured result against a fixed schema. The primary agent
@@ -135,8 +270,18 @@ a per-process random nonce, so a page cannot forge the delimiter. Untrusted
 content is placed mid-prompt: models attend most strongly to the beginning and
 end of context, which is where injected instructions do the most damage.
 
-**Network isolation.** Fetch and render containers sit on a network with no
-route to the gateway, the stores, or the Fireworks credential.
+**Network isolation.** Fetch, extract, and render containers sit on a network
+with no route to the gateway, the store, or the Fireworks credential.
+
+### Relay specifically
+
+Relay is not a free `message:other_peer` sink. Delivery is: propose exact bytes
+and attachments → sender confirms → Signal send verbatim → append a record to
+the recipient's history so their assistant knows who sent it and what it said.
+The recipient's model never rewrites the outbound text, which is both a fidelity
+property and a security one. The injected record is untrusted on her side:
+confirmation authorized the delivery to her phone, not her assistant's later
+tool use.
 
 ## Update awareness
 
@@ -148,11 +293,31 @@ Signal's server APIs change.
 
 ## Explicitly out of scope
 
-No web UI, no plugin system or marketplace, no shell tool, no cron-as-a-tool, no
-mobile nodes, no channels beyond Signal. Each of these is a documented source of
-blast radius in comparable projects.
+No web UI, no plugin system or marketplace, no shell tool, no mobile nodes, no
+channels beyond Signal, no session with the other person's assistant, no email
+send or delete, no acting as either person on the public web. Pairing is off by
+default. Headless Chromium is deferred. Each of the omitted surfaces is a
+documented blast radius in comparable projects.
+
+## Deltas from the current build
+
+Phase 3 shipped assumptions the PRD overturns. These are the concrete changes:
+
+- `SignalChannel._histories` is an in-memory dict. History and its untrusted
+  labels must move to SQLite, or a reboot clears taint.
+- `receive_url()` sets `ignore_attachments=true`. Relay needs attachments.
+- The channel replies only to inbound messages. Jobs need an outbound path.
+- `config/assistai.example.toml` binds `organizer` to `group:household`. The
+  organizer is not a Signal identity; that binding goes away.
+- The broker knows `sink` but has no staging concept. Staged actions are new.
 
 ## Build phases
+
+Persistence comes first because staging and jobs both need durable state, and
+because taint that a reboot can clear is worse than no taint. Relay and jobs
+land before the providers so the novel machinery is proven without waiting on
+OAuth. Calendar precedes mail because CalDAV read-only is the smaller surface.
+Calendar and mail can move earlier if credentials are ready sooner.
 
 | Phase | Deliverable | Done when |
 | --- | --- | --- |
@@ -160,8 +325,13 @@ blast radius in comparable projects.
 | 1 | Fireworks loop | Multi-turn conversation from the terminal (`make chat`) |
 | 2 | Signal | Texting the bot number gets a reply |
 | 3 | Agents + broker | Two numbers reach two agents with distinct, empty tool sets; candidate models compared on real schemas |
-| 4 | Shared store | Organizer reads both published feeds; neither personal store leaks |
-| 5 | Research tiers 1-2 | Cited answer, with a write refused under taint in the audit log |
-| 6 | Update watcher | Correctly flags a stale signal-cli and takes no action |
-| 7 | Pi migration | Survives reboot and a week unattended |
-| 8 | Household tools | Calendar, lists, reminders, each ACL'd per agent |
+| 4 | Persistence | History, untrusted labels, and the allowlist survive a restart; a reboot does not clear taint |
+| 5 | Staged actions | A staging tool proposes, waits, and on yes executes the stored call, not a re-rendered one |
+| 6 | Relay | Text, link, or attachment reaches the other phone verbatim after one confirm, and her assistant knows what arrived |
+| 7 | Jobs | Schedule and TTL'd watch, report-only, cancellable in Signal, failures ping, survive a reboot |
+| 8 | Research tiers 1-2 | Cited answer; a sink proposed under taint is labelled as such in the audit log |
+| 9 | Calendar | "What's on the docket today" reads the iCloud shared calendar |
+| 10 | Email | Digest, batch-staged filing, Gmail drafts; send and delete scopes never requested |
+| 11 | Shared store | Structured household state with ACLs; organizer runs as a process and never browses |
+| 12 | Update watcher | Correctly flags a stale signal-cli and takes no action |
+| 13 | Pi migration | Survives reboot and a week unattended |

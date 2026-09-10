@@ -24,7 +24,7 @@ _DEFAULT_TAINT_SINKS = frozenset({"shared:write", "shared:publish", "message:oth
 
 @dataclass(frozen=True)
 class Binding:
-    """Where this agent is reachable. DMs are E.164; groups wait for phase 4."""
+    """Where this agent is reachable. DMs are E.164; group routing is unbuilt."""
 
     channel: str
     peer: str

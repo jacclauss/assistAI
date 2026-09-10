@@ -18,7 +18,7 @@ def test_defaults_are_conservative() -> None:
     assert settings.manifest_path is None
     assert settings.signal_account is None
     assert settings.allow_from == ()
-    assert settings.signal_dm_policy == "pairing"
+    assert settings.signal_dm_policy == "allowlist"
     assert settings.signal_base_url == "http://signal-cli:8080"
 
 

@@ -281,7 +281,7 @@ async def test_allowlisted_number_with_no_agent_is_flagged_at_startup(
 
 
 async def test_empty_allowlist_is_flagged_at_startup(tmp_path: Path) -> None:
-    """With no operator, nobody can ever approve a pairing code."""
+    """With no operator, nobody can text the bot."""
     gateway = Gateway(
         signal_settings(
             heartbeat_seconds=0.01,

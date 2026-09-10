@@ -4,31 +4,35 @@ A self-hosted, multi-agent assistant reachable over Signal, running open models
 through Fireworks AI. Developed on a Mac, deployed to a Raspberry Pi 5 as an
 always-on appliance.
 
-Three agents share one gateway: one for each of us, plus an organizer for shared
-household state. They have different read, write, and tool permissions, enforced
-by a broker rather than by convention.
+Two people text a dedicated bot number. Each reaches their own assistant, with
+different read, write, and tool permissions enforced by a broker. An organizer
+process may hold shared state and jobs; nobody texts it.
 
-See [docs/architecture.md](docs/architecture.md) for the design and the
-reasoning behind it.
+See [docs/prd.md](docs/prd.md) for what this is for, and
+[docs/architecture.md](docs/architecture.md) for how it is built.
 
 ## Status
 
-Phase 3 of 8. Two Signal numbers reach two agents with distinct identities and
-empty tool allowlists. The broker is the security boundary: a tool the model
-invents is refused before any handler runs. Pairing still admits a number; it
-does not assign an agent.
+Phase 3 of 13. Two Signal numbers reach two agents with distinct identities and
+empty tool allowlists. Unknown numbers hear nothing. The broker is the security
+boundary: a tool the model invents is refused before any handler runs.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
 | 0 | Skeleton: packaging, container, logging, tests | done |
 | 1 | Fireworks inference loop | done |
 | 2 | Signal channel | done |
-| 3 | Three agents and the tool broker | done |
-| 4 | Shared store with ACLs | |
-| 5 | Research tools: search, fetch, extract | |
-| 6 | Update watcher | |
-| 7 | Raspberry Pi migration | |
-| 8 | Household tools | |
+| 3 | Two agents and the tool broker | done |
+| 4 | Durable history, taint, and allowlist | |
+| 5 | Staged actions: propose, confirm, execute | |
+| 6 | Relay, including attachments | |
+| 7 | Jobs: schedules and TTL'd watches | |
+| 8 | Research tools: search, fetch, extract | |
+| 9 | Shared calendar (iCloud CalDAV) | |
+| 10 | Email (Gmail: read / file / draft) | |
+| 11 | Shared store with ACLs | |
+| 12 | Update watcher | |
+| 13 | Raspberry Pi migration | |
 
 ## Prerequisites
 
@@ -89,19 +93,20 @@ from its own account, so a personal number cannot text its own assistant.
    reaches no agent at all. Every permission is opt-in, `web_access` included.
    Restart the gateway. Text the bot from a bound phone.
 
-Unknown numbers receive a pairing code. Approve from an **operator** phone,
-meaning one listed in `ASSISTAI_SIGNAL_ALLOW_FROM`:
+Unknown numbers hear nothing. Set `ASSISTAI_SIGNAL_DM_POLICY=pairing` if a
+stranger should receive a code you can approve from an **operator** phone
+(one listed in `ASSISTAI_SIGNAL_ALLOW_FROM`):
 
 ```
 /approve 482193
 ```
 
 A number admitted this way can talk to the bot but cannot approve anyone else,
-so letting one person in never hands out the ability to let others in.
+so letting one person in never hands out the ability to let others in. Pairing
+replies are capped at 3 per hour per sender.
 
 Per-sender limits cap what a single number can spend: 12 turns per minute and
-4000 characters per message by default. Strangers get at most 3 pairing replies
-per hour, so a flood cannot turn the bot number into an outbound spam source.
+4000 characters per message by default.
 
 `make compare` scores the primary and every candidate in `manifest.toml` against
 the real `get_time` schema. That is the check that matters for swapping models;
@@ -113,6 +118,7 @@ reach it. Do not use that overlay on the Pi.
 ## Layout
 
 ```
+docs/prd.md               what the product must do; wins over architecture.md
 docs/architecture.md      design, threat model, phase plan
 manifest.toml             pinned external dependencies; the update watcher reads this
 config/                   agent roster; copy assistai.example.toml to assistai.toml

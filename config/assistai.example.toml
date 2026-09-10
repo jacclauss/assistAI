@@ -4,8 +4,8 @@
 # (gitignored) and put real numbers in. The gateway refuses to start Signal
 # without that file: two people texting the bot must reach two different agents.
 #
-# Being on ASSISTAI_SIGNAL_ALLOW_FROM is not enough to get an agent. Pairing
-# admits a number; this file decides who they become.
+# Being on ASSISTAI_SIGNAL_ALLOW_FROM is not enough to get an agent. That list
+# is who may talk to the bot; this file decides who they become.
 
 [signal]
 # Phase 2 still reads these from the environment (ASSISTAI_SIGNAL_*), not this
@@ -14,11 +14,12 @@
 # Dedicated bot number, never a personal one: signal-cli ignores messages from
 # its own account, so a personal number cannot text its own assistant.
 account = "+15555550100"
-dm_policy = "pairing"
+dm_policy = "allowlist"
 
-# Operators. Only these numbers may approve a pairing code with /approve NNNNNN.
-# Pairing admits a number to the bot; it does not give it an agent. Until a
-# binding below names that number, it reaches nothing.
+# Operators. Only these numbers may talk to the bot. Pairing is off by default:
+# unknown numbers hear nothing. If you set dm_policy to pairing, only these
+# numbers may approve a code with /approve NNNNNN, and pairing still does not
+# give the admitted number an agent until a binding below names it.
 allow_from = ["+15555550101", "+15555550102"]
 
 # web_access defaults to false. Only the two personal agents opt in, and only

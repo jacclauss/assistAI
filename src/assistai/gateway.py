@@ -116,7 +116,7 @@ class Gateway:
             if not self._settings.allow_from:
                 log.warning(
                     "gateway.signal_allowlist_empty",
-                    reason="set ASSISTAI_SIGNAL_ALLOW_FROM to approve pairing codes",
+                    reason="set ASSISTAI_SIGNAL_ALLOW_FROM or nobody can text the bot",
                 )
             household = self._household or load_household(
                 resolve_household_path(self._settings),
