@@ -132,7 +132,7 @@ state volume:
 - pending staged actions
 - job definitions, schedules, TTLs, and last-run state
 - relay records
-- the sender allowlist (today a separate JSON file)
+- the sender allowlist
 
 Two consequences worth stating plainly. A restart does not forget that a relay
 happened, so her assistant can still answer "what did he send me yesterday?"
@@ -304,7 +304,6 @@ that remain:
 
 - `receive_url()` sets `ignore_attachments=true`. Relay needs attachments.
 - The channel replies only to inbound messages. Jobs need an outbound path.
-- The broker knows `sink` but has no staging concept. Staged actions are new.
 
 ## Build phases
 

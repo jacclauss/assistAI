@@ -22,6 +22,7 @@ def test_defaults_are_conservative() -> None:
     assert settings.signal_base_url == "http://signal-cli:8080"
     assert settings.history_keep == 30
     assert settings.history_max_age_seconds == 14 * 24 * 3600
+    assert settings.staging_ttl_seconds == 600.0
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,8 +2,10 @@
 
 A bound surface advertises only the agent's allowlist, refuses anything else
 before the handler runs, and taints the conversation when an untrusted tool
-returns. Once tainted, configured sinks are refused even if they sit on the
-allowlist, and the taint outlives the turn because the untrusted text does.
+returns. Once tainted, unstaged sinks are refused even if they sit on the
+allowlist. Staging tools still propose: the handler does not run until the
+person confirms the stored call. Taint outlives the turn because the untrusted
+text does.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from assistai.inference.types import Message, ToolCall, ToolSpec
 log = structlog.get_logger(__name__)
 
 DenyReason = Literal["unknown", "acl", "web_access", "taint"]
+AuditAction = Literal["allow", "deny", "stage"]
 
 # The Pi runs this for weeks. Keep enough audit history to explain a refusal
 # without letting a long uptime grow the process.
@@ -42,15 +45,16 @@ class ToolMeta:
     trusted: bool = True
     sink: str | None = None
     web: bool = False
+    staging: bool = False
 
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """One allow or deny. Tests read this; production logs it."""
+    """One allow, deny, or stage. Tests read this; production logs it."""
 
     agent: str
     tool: str
-    action: Literal["allow", "deny"]
+    action: AuditAction
     reason: DenyReason | None = None
 
 
@@ -85,9 +89,10 @@ class ToolCatalog:
         trusted: bool = True,
         sink: str | None = None,
         web: bool = False,
+        staging: bool = False,
     ) -> None:
         self._registry.register(spec, handler)
-        self._meta[spec.name] = ToolMeta(trusted=trusted, sink=sink, web=web)
+        self._meta[spec.name] = ToolMeta(trusted=trusted, sink=sink, web=web, staging=staging)
 
     def names(self) -> frozenset[str]:
         return self._registry.names()
@@ -129,6 +134,9 @@ class ToolBroker:
                 reason=event.reason,
             )
             return
+        if event.action == "stage":
+            log.info("broker.staged", agent=event.agent, tool=event.tool)
+            return
         log.info("broker.executed", agent=event.agent, tool=event.tool)
 
 
@@ -149,6 +157,17 @@ class BoundSurface:
         self._agent = agent
         self._scope = scope
         self._record = record
+        self._staged: list[ToolCall] = []
+
+    @property
+    def tainted(self) -> bool:
+        return self._scope.tainted
+
+    def take_staged(self) -> tuple[ToolCall, ...]:
+        """Calls recorded this turn. Empty if the model did not stage."""
+        staged = tuple(self._staged)
+        self._staged.clear()
+        return staged
 
     def specs(self) -> list[ToolSpec]:
         allowed: list[ToolSpec] = []
@@ -170,8 +189,30 @@ class BoundSurface:
             )
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
-        result = await self._catalog.execute(call)
         meta = self._catalog.meta(call.name)
+        if meta.staging:
+            if not _arguments_are_object(call.arguments):
+                body = json.dumps({"error": "invalid_arguments", "name": call.name})
+                return ToolResult(body)
+            self._staged.append(call)
+            self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="stage"))
+            body = json.dumps({"status": "staged", "name": call.name, "arguments": call.arguments})
+            return ToolResult(body)
+        return await self._run(call, meta)
+
+    async def commit(self, call: ToolCall) -> ToolResult:
+        """Run a previously staged call. The handler runs; it is not re-staged."""
+        denied = self._deny_reason(call.name)
+        if denied is not None:
+            self._record(
+                AuditEvent(agent=self._agent.name, tool=call.name, action="deny", reason=denied)
+            )
+            body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
+            return ToolResult(body)
+        return await self._run(call, self._catalog.meta(call.name))
+
+    async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
+        result = await self._catalog.execute(call)
         if not meta.trusted:
             self._scope.tainted = True
         self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="allow"))
@@ -189,9 +230,18 @@ class BoundSurface:
             self._scope.tainted
             and meta.sink is not None
             and meta.sink in self._policy.tainted_sinks_denied
+            and not meta.staging
         ):
             return "taint"
         return None
+
+
+def _arguments_are_object(raw: str) -> bool:
+    try:
+        parsed: object = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
 
 
 def builtin_catalog() -> ToolCatalog:

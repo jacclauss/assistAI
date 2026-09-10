@@ -187,6 +187,89 @@ async def test_a_clean_history_does_not_taint() -> None:
     assert result == {"ok": True}
 
 
+async def test_a_staging_tool_does_not_run_until_commit() -> None:
+    wrote = {"n": 0}
+
+    def write(_arguments: dict[str, object]) -> str:
+        wrote["n"] += 1
+        return json.dumps({"ok": True})
+
+    catalog = builtin_catalog()
+    catalog.add(_spec("shared_write"), write, sink="shared:write", staging=True)
+    jacob = agent("jacob", "+15555550101", tools=("shared_write",))
+    broker = ToolBroker(catalog, household(jacob, agent("spouse", "+15555550102")).broker)
+    surface = broker.for_agent(jacob)
+    call = ToolCall(id="c1", name="shared_write", arguments='{"path": "list"}')
+
+    staged = await body(surface, call)
+
+    assert staged["status"] == "staged"
+    assert staged["arguments"] == '{"path": "list"}'
+    assert wrote["n"] == 0
+    assert surface.take_staged() == (call,)
+
+    committed = await surface.commit(call)
+
+    assert json.loads(committed.content) == {"ok": True}
+    assert wrote["n"] == 1
+    assert [event.action for event in broker.audit] == ["stage", "allow"]
+
+
+async def test_staging_accumulates_calls_in_one_turn() -> None:
+    catalog = builtin_catalog()
+    catalog.add(
+        _spec("shared_write"),
+        lambda _a: json.dumps({"ok": True}),
+        sink="shared:write",
+        staging=True,
+    )
+    jacob = agent("jacob", "+15555550101", tools=("shared_write",))
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    await surface.execute(ToolCall(id="c1", name="shared_write", arguments='{"id": "1"}'))
+    await surface.execute(ToolCall(id="c2", name="shared_write", arguments='{"id": "2"}'))
+
+    staged = surface.take_staged()
+    assert [call.arguments for call in staged] == ['{"id": "1"}', '{"id": "2"}']
+    assert surface.take_staged() == ()
+
+
+async def test_a_staging_sink_is_proposed_under_taint() -> None:
+    """Unstaged sinks stay refused. Staging is how a tainted conversation still acts."""
+    wrote = {"n": 0}
+
+    def write(_arguments: dict[str, object]) -> str:
+        wrote["n"] += 1
+        return json.dumps({"ok": True})
+
+    catalog = builtin_catalog()
+    catalog.add(
+        _spec("web_search"),
+        lambda _a: json.dumps({"hits": ["page"]}),
+        trusted=False,
+        web=True,
+    )
+    catalog.add(_spec("shared_write"), write, sink="shared:write", staging=True)
+    jacob = agent(
+        "jacob",
+        "+15555550101",
+        tools=("web_search", "shared_write"),
+        web_access=True,
+    )
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    await surface.execute(ToolCall(id="c1", name="web_search", arguments="{}"))
+    staged = await body(surface, ToolCall(id="c2", name="shared_write", arguments="{}"))
+
+    assert staged["status"] == "staged"
+    assert wrote["n"] == 0
+    assert surface.tainted is True
+
+
 async def test_web_access_false_hides_and_denies_web_tools() -> None:
     guest = agent(
         "guest",

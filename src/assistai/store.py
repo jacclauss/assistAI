@@ -1,8 +1,8 @@
 """Durable household state. One SQLite file in the gateway state volume.
 
-History, untrusted labels, and the pairing allowlist live here so a reboot
-cannot forget a conversation or silently clear taint. Staging and jobs will
-join this file later; they are not in this schema yet.
+History, untrusted labels, the pairing allowlist, and staged proposals live
+here so a reboot cannot forget a conversation, silently clear taint, or skip
+a confirmation. Jobs will join this file later.
 """
 
 from __future__ import annotations
@@ -11,17 +11,18 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
+from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -42,6 +43,14 @@ CREATE INDEX IF NOT EXISTS messages_agent_seq ON messages(agent, seq);
 CREATE TABLE IF NOT EXISTS allowlist (
     number TEXT PRIMARY KEY NOT NULL,
     admitted_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    agent TEXT PRIMARY KEY NOT NULL,
+    calls TEXT NOT NULL,
+    tainted INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
 );
 """
 
@@ -98,30 +107,84 @@ class Store:
 
     def save_history(self, agent: str, messages: list[Message]) -> None:
         """Replace persisted history. System messages are not stored."""
+        self.persist(agent, messages)
+
+    def persist(
+        self,
+        agent: str,
+        messages: list[Message],
+        *,
+        proposal: Proposal | Literal["keep"] | None = "keep",
+    ) -> None:
+        """Write history and optionally replace or clear the live proposal."""
         persisted = [message for message in messages if message.role in _PERSISTED_ROLES]
         try:
             with self._conn:
-                self._conn.execute("DELETE FROM messages WHERE agent = ?", (agent,))
-                self._conn.executemany(
-                    "INSERT INTO messages "
-                    "(agent, seq, role, content, tool_calls, tool_call_id, untrusted, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            agent,
-                            seq,
-                            message.role,
-                            message.content,
-                            _tool_calls_json(message),
-                            message.tool_call_id,
-                            1 if message.untrusted else 0,
-                            message.created_at if message.created_at is not None else time.time(),
-                        )
-                        for seq, message in enumerate(persisted)
-                    ],
-                )
+                self._replace_history(agent, persisted)
+                if proposal != "keep":
+                    self._replace_proposal_row(agent, proposal)
         except sqlite3.Error as exc:
             raise StoreError(f"history for {agent} could not be saved") from exc
+
+    def load_proposal(self, agent: str, *, now: float | None = None) -> Proposal | None:
+        """The live proposal, or None if missing or expired."""
+        proposal, _expired = self.take_proposal(agent, now=now)
+        return proposal
+
+    def take_proposal(
+        self, agent: str, *, now: float | None = None
+    ) -> tuple[Proposal | None, bool]:
+        """Return the live proposal and whether an expired row was dropped.
+
+        An expired row is deleted so a later yes cannot fire it. Corrupt JSON
+        fails closed: executing garbage would be worse than asking again.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT calls, tainted, created_at, expires_at FROM proposals WHERE agent = ?",
+                (agent,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError(f"proposal for {agent} is unreadable") from exc
+        if row is None:
+            return None, False
+        expires_at = row["expires_at"]
+        if not isinstance(expires_at, (int, float)):
+            raise StoreError(f"proposal for {agent} is unreadable")
+        if float(expires_at) <= (now if now is not None else time.time()):
+            self.clear_proposal(agent)
+            return None, True
+        created_at = row["created_at"]
+        if not isinstance(created_at, (int, float)):
+            raise StoreError(f"proposal for {agent} is unreadable")
+        tainted = row["tainted"]
+        if tainted not in (0, 1):
+            raise StoreError(f"proposal for {agent} is unreadable")
+        calls = _proposal_calls(row["calls"], agent=agent)
+        return (
+            Proposal(
+                agent=agent,
+                calls=tuple(calls),
+                tainted=bool(tainted),
+                created_at=float(created_at),
+                expires_at=float(expires_at),
+            ),
+            False,
+        )
+
+    def replace_proposal(self, proposal: Proposal) -> None:
+        try:
+            with self._conn:
+                self._replace_proposal_row(proposal.agent, proposal)
+        except sqlite3.Error as exc:
+            raise StoreError(f"proposal for {proposal.agent} could not be saved") from exc
+
+    def clear_proposal(self, agent: str) -> None:
+        try:
+            with self._conn:
+                self._conn.execute("DELETE FROM proposals WHERE agent = ?", (agent,))
+        except sqlite3.Error as exc:
+            raise StoreError(f"proposal for {agent} could not be saved") from exc
 
     def approved(self) -> frozenset[str]:
         try:
@@ -186,6 +249,43 @@ class Store:
             self._conn.executescript(_SCHEMA)
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
+    def _replace_history(self, agent: str, persisted: list[Message]) -> None:
+        self._conn.execute("DELETE FROM messages WHERE agent = ?", (agent,))
+        self._conn.executemany(
+            "INSERT INTO messages "
+            "(agent, seq, role, content, tool_calls, tool_call_id, untrusted, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    agent,
+                    seq,
+                    message.role,
+                    message.content,
+                    _tool_calls_json(message),
+                    message.tool_call_id,
+                    1 if message.untrusted else 0,
+                    message.created_at if message.created_at is not None else time.time(),
+                )
+                for seq, message in enumerate(persisted)
+            ],
+        )
+
+    def _replace_proposal_row(self, agent: str, proposal: Proposal | None) -> None:
+        self._conn.execute("DELETE FROM proposals WHERE agent = ?", (agent,))
+        if proposal is None:
+            return
+        self._conn.execute(
+            "INSERT INTO proposals (agent, calls, tainted, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                agent,
+                _proposal_calls_json(proposal.calls),
+                1 if proposal.tainted else 0,
+                proposal.created_at,
+                proposal.expires_at,
+            ),
+        )
+
 
 def _tool_calls_json(message: Message) -> str | None:
     if not message.tool_calls:
@@ -202,7 +302,7 @@ def _message_from_row(row: sqlite3.Row, *, agent: str) -> Message:
     if role not in _PERSISTED_ROLES:
         raise StoreError(f"history for {agent} is unreadable")
     raw_calls = row["tool_calls"]
-    tool_calls = _parse_tool_calls(raw_calls, agent=agent) if raw_calls else []
+    tool_calls = _parse_tool_calls(raw_calls, agent=agent, what="history") if raw_calls else []
     created_at = row["created_at"]
     if not isinstance(created_at, (int, float)):
         raise StoreError(f"history for {agent} is unreadable")
@@ -216,23 +316,36 @@ def _message_from_row(row: sqlite3.Row, *, agent: str) -> Message:
     )
 
 
-def _parse_tool_calls(raw: str, *, agent: str) -> list[ToolCall]:
+def _parse_tool_calls(raw: str, *, agent: str, what: str = "history") -> list[ToolCall]:
     try:
         parsed: Any = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise StoreError(f"history for {agent} is unreadable") from exc
+        raise StoreError(f"{what} for {agent} is unreadable") from exc
     if not isinstance(parsed, list):
-        raise StoreError(f"history for {agent} is unreadable")
+        raise StoreError(f"{what} for {agent} is unreadable")
     calls: list[ToolCall] = []
     for item in parsed:
         if not isinstance(item, dict):
-            raise StoreError(f"history for {agent} is unreadable")
+            raise StoreError(f"{what} for {agent} is unreadable")
         call_id = item.get("id")
         name = item.get("name")
         arguments = item.get("arguments")
         if not isinstance(call_id, str) or not isinstance(name, str):
-            raise StoreError(f"history for {agent} is unreadable")
+            raise StoreError(f"{what} for {agent} is unreadable")
         if not isinstance(arguments, str):
-            raise StoreError(f"history for {agent} is unreadable")
+            raise StoreError(f"{what} for {agent} is unreadable")
         calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
     return calls
+
+
+def _proposal_calls_json(calls: tuple[ToolCall, ...] | list[ToolCall]) -> str:
+    payload: list[dict[str, str]] = [
+        {"id": call.id, "name": call.name, "arguments": call.arguments} for call in calls
+    ]
+    return json.dumps(payload)
+
+
+def _proposal_calls(raw: object, *, agent: str) -> list[ToolCall]:
+    if not isinstance(raw, str):
+        raise StoreError(f"proposal for {agent} is unreadable")
+    return _parse_tool_calls(raw, agent=agent, what="proposal")

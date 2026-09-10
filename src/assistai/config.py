@@ -85,6 +85,9 @@ class Settings(BaseSettings):
     # (and ordinary memory) is allowed to live on disk after the last message.
     history_keep: int = Field(default=30, gt=0)
     history_max_age_seconds: float = Field(default=14 * 24 * 3600, gt=0)
+    # How long a staged proposal waits for a yes. A stale yes must not fire
+    # something the person has forgotten about.
+    staging_ttl_seconds: float = Field(default=600.0, gt=0)
 
     @field_validator("signal_account", mode="before")
     @classmethod

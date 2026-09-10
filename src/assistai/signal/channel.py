@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Literal
 
 import structlog
 
@@ -14,12 +15,13 @@ from assistai.conversation import apply_window, last_assistant_text
 from assistai.errors import AssistAIError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
-from assistai.inference.types import Message
+from assistai.inference.types import Message, ToolCall
 from assistai.manifest import Manifest
 from assistai.signal.client import SignalTransport
 from assistai.signal.envelopes import InboundText, parse_inbound
 from assistai.signal.policy import AccessPolicy
 from assistai.signal.ratelimit import RateLimiter
+from assistai.staging import Proposal, format_executed, format_proposal, parse_decision
 from assistai.store import Store
 
 log = structlog.get_logger(__name__)
@@ -44,6 +46,8 @@ _UNBOUND = (
     "This number is allowed to message the bot, but no agent is bound to it. "
     "The operator has to add a binding in config/assistai.toml."
 )
+_DISCARDED = "Discarded."
+_EXPIRED = "That proposal expired."
 
 
 class SignalChannel:
@@ -142,6 +146,8 @@ class SignalChannel:
             await self._safe_send(inbound.sender, _TOO_FAST)
             return
         async with self._slots:
+            if await self._handle_decision(inbound, agent):
+                return
             await self._converse(inbound, agent)
 
     async def _converse(self, inbound: InboundText, agent: AgentSpec) -> None:
@@ -177,6 +183,114 @@ class SignalChannel:
         reply = last_assistant_text(messages)
         if not reply:
             reply = _UNAVAILABLE
+        staged = surface.take_staged()
+        proposal: Proposal | Literal["keep"] = "keep"
+        if staged:
+            now = time.time()
+            preview = format_proposal(staged, tainted=surface.tainted)
+            messages.append(Message(role="assistant", content=preview, created_at=now))
+            reply = preview
+            proposal = Proposal(
+                agent=agent.name,
+                calls=staged,
+                tainted=surface.tainted,
+                created_at=now,
+                expires_at=now + self._settings.staging_ttl_seconds,
+            )
+        if not self._window_and_persist(agent.name, messages, proposal=proposal):
+            del messages[baseline:]
+            if staged:
+                self._abandon_live_proposal(agent.name)
+            await self._safe_send(inbound.sender, _SAVE_FAILED)
+            return
+        await self._safe_send(inbound.sender, reply)
+
+    async def _handle_decision(self, inbound: InboundText, agent: AgentSpec) -> bool:
+        """Confirm or discard a live proposal. False means this is a normal turn."""
+        decision = parse_decision(inbound.text)
+        if decision is None:
+            return False
+        try:
+            pending, expired = self._store.take_proposal(agent.name)
+        except StoreError:
+            log.exception("store.proposal_unreadable", agent=agent.name)
+            await self._safe_send(inbound.sender, _UNAVAILABLE)
+            return True
+        if expired:
+            reply = _EXPIRED if decision == "confirm" else _DISCARDED
+            await self._safe_send(inbound.sender, reply)
+            return True
+        if pending is None:
+            return False
+        if decision == "confirm":
+            await self._commit_proposal(inbound, agent, pending)
+        else:
+            await self._reject_proposal(inbound, agent)
+        return True
+
+    async def _commit_proposal(
+        self, inbound: InboundText, agent: AgentSpec, pending: Proposal
+    ) -> None:
+        # Load history before consuming the proposal. A yes that cannot
+        # proceed must still be retryable.
+        try:
+            messages = self._history(agent.name, system_prompt_for(agent))
+        except StoreError:
+            log.exception("store.history_unreadable", agent=agent.name)
+            await self._safe_send(inbound.sender, _UNAVAILABLE)
+            return
+        # Drop the proposal before the handlers run. A later yes must not fire
+        # the same stored calls twice if persist fails after the side effects.
+        try:
+            self._store.clear_proposal(agent.name)
+        except StoreError:
+            log.exception("store.proposal_clear_failed", agent=agent.name)
+            await self._safe_send(inbound.sender, _SAVE_FAILED)
+            return
+        surface: BoundSurface = self._broker.for_agent(agent, Scope.from_history(messages))
+        results: list[tuple[ToolCall, str]] = []
+        for call in pending.calls:
+            result = await surface.commit(call)
+            results.append((call, result.content))
+        now = time.time()
+        summary = format_executed(results)
+        messages.append(Message(role="user", content=inbound.text, created_at=now))
+        messages.append(Message(role="assistant", content=summary, created_at=now))
+        if not self._window_and_persist(agent.name, messages):
+            log.error("store.save_failed_after_commit", agent=agent.name)
+        log.info("staging.committed", agent=agent.name, calls=len(pending.calls))
+        await self._safe_send(inbound.sender, summary)
+
+    async def _reject_proposal(self, inbound: InboundText, agent: AgentSpec) -> None:
+        try:
+            messages = self._history(agent.name, system_prompt_for(agent))
+        except StoreError:
+            log.exception("store.history_unreadable", agent=agent.name)
+            await self._safe_send(inbound.sender, _UNAVAILABLE)
+            return
+        now = time.time()
+        messages.append(Message(role="user", content=inbound.text, created_at=now))
+        messages.append(Message(role="assistant", content=_DISCARDED, created_at=now))
+        if not self._window_and_persist(agent.name, messages, proposal=None):
+            await self._safe_send(inbound.sender, _SAVE_FAILED)
+            return
+        log.info("staging.discarded", agent=agent.name)
+        await self._safe_send(inbound.sender, _DISCARDED)
+
+    def _abandon_live_proposal(self, agent_name: str) -> None:
+        """A failed staging save must not leave an older proposal confirmable."""
+        try:
+            self._store.clear_proposal(agent_name)
+        except StoreError:
+            log.exception("store.proposal_clear_failed", agent=agent_name)
+
+    def _window_and_persist(
+        self,
+        agent_name: str,
+        messages: list[Message],
+        *,
+        proposal: Proposal | Literal["keep"] | None = "keep",
+    ) -> bool:
         windowed = messages[:]
         apply_window(
             windowed,
@@ -184,14 +298,12 @@ class SignalChannel:
             max_age_seconds=self._settings.history_max_age_seconds,
         )
         try:
-            self._store.save_history(agent.name, windowed)
+            self._store.persist(agent_name, windowed, proposal=proposal)
         except StoreError:
-            log.exception("store.save_failed", agent=agent.name)
-            del messages[baseline:]
-            await self._safe_send(inbound.sender, _SAVE_FAILED)
-            return
+            log.exception("store.save_failed", agent=agent_name)
+            return False
         messages[:] = windowed
-        await self._safe_send(inbound.sender, reply)
+        return True
 
     def _history(self, agent_name: str, prompt: str) -> list[Message]:
         if agent_name not in self._histories:

@@ -13,9 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 4 of 13. Two Signal numbers reach two agents with distinct identities.
-History, untrusted labels, and the pairing allowlist live in SQLite, so a
-reboot cannot forget a conversation or silently clear taint.
+Phase 5 of 13. Irreversible actions stage first: the broker stores the
+resolved call, Signal shows that preview, and a yes executes those bytes —
+not a second pass through the model.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ reboot cannot forget a conversation or silently clear taint.
 | 2 | Signal channel | done |
 | 3 | Two agents and the tool broker | done |
 | 4 | Durable history, taint, and allowlist | done |
-| 5 | Staged actions: propose, confirm, execute | |
+| 5 | Staged actions: propose, confirm, execute | done |
 | 6 | Relay, including attachments | |
 | 7 | Jobs: schedules and TTL'd watches | |
 | 8 | Research tools: search, fetch, extract | |

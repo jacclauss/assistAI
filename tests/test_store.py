@@ -8,6 +8,7 @@ import pytest
 
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
+from assistai.staging import Proposal
 from assistai.store import SCHEMA_VERSION, Store
 
 
@@ -141,3 +142,106 @@ def test_newer_schema_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(StoreError, match="newer than this build"):
         Store(path)
+
+
+def test_proposal_round_trips_and_replaces(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first = _proposal("jacob", '{"id": "1"}', expires_at=9_999_999_999)
+    second = _proposal("jacob", '{"id": "2"}', expires_at=9_999_999_999)
+
+    store.replace_proposal(first)
+    store.replace_proposal(second)
+
+    loaded = store.load_proposal("jacob")
+    assert loaded is not None
+    assert loaded.calls[0].arguments == '{"id": "2"}'
+    assert store.load_proposal("spouse") is None
+    store.close()
+
+
+def test_expired_proposal_cannot_be_loaded(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.replace_proposal(_proposal("jacob", "{}", created_at=1.0, expires_at=2.0))
+
+    assert store.load_proposal("jacob", now=3.0) is None
+    assert store.load_proposal("jacob", now=3.0) is None
+    store.close()
+
+
+def test_take_proposal_reports_expiry(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.replace_proposal(_proposal("jacob", "{}", created_at=1.0, expires_at=2.0))
+
+    live, expired = store.take_proposal("jacob", now=3.0)
+    assert live is None
+    assert expired is True
+    missing, expired_again = store.take_proposal("jacob", now=3.0)
+    assert missing is None
+    assert expired_again is False
+    store.close()
+
+
+def test_corrupt_proposal_fails_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.replace_proposal(_proposal("jacob", "{}", expires_at=9_999_999_999))
+    store.close()
+
+    conn = sqlite3.connect(tmp_path / "assistai.sqlite")
+    conn.execute("UPDATE proposals SET calls = 'not-json' WHERE agent = 'jacob'")
+    conn.commit()
+    conn.close()
+
+    reopened = Store(tmp_path / "assistai.sqlite")
+    with pytest.raises(StoreError, match="unreadable"):
+        reopened.load_proposal("jacob")
+    reopened.close()
+
+
+def test_schema_v1_gains_a_proposals_table(tmp_path: Path) -> None:
+    path = tmp_path / "assistai.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            untrusted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            UNIQUE(agent, seq)
+        );
+        CREATE TABLE allowlist (
+            number TEXT PRIMARY KEY NOT NULL,
+            admitted_at REAL NOT NULL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.replace_proposal(_proposal("jacob", "{}", expires_at=9_999_999_999))
+    assert store.load_proposal("jacob") is not None
+    store.close()
+
+
+def _proposal(
+    agent: str,
+    arguments: str,
+    *,
+    created_at: float = 1.0,
+    expires_at: float = 2.0,
+    tainted: bool = False,
+) -> Proposal:
+    return Proposal(
+        agent=agent,
+        calls=(ToolCall(id="c1", name="shared_write", arguments=arguments),),
+        tainted=tainted,
+        created_at=created_at,
+        expires_at=expires_at,
+    )

@@ -42,9 +42,10 @@ tools = []
 web_access = true
 
 [broker]
-# Once an untrusted tool result enters a conversation, these sinks are refused
-# before execution rather than after. Relay is not a free message:other_peer
-# tool; when it lands it will stage first.
+# Once an untrusted tool result enters a conversation, unstaged sinks are
+# refused before execution. Staging tools still propose; the person confirms
+# the stored call, and a proposal made under taint says so. Relay is not a
+# free message:other_peer tool; when it lands it will stage first.
 tainted_sinks_denied = ["shared:write", "shared:publish", "message:other_peer"]
 
 # Untrusted content is placed mid-prompt: models attend most strongly to the
