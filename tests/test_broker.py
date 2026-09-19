@@ -270,6 +270,33 @@ async def test_a_staging_sink_is_proposed_under_taint() -> None:
     assert surface.tainted is True
 
 
+async def test_relay_is_a_staging_sink() -> None:
+    """The model must not send on the first call; the stored body waits for yes."""
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+    call = ToolCall(id="c1", name="relay", arguments='{"body": "pick up milk"}')
+
+    staged = await body(surface, call)
+
+    assert staged["status"] == "staged"
+    assert staged["arguments"] == '{"body": "pick up milk"}'
+    assert surface.take_staged() == (call,)
+
+
+async def test_an_empty_relay_body_is_not_staged() -> None:
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    staged = await body(surface, ToolCall(id="c1", name="relay", arguments='{"body": "   "}'))
+
+    assert staged["error"] == "invalid_arguments"
+    assert surface.take_staged() == ()
+
+
 async def test_web_access_false_hides_and_denies_web_tools() -> None:
     guest = agent(
         "guest",

@@ -36,13 +36,15 @@ def envelope(
     data: dict[str, Any] = {"message": text, "timestamp": timestamp}
     if group:
         data["groupInfo"] = {"groupId": "abc", "revision": 1}
-    return {
-        "envelope": {
-            "sourceNumber": sender,
-            "timestamp": timestamp,
-            "dataMessage": data,
-        }
-    }
+    source: dict[str, Any] = {"timestamp": timestamp, "dataMessage": data}
+    if sender.startswith("+"):
+        source["sourceNumber"] = sender
+        source["source"] = sender
+    else:
+        source["source"] = sender
+        source["sourceUuid"] = sender
+        source["sourceNumber"] = ""
+    return {"envelope": source}
 
 
 def inbound(sender: str = "+15555550101", text: str = "hello") -> InboundText:
@@ -57,6 +59,7 @@ class FakeSignal:
         self.sent: list[tuple[str, str]] = []
         self.check_calls = 0
         self.waited = False
+        self.uuid_numbers: dict[str, str] = {}
         for frame in frames or ():
             self.inbox.put_nowait(frame)
 
@@ -84,6 +87,9 @@ class FakeSignal:
 
     async def aclose(self) -> None:
         return None
+
+    async def number_for_uuid(self, uuid: str) -> str | None:
+        return self.uuid_numbers.get(uuid.strip().lower())
 
 
 class FakeChannel:

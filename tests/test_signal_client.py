@@ -24,6 +24,7 @@ def test_receive_url_encodes_plus() -> None:
 
     assert url.startswith("ws://signal.test/v1/receive/%2B15555550100")
     assert "ignore_stories=true" in url
+    assert "ignore_attachments=true" in url
 
 
 def test_https_base_uses_wss() -> None:
@@ -191,12 +192,104 @@ async def test_send_splits_long_text() -> None:
     assert seen[1] == "x" * 100
 
 
+async def test_number_for_uuid_reads_contacts() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "/v1/contacts/" in request.url.path
+        assert "15555550100" in request.url.path
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "number": "+15555550101",
+                    "uuid": "429cce0e-9174-4d7a-a98b-1cb9208b1951",
+                }
+            ],
+        )
+
+    client = http_signal(handler)
+    found = await client.number_for_uuid("429CCE0E-9174-4D7A-A98B-1CB9208B1951")
+    await client.aclose()
+    assert found == "+15555550101"
+
+
+async def test_number_for_uuid_stitches_split_contact() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"number": "+15555550101", "uuid": ""},
+                {"number": "", "uuid": "429cce0e-9174-4d7a-a98b-1cb9208b1951"},
+                {"number": "+15555550100", "uuid": "13a428c0-42fb-4e89-ad6c-f50c8e7900a7"},
+            ],
+        )
+
+    client = http_signal(handler)
+    found = await client.number_for_uuid("429cce0e-9174-4d7a-a98b-1cb9208b1951")
+    await client.aclose()
+    assert found == "+15555550101"
+
+
+async def test_number_for_uuid_returns_none_when_contacts_fail() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    client = http_signal(handler)
+    found = await client.number_for_uuid("429cce0e-9174-4d7a-a98b-1cb9208b1951")
+    await client.aclose()
+    assert found is None
+
+
 async def test_send_skips_empty() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("should not send")
 
     client = http_signal(handler)
     await client.send("+15555550101", "   ")
+    await client.aclose()
+
+
+async def test_send_rate_limit_includes_challenge_tokens() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "error": "rate limited",
+                "challenge_tokens": ["3472e52f-7416-4e1a-8da3-668dfb59557c"],
+            },
+        )
+
+    client = http_signal(handler)
+    with pytest.raises(SignalError, match="3472e52f-7416-4e1a-8da3-668dfb59557c"):
+        await client.send("+15555550101", "hello")
+    await client.aclose()
+
+
+async def test_lift_rate_limit_posts_challenge() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    client = http_signal(handler)
+    await client.lift_rate_limit(
+        challenge_token="3472e52f-7416-4e1a-8da3-668dfb59557c",
+        captcha="signalcaptcha://proof",
+    )
+    await client.aclose()
+
+    assert seen[0].method == "POST"
+    assert "/rate-limit-challenge" in seen[0].url.path
+    assert json.loads(seen[0].content) == {
+        "challenge_token": "3472e52f-7416-4e1a-8da3-668dfb59557c",
+        "captcha": "signalcaptcha://proof",
+    }
+
+
+async def test_lift_rate_limit_rejects_non_captcha() -> None:
+    client = http_signal(lambda _request: httpx.Response(204))
+    with pytest.raises(SignalError, match="signalcaptcha://"):
+        await client.lift_rate_limit(challenge_token="abc", captcha="not-a-captcha")
     await client.aclose()
 
 
@@ -232,6 +325,27 @@ async def test_receive_skips_malformed_frames() -> None:
         return scripted_ws(["not-json", json.dumps({"ok": True})])
 
     client = SignalClient(signal_settings(), http=httpx.AsyncClient(), connect=connect)
+    stop = asyncio.Event()
+    got: list[object] = []
+    async for payload in client.receive(stop):
+        got.append(payload)
+        stop.set()
+
+    assert got == [{"ok": True}]
+    await client.aclose()
+
+
+async def test_receive_drops_oversized_frames() -> None:
+    huge = json.dumps({"envelope": {"sourceNumber": "+15555550101", "pad": "x" * 300_000}})
+
+    def connect(_url: str) -> AbstractAsyncContextManager[WebSocketConnection]:
+        return scripted_ws([huge, json.dumps({"ok": True})])
+
+    client = SignalClient(
+        signal_settings(signal_max_receive_bytes=1000),
+        http=httpx.AsyncClient(),
+        connect=connect,
+    )
     stop = asyncio.Event()
     got: list[object] = []
     async for payload in client.receive(stop):

@@ -30,22 +30,22 @@ allow_from = ["+15555550101", "+15555550102"]
 [agents.jacob]
 binds_to = { channel = "signal", peer = "+15555550101" }
 reads = ["own", "shared"]
-writes = []         # mail file/draft and relay land later as staged tools
-tools = []          # phase 8 adds: web_search, web_fetch
+writes = []
+tools = ["relay"]
 web_access = true
 
 [agents.spouse]
 binds_to = { channel = "signal", peer = "+15555550102" }
 reads = ["own", "shared"]
 writes = []
-tools = []
+tools = ["relay"]
 web_access = true
 
 [broker]
 # Once an untrusted tool result enters a conversation, unstaged sinks are
 # refused before execution. Staging tools still propose; the person confirms
-# the stored call, and a proposal made under taint says so. Relay is not a
-# free message:other_peer tool; when it lands it will stage first.
+# the stored call, and a proposal made under taint says so. Relay is a
+# staged tool named `relay`, not a free message:other_peer sink.
 tainted_sinks_denied = ["shared:write", "shared:publish", "message:other_peer"]
 
 # Untrusted content is placed mid-prompt: models attend most strongly to the

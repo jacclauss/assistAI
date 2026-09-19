@@ -19,11 +19,12 @@ from websockets.asyncio.client import connect as ws_connect
 
 from assistai.config import Settings
 from assistai.errors import SignalError, SignalUnavailableError
+from assistai.signal.numbers import InvalidNumberError, normalize_e164
 
 log = structlog.get_logger(__name__)
 
 # Older Signal clients truncate around 2 KiB. Stay under that and send parts.
-_MAX_SEND_CHARS = 1900
+MAX_SEND_CHARS = 1900
 
 
 class WebSocketConnection(Protocol):
@@ -49,6 +50,8 @@ class SignalTransport(Protocol):
     ) -> None: ...
 
     async def aclose(self) -> None: ...
+
+    async def number_for_uuid(self, uuid: str) -> str | None: ...
 
 
 class SignalClient:
@@ -146,7 +149,7 @@ class SignalClient:
         body = text.strip()
         if not body:
             return
-        for part in _chunks(body, _MAX_SEND_CHARS):
+        for part in _chunks(body, MAX_SEND_CHARS):
             await self._send_part(recipient, part)
 
     async def receive(self, stop: asyncio.Event) -> AsyncIterator[object]:
@@ -162,6 +165,14 @@ class SignalClient:
                     closer = _close_on_stop(stop, conn)
                     try:
                         async for raw in conn:
+                            size = _raw_size(raw)
+                            if size > self._settings.signal_max_receive_bytes:
+                                log.warning(
+                                    "signal.frame_too_large",
+                                    bytes=size,
+                                    limit=self._settings.signal_max_receive_bytes,
+                                )
+                                continue
                             decoded = _decode_frame(raw)
                             if decoded is not None:
                                 yield decoded
@@ -246,6 +257,68 @@ class SignalClient:
             return None
         return [item for item in payload if isinstance(item, str)]
 
+    async def number_for_uuid(self, uuid: str) -> str | None:
+        """Resolve a Signal ACI to E.164 when the contact store knows it.
+
+        Phone-number privacy often splits one person into a UUID-only row and a
+        number-only row. If that UUID is known and exactly one other contact
+        has a number and no UUID (besides this account), pair them.
+        """
+        if self._account is None:
+            return None
+        try:
+            response = await self._get(f"{self._base}/v1/contacts/{quote(self._account, safe='')}")
+        except SignalUnavailableError:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            payload: object = response.json()
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, list):
+            return None
+        want = uuid.strip().lower()
+        number_only: list[str] = []
+        uuid_without_number = False
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            listed_uuid = item.get("uuid")
+            listed_uuid = (
+                listed_uuid.strip().lower()
+                if isinstance(listed_uuid, str) and listed_uuid.strip()
+                else ""
+            )
+            listed_number = _contact_number(item.get("number"))
+            if listed_uuid == want:
+                if listed_number is not None:
+                    return listed_number
+                uuid_without_number = True
+                continue
+            if listed_number is not None and not listed_uuid and listed_number != self._account:
+                number_only.append(listed_number)
+        if uuid_without_number and len(number_only) == 1:
+            return number_only[0]
+        return None
+
+    async def lift_rate_limit(self, *, challenge_token: str, captcha: str) -> None:
+        """POST /v1/accounts/{number}/rate-limit-challenge after a 429 send."""
+        if self._account is None:
+            raise SignalError("ASSISTAI_SIGNAL_ACCOUNT is not set")
+        token = challenge_token.strip()
+        proof = captcha.strip()
+        if not token:
+            raise SignalError("challenge_token is empty")
+        if not proof.startswith("signalcaptcha://"):
+            raise SignalError("captcha must start with signalcaptcha://")
+        response = await self._post(
+            f"{self._base}/v1/accounts/{quote(self._account, safe='')}/rate-limit-challenge",
+            json={"challenge_token": token, "captcha": proof},
+        )
+        if response.status_code >= 400:
+            raise SignalError(_http_error(response))
+
     async def _send_part(self, recipient: str, text: str) -> None:
         payload = {
             "number": self._account,
@@ -256,12 +329,21 @@ class SignalClient:
             response = await self._http.post(f"{self._base}/v2/send", json=payload)
         except httpx.HTTPError as exc:
             raise SignalError("signal-cli send failed") from exc
+        if response.status_code == 429:
+            tokens = _challenge_tokens(response)
+            log.error("signal.send_rate_limited", tokens=tokens)
+            suffix = f" tokens={tokens}" if tokens else ""
+            raise SignalError(f"signal-cli HTTP 429: send rate-limited.{suffix}")
         if response.status_code >= 400:
             raise SignalError(_http_error(response))
 
 
 def _default_connect(url: str) -> AbstractAsyncContextManager[WebSocketConnection]:
     return ws_connect(url)
+
+
+def _raw_size(raw: str | bytes) -> int:
+    return len(raw) if isinstance(raw, bytes) else len(raw.encode())
 
 
 def _chunks(text: str, size: int) -> list[str]:
@@ -298,6 +380,31 @@ def _about_mode(response: httpx.Response) -> str | None:
         return None
     mode = payload.get("mode")
     return mode if isinstance(mode, str) else None
+
+
+def _challenge_tokens(response: httpx.Response) -> list[str]:
+    try:
+        payload: object = response.json()
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("challenge_tokens")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, str) and item.strip()]
+    token = payload.get("challenge_token")
+    if isinstance(token, str) and token.strip():
+        return [token.strip()]
+    return []
+
+
+def _contact_number(raw: object) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return normalize_e164(raw)
+    except InvalidNumberError:
+        return None
 
 
 def _http_error(response: httpx.Response) -> str:

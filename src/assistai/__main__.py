@@ -41,6 +41,15 @@ def main(argv: list[str] | None = None) -> None:
     register.add_argument("number", help="dedicated bot number in E.164")
     register.add_argument("--captcha", default=None, help="token from signalcaptchas.org")
     register.add_argument("--voice", action="store_true", help="call instead of SMS")
+    challenge = signal_sub.add_parser(
+        "challenge", help="lift a send rate limit with a challenge captcha"
+    )
+    challenge.add_argument("token", help="challenge_token from the 429 body")
+    challenge.add_argument(
+        "--captcha",
+        required=True,
+        help="signalcaptcha:// token from https://signalcaptchas.org/challenge/generate.html",
+    )
     verify = signal_sub.add_parser("verify", help="complete registration with the SMS code")
     verify.add_argument("number", help="dedicated bot number in E.164")
     verify.add_argument("code", help="verification code")
@@ -112,6 +121,10 @@ async def _signal(args: argparse.Namespace) -> None:
             number = normalize_e164(args.number)
             await client.verify(number, args.code)
             print(f"registered {number}")
+            return
+        if args.signal_command == "challenge":
+            await client.lift_rate_limit(challenge_token=args.token, captcha=args.captcha)
+            print("rate limit challenge accepted")
             return
     finally:
         await client.aclose()

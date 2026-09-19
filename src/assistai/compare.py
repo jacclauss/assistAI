@@ -47,7 +47,7 @@ class CompareResult:
 
 def eval_agent() -> AgentSpec:
     """Synthetic agent used only for the bake-off. Not reachable over Signal."""
-    return local_agent("eval")
+    return local_agent("eval", tools=("get_time",))
 
 
 async def compare_models(

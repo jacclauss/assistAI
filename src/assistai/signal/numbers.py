@@ -7,6 +7,10 @@ import re
 from assistai.errors import AssistAIError
 
 _E164 = re.compile(r"\+[1-9]\d{6,14}$")
+_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 class InvalidNumberError(AssistAIError, ValueError):
@@ -23,3 +27,8 @@ def normalize_e164(value: str) -> str:
     if not _E164.fullmatch(compact):
         raise InvalidNumberError(f"not an E.164 number: {value!r}")
     return compact
+
+
+def is_uuid(value: str) -> bool:
+    """Signal ACI / PNI identifiers. Phone-number privacy sends these instead of E.164."""
+    return bool(_UUID.fullmatch(value.strip()))

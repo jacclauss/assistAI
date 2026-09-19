@@ -27,6 +27,7 @@ from assistai.inference.tools import (
     get_time,
 )
 from assistai.inference.types import Message, ToolCall, ToolSpec
+from assistai.relay import RELAY_SPEC, RELAY_TOOL, RelayError, parse_body, using_agent
 
 log = structlog.get_logger(__name__)
 
@@ -94,6 +95,13 @@ class ToolCatalog:
         self._registry.register(spec, handler)
         self._meta[spec.name] = ToolMeta(trusted=trusted, sink=sink, web=web, staging=staging)
 
+    def bind(self, name: str, handler: ToolHandler) -> None:
+        """Replace the handler for a tool already on the catalog."""
+        spec = self._registry.spec(name)
+        if spec is None:
+            raise KeyError(name)
+        self._registry.register(spec, handler)
+
     def names(self) -> frozenset[str]:
         return self._registry.names()
 
@@ -123,6 +131,10 @@ class ToolBroker:
             scope=scope or Scope(),
             record=self.record,
         )
+
+    def bind(self, name: str, handler: ToolHandler) -> None:
+        """Replace the live handler for a catalog tool."""
+        self._catalog.bind(name, handler)
 
     def record(self, event: AuditEvent) -> None:
         self.audit.append(event)
@@ -194,6 +206,9 @@ class BoundSurface:
             if not _arguments_are_object(call.arguments):
                 body = json.dumps({"error": "invalid_arguments", "name": call.name})
                 return ToolResult(body)
+            if not _staging_args_ok(call, self._agent):
+                body = json.dumps({"error": "invalid_arguments", "name": call.name})
+                return ToolResult(body)
             self._staged.append(call)
             self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="stage"))
             body = json.dumps({"status": "staged", "name": call.name, "arguments": call.arguments})
@@ -212,7 +227,8 @@ class BoundSurface:
         return await self._run(call, self._catalog.meta(call.name))
 
     async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
-        result = await self._catalog.execute(call)
+        with using_agent(self._agent):
+            result = await self._catalog.execute(call)
         if not meta.trusted:
             self._scope.tainted = True
         self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="allow"))
@@ -244,8 +260,38 @@ def _arguments_are_object(raw: str) -> bool:
     return isinstance(parsed, dict)
 
 
+def _staging_args_ok(call: ToolCall, agent: AgentSpec) -> bool:
+    """Reject a staged call whose stored bytes could not be executed as-is."""
+    if call.name != RELAY_TOOL:
+        return True
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        if not isinstance(parsed, dict):
+            return False
+        parse_body(parsed, from_name=agent.name)
+    except (RelayError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def builtin_catalog() -> ToolCatalog:
-    """The tools this build actually implements. Signal ACLs start empty anyway."""
+    """The tools this build actually implements.
+
+    ``relay`` is on the catalog so household ACLs can name it. The live handler
+    is bound when the Signal channel has a store and a transport; until then a
+    commit fails closed as ``tool_failed``.
+    """
     catalog = ToolCatalog()
     catalog.add(GET_TIME_SPEC, get_time, trusted=True)
+
+    async def _unbound(_arguments: dict[str, object]) -> str:
+        raise RuntimeError("relay handler is not bound")
+
+    catalog.add(
+        RELAY_SPEC,
+        _unbound,
+        trusted=True,
+        sink="message:other_peer",
+        staging=True,
+    )
     return catalog

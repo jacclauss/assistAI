@@ -13,9 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 5 of 13. Irreversible actions stage first: the broker stores the
-resolved call, Signal shows that preview, and a yes executes those bytes —
-not a second pass through the model.
+Phase 6 of 13. "Tell her this" stages the exact Signal body, and on yes she
+receives it labelled as a relay. Her assistant's next turn knows it arrived
+and treats it as untrusted. File attachments are noted, not yet forwarded.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -25,7 +25,7 @@ not a second pass through the model.
 | 3 | Two agents and the tool broker | done |
 | 4 | Durable history, taint, and allowlist | done |
 | 5 | Staged actions: propose, confirm, execute | done |
-| 6 | Relay, including attachments | |
+| 6 | Relay, including attachments | done |
 | 7 | Jobs: schedules and TTL'd watches | |
 | 8 | Research tools: search, fetch, extract | |
 | 9 | Shared calendar (iCloud CalDAV) | |
@@ -73,8 +73,20 @@ from its own account, so a personal number cannot text its own assistant.
    ```
 
    Scan the printed URI from Signal → Settings → Linked devices.
-   To register a new number instead: `python -m assistai signal register +1…`
-   (usually needs a captcha from [signalcaptchas.org](https://signalcaptchas.org/registration/generate.html)).
+
+   The image entrypoint is already `python -m assistai`, so compose `run`
+   takes the subcommand only (`signal link`), not another `python -m assistai`.
+   To register a new number instead:
+
+   ```bash
+   docker compose -f docker/docker-compose.yml run --rm --no-deps gateway \
+     signal register +1… --captcha 'signal-recaptcha-v2.TOKEN'
+   docker compose -f docker/docker-compose.yml run --rm --no-deps gateway \
+     signal verify +1… 123-456
+   ```
+
+   (Registration usually needs a captcha from
+   [signalcaptchas.org](https://signalcaptchas.org/registration/generate.html).)
 3. Set in `.env`:
 
    ```

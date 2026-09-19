@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # much text one message can push into context.
     signal_rate_limit_per_minute: int = Field(default=12, gt=0)
     signal_max_inbound_chars: int = Field(default=4000, gt=0)
+    # Drop oversized receive frames before JSON parse so a file on the
+    # websocket cannot OOM the Pi. Attachment binaries stay off the wire
+    # via ignore_attachments; this is the backstop.
+    signal_max_receive_bytes: int = Field(default=256_000, gt=0)
     signal_pairing_replies_per_hour: int = Field(default=3, gt=0)
 
     # Conversation window. Count is the working context; age is how long taint

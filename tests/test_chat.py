@@ -53,6 +53,7 @@ async def test_once_goes_through_the_broker() -> None:
     body = json.loads(seen[0].content)
     names = [tool["function"]["name"] for tool in body["tools"]]
     assert names == ["get_time"]
+    assert "relay" not in names
     assert "agent 'repl'" in body["messages"][0]["content"]
     await client.aclose()
 

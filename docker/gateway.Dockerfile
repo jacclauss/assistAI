@@ -28,7 +28,11 @@ RUN uv sync --locked --no-dev
 FROM python:3.12-slim-bookworm
 
 # No shell tooling, no package manager use at runtime, never root.
-RUN useradd --system --create-home --uid 10001 assistai
+# /app/state must exist and be owned by this user so an empty named volume
+# copies that ownership in. Otherwise SQLite cannot create assistai.sqlite.
+RUN useradd --system --create-home --uid 10001 assistai \
+    && mkdir -p /app/state \
+    && chown assistai:assistai /app/state
 
 WORKDIR /app
 

@@ -66,8 +66,14 @@ services:
       retries: 12
       start_period: 60s
     # Writes account keys to the volume; do not make this service read-only.
+    # The image chowns that volume on start, so it cannot drop CHOWN/FOWNER.
     cap_drop:
-      - ALL
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - MKNOD
+      - AUDIT_WRITE
+      - SETPCAP
     security_opt:
       - no-new-privileges:true
     logging:

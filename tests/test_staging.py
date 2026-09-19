@@ -44,3 +44,15 @@ def test_executed_summary_keeps_call_order() -> None:
 
     assert summary.startswith("Ran 2 actions:")
     assert summary.index('{"ok": true}') < summary.index('{"ok": false}')
+
+
+def test_a_relay_preview_shows_the_stored_body() -> None:
+    preview = format_proposal(
+        (ToolCall(id="c1", name="relay", arguments='{"body": "pick up milk"}'),),
+        tainted=False,
+    )
+
+    assert "pick up milk" in preview
+    assert "Queued" not in preview
+    assert "yes" in preview.lower()
+    assert "relay from you" in preview.lower()

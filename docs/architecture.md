@@ -201,10 +201,14 @@ consume a person's conversational rate limit.
 
 ## Attachments
 
-Relay carries documents and images, so the receive path cannot keep
-`ignore_attachments=true`. Inbound attachments are downloaded to a size-capped
-scratch area, checked against a MIME allowlist, and treated as untrusted input
-exactly like a fetched page.
+Relay carries documents and images eventually, but this phase does not pull
+file bytes onto the Pi. Receive keeps `ignore_attachments=true` so the
+websocket does not carry binaries; signal-cli still lists name, type, and
+size on the envelope. Frames larger than `ASSISTAI_SIGNAL_MAX_RECEIVE_BYTES`
+are dropped. Downloading the bytes, MIME-checking them, and extracting text
+wait on the isolated extractor that lands with research; until then a
+file-only DM is turned into a prompt that asks the sender to paste a link.
+Outbound relays this phase are text (and links in that text).
 
 Text extraction runs in the same isolated extractor as web pages, so a
 malformed PDF or image cannot exploit a parser inside the gateway. Mail HTML
@@ -302,7 +306,6 @@ documented blast radius in comparable projects.
 Phase 3 shipped assumptions the PRD overturns. These are the concrete changes
 that remain:
 
-- `receive_url()` sets `ignore_attachments=true`. Relay needs attachments.
 - The channel replies only to inbound messages. Jobs need an outbound path.
 
 ## Build phases

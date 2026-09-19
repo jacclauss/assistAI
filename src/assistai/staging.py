@@ -48,6 +48,8 @@ def parse_decision(text: str) -> Decision | None:
 
 def format_proposal(calls: Sequence[ToolCall], *, tainted: bool) -> str:
     """Human-readable preview of the stored calls. This is what they confirm."""
+    if len(calls) == 1 and calls[0].name == "relay":
+        return _format_relay(calls[0], tainted=tainted)
     lines = [_heading(len(calls))]
     lines.extend(f"- `{call.name}` {_preview_args(call.arguments)}" for call in calls)
     lines.append("")
@@ -71,6 +73,26 @@ def _heading(count: int) -> str:
     if count == 1:
         return "I will run this when you confirm:\n"
     return f"I will run these {count} actions when you confirm:\n"
+
+
+def _format_relay(call: ToolCall, *, tainted: bool) -> str:
+    from assistai.relay import parse_body
+
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        body = parse_body(parsed) if isinstance(parsed, dict) else call.arguments
+    except Exception:
+        body = call.arguments
+    lines = [
+        "I will send this to the other phone when you confirm:\n",
+        f"From you:\n{body}",
+        "",
+        "They will see it as a relay from you, not as their assistant.",
+        _CONFIRM_HINT_ONE,
+    ]
+    if tainted:
+        lines.append(_TAINT_NOTE)
+    return "\n".join(lines)
 
 
 def _preview_args(raw: str) -> str:

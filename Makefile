@@ -79,11 +79,11 @@ logs-signal: ## Follow signal-cli logs
 
 .PHONY: signal-link
 signal-link: ## Print a device-link URI (scan from Signal on your phone)
-	$(COMPOSE) run --rm gateway python -m assistai signal link
+	$(COMPOSE) run --rm --no-deps gateway signal link
 
 .PHONY: signal-health
 signal-health: ## Check signal-cli from inside the compose network
-	$(COMPOSE) run --rm gateway python -m assistai signal health
+	$(COMPOSE) run --rm --no-deps gateway signal health
 
 .PHONY: build-pi
 build-pi: ## Build the arm64 image for the Raspberry Pi

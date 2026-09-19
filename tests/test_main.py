@@ -83,6 +83,9 @@ class _StubSignal:
     async def verify(self, number: str, code: str) -> None:
         self.calls.append(("verify", (number, code)))
 
+    async def lift_rate_limit(self, *, challenge_token: str, captcha: str) -> None:
+        self.calls.append(("challenge", (challenge_token, captcha)))
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -167,6 +170,27 @@ def test_signal_verify_passes_the_code(monkeypatch: pytest.MonkeyPatch) -> None:
     cli.main(["signal", "verify", "+15555550100", "123456"])
 
     assert made[0].calls == [("verify", ("+15555550100", "123456"))]
+
+
+def test_signal_challenge_posts_token_and_captcha(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    made = _stub_signal(monkeypatch)
+
+    cli.main(
+        [
+            "signal",
+            "challenge",
+            "3472e52f-7416-4e1a-8da3-668dfb59557c",
+            "--captcha",
+            "signalcaptcha://proof",
+        ]
+    )
+
+    assert made[0].calls == [
+        ("challenge", ("3472e52f-7416-4e1a-8da3-668dfb59557c", "signalcaptcha://proof"))
+    ]
+    assert "accepted" in capsys.readouterr().out
 
 
 def test_models_compare_exits_nonzero_when_nothing_works(
