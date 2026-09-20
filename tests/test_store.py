@@ -230,6 +230,412 @@ def test_schema_v1_gains_a_proposals_table(tmp_path: Path) -> None:
     store.close()
 
 
+def test_jobs_round_trip_and_due_query(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    job = Job(
+        id="jabcd1234",
+        agent="jacob",
+        kind="schedule",
+        name="morning email",
+        prompt="check mail",
+        every_seconds=86400,
+        ttl_seconds=None,
+        created_at=1.0,
+        expires_at=None,
+        next_run_at=10.0,
+        last_run_at=None,
+        cancelled_at=None,
+    )
+    store.save_job(job)
+    store.close()
+
+    reopened = Store(tmp_path / "assistai.sqlite")
+    loaded = reopened.find_job("jacob", name="Morning Email")
+    assert loaded is not None
+    assert loaded.id == "jabcd1234"
+    assert loaded.prompt == "check mail"
+    assert reopened.due_jobs(9.0) == []
+    assert reopened.due_jobs(10.0)[0].id == "jabcd1234"
+    reopened.cancel_job("jabcd1234", at=11.0)
+    assert reopened.list_jobs("jacob") == []
+    reopened.close()
+
+
+def test_find_job_requires_name_and_id_to_agree(tmp_path: Path) -> None:
+    """A cancel preview that names one job must not delete another by id."""
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+
+    def job(job_id: str, name: str) -> Job:
+        return Job(
+            id=job_id,
+            agent="jacob",
+            kind="schedule",
+            name=name,
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+
+    store.save_job(job("jabcd1234", "morning email"))
+    store.save_job(job("jeeee9999", "evening email"))
+    assert store.find_job("jacob", name="morning email", job_id="jeeee9999") is None
+    matched = store.find_job("jacob", name="morning email", job_id="jabcd1234")
+    assert matched is not None
+    assert matched.id == "jabcd1234"
+    store.close()
+
+
+def test_pending_outbox_is_due_even_when_next_run_is_in_the_future(tmp_path: Path) -> None:
+    """A reschedule must not hide a report that already ran."""
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=9_999.0,
+            last_run_at=None,
+            cancelled_at=None,
+            pending_text="[job: morning email]\nheld",
+            pending_after="advance",
+        )
+    )
+
+    due = store.due_jobs(10.0)
+    assert len(due) == 1
+    assert due[0].pending_text is not None
+    store.close()
+
+
+def test_reschedule_does_not_restore_a_cleared_outbox(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=60,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+            pending_text="[job: morning email]\nalready sent",
+            pending_after="advance",
+            pending_delivered=True,
+        )
+    )
+    assert store.advance_job("jabcd1234", now=10.0)
+    assert store.reschedule_job("jabcd1234", every_seconds=600, next_run_at=610.0)
+
+    loaded = store.find_job("jacob", name="morning email")
+    assert loaded is not None
+    assert loaded.pending_text is None
+    assert loaded.every_seconds == 600
+    assert loaded.next_run_at == 610.0
+    store.close()
+
+
+def test_two_active_jobs_cannot_share_a_name(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jaaaa1111",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    with pytest.raises(StoreError):
+        store.save_job(
+            Job(
+                id="jbbbb2222",
+                agent="jacob",
+                kind="schedule",
+                name="Morning Email",
+                prompt="again",
+                every_seconds=86400,
+                ttl_seconds=None,
+                created_at=1.0,
+                expires_at=None,
+                next_run_at=10.0,
+                last_run_at=None,
+                cancelled_at=None,
+            )
+        )
+    store.close()
+
+
+def test_save_job_does_not_overwrite_another_row(tmp_path: Path) -> None:
+    """Create is insert-only. Reusing an id must not rename someone else's job."""
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    with pytest.raises(StoreError):
+        store.save_job(
+            Job(
+                id="jabcd1234",
+                agent="jacob",
+                kind="schedule",
+                name="evening email",
+                prompt="again",
+                every_seconds=86400,
+                ttl_seconds=None,
+                created_at=2.0,
+                expires_at=None,
+                next_run_at=20.0,
+                last_run_at=None,
+                cancelled_at=None,
+            )
+        )
+    kept = store.find_job("jacob", name="morning email")
+    assert kept is not None
+    assert kept.prompt == "check mail"
+    assert store.find_job("jacob", name="evening email") is None
+    store.close()
+
+
+def test_schema_v2_gains_a_jobs_table(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    path = tmp_path / "assistai.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            untrusted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            UNIQUE(agent, seq)
+        );
+        CREATE TABLE allowlist (
+            number TEXT PRIMARY KEY NOT NULL,
+            admitted_at REAL NOT NULL
+        );
+        CREATE TABLE proposals (
+            agent TEXT PRIMARY KEY NOT NULL,
+            calls TEXT NOT NULL,
+            tainted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="watch",
+            name="flights",
+            prompt="look",
+            every_seconds=60,
+            ttl_seconds=3600,
+            created_at=1.0,
+            expires_at=3601.0,
+            next_run_at=61.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    assert store.find_job("jacob", name="flights") is not None
+    store.close()
+
+
+def test_schema_v4_gains_pending_notify_columns(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    path = tmp_path / "assistai.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            untrusted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            UNIQUE(agent, seq)
+        );
+        CREATE TABLE allowlist (
+            number TEXT PRIMARY KEY NOT NULL,
+            admitted_at REAL NOT NULL
+        );
+        CREATE TABLE proposals (
+            agent TEXT PRIMARY KEY NOT NULL,
+            calls TEXT NOT NULL,
+            tainted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        );
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            every_seconds INTEGER NOT NULL,
+            ttl_seconds INTEGER,
+            created_at REAL NOT NULL,
+            expires_at REAL,
+            next_run_at REAL NOT NULL,
+            last_run_at REAL,
+            cancelled_at REAL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 4")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+            pending_text="[job: morning email]\nheld",
+            pending_after="advance",
+        )
+    )
+    loaded = store.find_job("jacob", name="morning email")
+    assert loaded is not None
+    assert loaded.pending_text is not None
+    assert "held" in loaded.pending_text
+    store.close()
+
+
+def test_active_job_names_are_unique(tmp_path: Path) -> None:
+    from assistai.jobs import Job
+
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    with pytest.raises(StoreError):
+        store.save_job(
+            Job(
+                id="jffff9999",
+                agent="jacob",
+                kind="schedule",
+                name="Morning Email",
+                prompt="other",
+                every_seconds=86400,
+                ttl_seconds=None,
+                created_at=2.0,
+                expires_at=None,
+                next_run_at=20.0,
+                last_run_at=None,
+                cancelled_at=None,
+            )
+        )
+    store.cancel_job("jabcd1234", at=3.0)
+    store.save_job(
+        Job(
+            id="jffff9999",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="again",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=4.0,
+            expires_at=None,
+            next_run_at=30.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    found = store.find_job("jacob", name="morning email")
+    assert found is not None
+    assert found.id == "jffff9999"
+    store.close()
+
+
 def _proposal(
     agent: str,
     arguments: str,

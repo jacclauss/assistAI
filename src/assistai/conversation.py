@@ -34,14 +34,16 @@ def safe_trim(messages: list[Message], keep: int) -> None:
     """Drop the oldest turns, never splitting an assistant/tool exchange.
 
     A ``tool`` message whose assistant tool-call was trimmed away is rejected by
-    the provider, so the cut advances to the next ``user`` message, which is
-    always a clean turn boundary.
+    the provider, so a cut that lands on a tool result advances past it. Any
+    other role is a valid start: an assistant tool-call keeps its results, and
+    an assistant-only job report stands alone.
     """
     if len(messages) <= keep + 1:
         return
     cut = len(messages) - keep
-    while cut < len(messages) and messages[cut].role != "user":
-        cut += 1
+    if cut < 1:
+        cut = 1
+    cut = _past_orphan_tools(messages, cut)
     del messages[1:cut]
 
 
@@ -62,7 +64,46 @@ def _trim_older_than(messages: list[Message], cutoff: float) -> None:
     else:
         del messages[1:]
         return
-    while cut < len(messages) and messages[cut].role != "user":
-        cut += 1
+    cut = _past_orphan_tools(messages, cut)
     if cut > 1:
         del messages[1:cut]
+
+
+def _past_orphan_tools(messages: list[Message], cut: int) -> int:
+    """Advance a cut off a tool result whose assistant tool-call is being dropped.
+
+    Only the tool results move the cut. Stepping further, to the next ``user``,
+    would throw away every assistant-only job report that follows them.
+    """
+    while cut < len(messages) and messages[cut].role == "tool":
+        cut += 1
+    return cut
+
+
+def trusted_context(messages: list[Message]) -> list[Message]:
+    """History a job may send to the model. The stored window is unchanged.
+
+    Untrusted text stays on disk so taint can age out, but a background run
+    must not be steered by it or the digest launders the injection into a
+    trusted assistant line. A tainted tool exchange is dropped as a whole so
+    the provider never sees a dangling tool-call.
+    """
+    kept: list[Message] = []
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        if message.role == "assistant" and message.tool_calls:
+            end = i + 1
+            while end < len(messages) and messages[end].role == "tool":
+                end += 1
+            exchange = messages[i:end]
+            if any(item.untrusted for item in exchange):
+                i = end
+                continue
+            kept.extend(exchange)
+            i = end
+            continue
+        if not message.untrusted:
+            kept.append(message)
+        i += 1
+    return kept

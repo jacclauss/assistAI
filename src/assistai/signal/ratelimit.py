@@ -31,15 +31,27 @@ class RateLimiter:
 
     def allow(self, key: str) -> bool:
         """Record an attempt. False once the key is over its budget."""
+        hits = self._prepare(key)
+        if len(hits) >= self._limit:
+            return False
+        hits.append(self._clock())
+        return True
+
+    def would_allow(self, key: str) -> bool:
+        """True if ``allow`` would succeed. Does not spend the budget."""
+        return len(self._prepare(key)) < self._limit
+
+    def record(self, key: str) -> None:
+        """Spend one slot after a successful send. Does not refuse."""
+        self._prepare(key).append(self._clock())
+
+    def _prepare(self, key: str) -> deque[float]:
         now = self._clock()
         self._evict(now)
         hits = self._hits.setdefault(key, deque())
         while hits and hits[0] <= now - self._window:
             hits.popleft()
-        if len(hits) >= self._limit:
-            return False
-        hits.append(now)
-        return True
+        return hits
 
     def _evict(self, now: float) -> None:
         """Drop keys with no recent activity, then oldest, to bound memory."""

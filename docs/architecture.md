@@ -306,7 +306,9 @@ documented blast radius in comparable projects.
 Phase 3 shipped assumptions the PRD overturns. These are the concrete changes
 that remain:
 
-- The channel replies only to inbound messages. Jobs need an outbound path.
+- Jobs can send without an inbound trigger, but they still cannot stage an
+  action. Mail, calendar, and research tools are not implemented yet, so a
+  job's report is `get_time` plus whatever the model already knows.
 
 ## Build phases
 

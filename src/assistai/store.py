@@ -1,8 +1,8 @@
 """Durable household state. One SQLite file in the gateway state volume.
 
-History, untrusted labels, the pairing allowlist, and staged proposals live
-here so a reboot cannot forget a conversation, silently clear taint, or skip
-a confirmation. Jobs will join this file later.
+History, untrusted labels, the pairing allowlist, staged proposals, and jobs
+live here so a reboot cannot forget a conversation, silently clear taint,
+skip a confirmation, or drop a schedule.
 """
 
 from __future__ import annotations
@@ -17,12 +17,13 @@ import structlog
 
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
+from assistai.jobs import Job, JobKind
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
 from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -52,6 +53,29 @@ CREATE TABLE IF NOT EXISTS proposals (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY NOT NULL,
+    agent TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    every_seconds INTEGER NOT NULL,
+    ttl_seconds INTEGER,
+    created_at REAL NOT NULL,
+    expires_at REAL,
+    next_run_at REAL NOT NULL,
+    last_run_at REAL,
+    cancelled_at REAL,
+    pending_text TEXT,
+    pending_untrusted INTEGER NOT NULL DEFAULT 0,
+    pending_after TEXT,
+    pending_delivered INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
+CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_agent_active_name
+    ON jobs(agent, lower(name)) WHERE cancelled_at IS NULL;
 """
 
 _PERSISTED_ROLES = frozenset({"user", "assistant", "tool"})
@@ -237,6 +261,176 @@ class Store:
             return
         log.info("store.legacy_allowlist_imported", count=imported, retired=str(retired))
 
+    def save_job(self, job: Job) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO jobs (id, agent, kind, name, prompt, every_seconds, "
+                    "ttl_seconds, created_at, expires_at, next_run_at, last_run_at, "
+                    "cancelled_at, pending_text, pending_untrusted, pending_after, "
+                    "pending_delivered) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        job.id,
+                        job.agent,
+                        job.kind,
+                        job.name,
+                        job.prompt,
+                        job.every_seconds,
+                        job.ttl_seconds,
+                        job.created_at,
+                        job.expires_at,
+                        job.next_run_at,
+                        job.last_run_at,
+                        job.cancelled_at,
+                        job.pending_text,
+                        1 if job.pending_untrusted else 0,
+                        job.pending_after,
+                        1 if job.pending_delivered else 0,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(f"job {job.id} could not be saved") from exc
+
+    def list_jobs(self, agent: str) -> list[Job]:
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE agent = ? AND cancelled_at IS NULL "
+                "ORDER BY next_run_at ASC",
+                (agent,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError(f"jobs for {agent} are unreadable") from exc
+        return _jobs_from_rows(rows)
+
+    def due_jobs(self, now: float) -> list[Job]:
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE "
+                "(cancelled_at IS NULL AND ("
+                "pending_text IS NOT NULL OR "
+                "next_run_at <= ? OR "
+                "(kind = 'watch' AND expires_at IS NOT NULL AND expires_at <= ?)"
+                ")) OR (pending_text IS NOT NULL AND pending_delivered = 1) "
+                "ORDER BY next_run_at ASC",
+                (now, now),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError("due jobs are unreadable") from exc
+        return _jobs_from_rows(rows)
+
+    def find_job(
+        self, agent: str, *, name: str | None = None, job_id: str | None = None
+    ) -> Job | None:
+        try:
+            if job_id is not None and name is not None:
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND agent = ? AND cancelled_at IS NULL "
+                    "AND lower(name) = lower(?)",
+                    (job_id, agent, name),
+                ).fetchone()
+            elif job_id is not None:
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND agent = ? AND cancelled_at IS NULL",
+                    (job_id, agent),
+                ).fetchone()
+            elif name is not None:
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE agent = ? AND cancelled_at IS NULL "
+                    "AND lower(name) = lower(?)",
+                    (agent, name),
+                ).fetchone()
+            else:
+                return None
+        except sqlite3.Error as exc:
+            raise StoreError(f"jobs for {agent} are unreadable") from exc
+        if row is None:
+            return None
+        return _job_from_row(row)
+
+    def queue_job_report(self, job: Job) -> bool:
+        """Store the outbox fields only. False if the job was cancelled meanwhile.
+
+        The runner holds a row it read before a model call, so writing the whole
+        row back would revert a cancel or a reschedule the owner asked for while
+        the job was running.
+        """
+        return self._touch_job(
+            "UPDATE jobs SET pending_text = ?, pending_untrusted = ?, pending_after = ?, "
+            "pending_delivered = 0 WHERE id = ? AND cancelled_at IS NULL",
+            (job.pending_text, 1 if job.pending_untrusted else 0, job.pending_after),
+            job.id,
+        )
+
+    def mark_job_delivered(self, job_id: str) -> bool:
+        """Record that the report reached Signal. False if the outbox is already gone.
+
+        Cancel must not block this. The text already went out, and due_jobs only
+        retries a cancelled row once pending_delivered is set.
+        """
+        return self._touch_job(
+            "UPDATE jobs SET pending_delivered = 1 WHERE id = ? AND pending_text IS NOT NULL",
+            (),
+            job_id,
+        )
+
+    def advance_job(self, job_id: str, *, now: float) -> bool:
+        """Schedule the next run and clear the outbox. False if cancelled meanwhile.
+
+        The interval comes from the stored row, not from the runner's copy, so a
+        reschedule confirmed during the run is what takes effect.
+        """
+        return self._touch_job(
+            "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
+            "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
+            "pending_delivered = 0 WHERE id = ? AND cancelled_at IS NULL",
+            (now, now),
+            job_id,
+        )
+
+    def reschedule_job(self, job_id: str, *, every_seconds: int, next_run_at: float) -> bool:
+        """Change the interval without touching the outbox.
+
+        A full-row write from a snapshot taken before the runner queued or
+        cleared a report would hide a pending send, or put one back after it
+        had already gone out.
+        """
+        return self._touch_job(
+            "UPDATE jobs SET every_seconds = ?, next_run_at = ? "
+            "WHERE id = ? AND cancelled_at IS NULL",
+            (every_seconds, next_run_at),
+            job_id,
+        )
+
+    def clear_job_outbox(self, job_id: str) -> None:
+        """Drop a pending report. Used after persist when the job is already cancelled."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE jobs SET pending_text = NULL, pending_untrusted = 0, "
+                    "pending_after = NULL, pending_delivered = 0 WHERE id = ?",
+                    (job_id,),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(f"job {job_id} could not be saved") from exc
+
+    def _touch_job(self, sql: str, values: tuple[Any, ...], job_id: str) -> bool:
+        try:
+            with self._conn:
+                cursor = self._conn.execute(sql, (*values, job_id))
+        except sqlite3.Error as exc:
+            raise StoreError(f"job {job_id} could not be saved") from exc
+        return cursor.rowcount > 0
+
+    def cancel_job(self, job_id: str, *, at: float) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE jobs SET cancelled_at = ? WHERE id = ? AND cancelled_at IS NULL",
+                    (at, job_id),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(f"job {job_id} could not be saved") from exc
+
     def _init_schema(self) -> None:
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
         if version > SCHEMA_VERSION:
@@ -247,7 +441,22 @@ class Store:
             return
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._ensure_job_pending_columns()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _ensure_job_pending_columns(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols:
+            return
+        additions = (
+            ("pending_text", "TEXT"),
+            ("pending_untrusted", "INTEGER NOT NULL DEFAULT 0"),
+            ("pending_after", "TEXT"),
+            ("pending_delivered", "INTEGER NOT NULL DEFAULT 0"),
+        )
+        for name, decl in additions:
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
 
     def _replace_history(self, agent: str, persisted: list[Message]) -> None:
         self._conn.execute("DELETE FROM messages WHERE agent = ?", (agent,))
@@ -349,3 +558,91 @@ def _proposal_calls(raw: object, *, agent: str) -> list[ToolCall]:
     if not isinstance(raw, str):
         raise StoreError(f"proposal for {agent} is unreadable")
     return _parse_tool_calls(raw, agent=agent, what="proposal")
+
+
+def _job_from_row(row: sqlite3.Row) -> Job:
+    kind = row["kind"]
+    if kind not in ("schedule", "watch"):
+        raise StoreError(f"job {row['id']} is unreadable")
+    typed_kind: JobKind = kind
+    every_seconds = row["every_seconds"]
+    if not isinstance(every_seconds, int) or every_seconds <= 0:
+        raise StoreError(f"job {row['id']} is unreadable")
+    created_at = row["created_at"]
+    next_run_at = row["next_run_at"]
+    if not isinstance(created_at, (int, float)) or not isinstance(next_run_at, (int, float)):
+        raise StoreError(f"job {row['id']} is unreadable")
+    ttl_seconds = row["ttl_seconds"]
+    if ttl_seconds is not None and not isinstance(ttl_seconds, int):
+        raise StoreError(f"job {row['id']} is unreadable")
+    expires_at = row["expires_at"]
+    if expires_at is not None and not isinstance(expires_at, (int, float)):
+        raise StoreError(f"job {row['id']} is unreadable")
+    last_run_at = row["last_run_at"]
+    if last_run_at is not None and not isinstance(last_run_at, (int, float)):
+        raise StoreError(f"job {row['id']} is unreadable")
+    cancelled_at = row["cancelled_at"]
+    if cancelled_at is not None and not isinstance(cancelled_at, (int, float)):
+        raise StoreError(f"job {row['id']} is unreadable")
+    name = row["name"]
+    prompt = row["prompt"]
+    agent = row["agent"]
+    job_id = row["id"]
+    if not isinstance(name, str) or not isinstance(prompt, str):
+        raise StoreError(f"job {job_id} is unreadable")
+    if not isinstance(agent, str) or not isinstance(job_id, str):
+        raise StoreError("job row is unreadable")
+    return Job(
+        id=job_id,
+        agent=agent,
+        kind=typed_kind,
+        name=name,
+        prompt=prompt,
+        every_seconds=every_seconds,
+        ttl_seconds=ttl_seconds,
+        created_at=float(created_at),
+        expires_at=float(expires_at) if expires_at is not None else None,
+        next_run_at=float(next_run_at),
+        last_run_at=float(last_run_at) if last_run_at is not None else None,
+        cancelled_at=float(cancelled_at) if cancelled_at is not None else None,
+        pending_text=_optional_str(row["pending_text"], job_id),
+        pending_untrusted=_flag(row["pending_untrusted"], job_id),
+        pending_after=_pending_after(row["pending_after"], job_id),
+        pending_delivered=_flag(row["pending_delivered"], job_id),
+    )
+
+
+def _jobs_from_rows(rows: list[sqlite3.Row]) -> list[Job]:
+    """Skip a corrupt row so one bad job cannot hide the rest of the list."""
+    jobs: list[Job] = []
+    for row in rows:
+        try:
+            jobs.append(_job_from_row(row))
+        except StoreError:
+            ident = row["id"] if "id" in row.keys() else None
+            log.exception("store.job_unreadable", job=ident)
+    return jobs
+
+
+def _optional_str(raw: object, job_id: str) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise StoreError(f"job {job_id} is unreadable")
+    return raw
+
+
+def _flag(raw: object, job_id: str) -> bool:
+    if raw in (0, 1):
+        return bool(raw)
+    if raw is None:
+        return False
+    raise StoreError(f"job {job_id} is unreadable")
+
+
+def _pending_after(raw: object, job_id: str) -> Literal["advance", "cancel"] | None:
+    if raw is None:
+        return None
+    if raw in ("advance", "cancel"):
+        return raw
+    raise StoreError(f"job {job_id} is unreadable")

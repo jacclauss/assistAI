@@ -13,9 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 6 of 13. "Tell her this" stages the exact Signal body, and on yes she
-receives it labelled as a relay. Her assistant's next turn knows it arrived
-and treats it as untrusted. File attachments are noted, not yet forwarded.
+Phase 7 of 13. Jobs are first-class: a schedule always texts the owner, a
+watch stays quiet unless it finds something, fails, or hits its TTL, and
+both survive a reboot. They report; they do not act.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ and treats it as untrusted. File attachments are noted, not yet forwarded.
 | 4 | Durable history, taint, and allowlist | done |
 | 5 | Staged actions: propose, confirm, execute | done |
 | 6 | Relay, including attachments | done |
-| 7 | Jobs: schedules and TTL'd watches | |
+| 7 | Jobs: schedules and TTL'd watches | done |
 | 8 | Research tools: search, fetch, extract | |
 | 9 | Shared calendar (iCloud CalDAV) | |
 | 10 | Email (Gmail: read / file / draft) | |
@@ -104,6 +104,12 @@ from its own account, so a personal number cannot text its own assistant.
    not give them someone else's assistant, and an allowed number with no binding
    reaches no agent at all. Every permission is opt-in, `web_access` included.
    Restart the gateway. Text the bot from a bound phone.
+
+   Job tools on the roster let you schedule and cancel from Signal. A schedule
+   always texts you; a watch stays quiet unless it finds something, fails, or
+   expires. Until mail, calendar, and research land, a job can only report
+   with `get_time` plus whatever the model already knows. Copy the example
+   tools into a live `config/assistai.toml` that was created earlier.
 
 Unknown numbers hear nothing. Set `ASSISTAI_SIGNAL_DM_POLICY=pairing` if a
 stranger should receive a code you can approve from an **operator** phone

@@ -12,13 +12,15 @@ import structlog
 from assistai.agents import AgentSpec, Household, system_prompt_for
 from assistai.broker import BoundSurface, Scope, ToolBroker
 from assistai.config import Settings
-from assistai.conversation import apply_window, last_assistant_text
+from assistai.conversation import apply_window, last_assistant_text, trusted_context
 from assistai.errors import AssistAIError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
 from assistai.inference.types import Message, ToolCall
+from assistai.jobs import Job, JobOutcome, bind_jobs, is_nothing, job_user_prompt
 from assistai.manifest import Manifest
 from assistai.relay import RELAY_TOOL, RelayError, bind_relay
+from assistai.scheduler import NotifyStatus
 from assistai.signal.client import SignalTransport
 from assistai.signal.envelopes import InboundText, parse_inbound
 from assistai.signal.numbers import is_uuid
@@ -54,10 +56,10 @@ _EXPIRED = "That proposal expired."
 
 
 class SignalChannel:
-    """One inbound text → at most one outbound reply.
+    """Inbound DMs and job reports over Signal.
 
     Turns are serialized per sender, so a slow model call for one person does
-    not block the other.
+    not block the other. Job sends use a separate meter.
     """
 
     def __init__(
@@ -88,6 +90,8 @@ class SignalChannel:
                 inject=self._inject_relay,
             ),
         )
+        for name, handler in bind_jobs(store).items():
+            broker.bind(name, handler)
         self._histories: dict[str, list[Message]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._history_locks: dict[str, asyncio.Lock] = {}
@@ -96,7 +100,9 @@ class SignalChannel:
         # Strangers get a much smaller budget: each reply is outbound traffic
         # from the bot number, which Signal counts against us, not them.
         self._pairing = RateLimiter(settings.signal_pairing_replies_per_hour, 3600.0)
+        self._job_sends = RateLimiter(settings.signal_job_messages_per_hour, 3600.0)
         self._slots = asyncio.Semaphore(settings.max_concurrent_turns)
+        broker.use_store(store)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Consume receive frames until shutdown.
@@ -185,6 +191,90 @@ class SignalChannel:
             if await self._handle_decision(inbound, agent):
                 return
             await self._converse(inbound, agent)
+
+    async def run_job(self, agent: AgentSpec, job: Job) -> JobOutcome:
+        """Report-only turn for a due job. Does not send; the runner decides."""
+        if self._fireworks is None or self._manifest is None:
+            raise AssistAIError(_NOT_CONFIGURED)
+        # Same order as an inbound turn: peer, then slot, then history. A relay
+        # confirm holds a slot while it waits for the other person's history
+        # lock, so taking history before the slot can deadlock both of them.
+        async with self._lock_for(agent.binding.peer):
+            async with self._slots:
+                async with self._history_lock(agent.name):
+                    try:
+                        messages = self._history(agent.name, system_prompt_for(agent))
+                    except StoreError:
+                        log.exception("store.history_unreadable", agent=agent.name)
+                        raise
+                    surface: BoundSurface = self._broker.for_agent(
+                        agent, Scope.from_history(messages), report_only=True
+                    )
+                    scratch = [
+                        *trusted_context(messages),
+                        Message(
+                            role="user",
+                            content=job_user_prompt(job),
+                            created_at=time.time(),
+                        ),
+                    ]
+                    await run_turn(
+                        self._fireworks,
+                        self._manifest.primary,
+                        scratch,
+                        surface,
+                        max_tool_rounds=self._settings.max_tool_rounds,
+                    )
+                    text = last_assistant_text(scratch) or ""
+                    # Label this report for what this run fetched. Inherited
+                    # taint stays on the messages that carry it, so it can
+                    # still age out of the window on schedule.
+                    return JobOutcome(
+                        text=text,
+                        found=not is_nothing(text),
+                        untrusted=surface.fetched_untrusted,
+                    )
+
+    def can_notify_job(self, agent: AgentSpec) -> bool:
+        return self._job_sends.would_allow(agent.name)
+
+    async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
+        """Send a job report. History is persisted separately after delivery is recorded."""
+        _ = untrusted
+        if not self._job_sends.would_allow(agent.name):
+            return "rate_limited"
+        try:
+            await self._signal.send(agent.binding.peer, text)
+        except AssistAIError:
+            log.exception("signal.send_failed", recipient=agent.binding.peer)
+            return "failed"
+        self._job_sends.record(agent.name)
+        return "sent"
+
+    async def persist_job_report(self, agent: AgentSpec, text: str, *, untrusted: bool) -> bool:
+        """Append a job report that already went out over Signal."""
+        async with self._history_lock(agent.name):
+            self._histories.pop(agent.name, None)
+            try:
+                messages = self._history(agent.name, system_prompt_for(agent))
+            except StoreError:
+                log.exception("store.history_unreadable", agent=agent.name)
+                return False
+            messages.append(
+                Message(
+                    role="assistant",
+                    content=text,
+                    untrusted=untrusted,
+                    created_at=time.time(),
+                )
+            )
+            saved = self._window_and_persist(agent.name, messages)
+            if not saved:
+                # The append mutated the cached list. Leave it there and a later
+                # turn persists a report the store never accepted; the retry
+                # then appends it a second time.
+                self._histories.pop(agent.name, None)
+            return saved
 
     async def _converse(self, inbound: InboundText, agent: AgentSpec) -> None:
         if self._fireworks is None or self._manifest is None:

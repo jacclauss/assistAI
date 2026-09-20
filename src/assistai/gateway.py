@@ -19,6 +19,7 @@ from assistai.broker import ToolBroker, builtin_catalog
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
+from assistai.scheduler import JobRunner
 from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
@@ -58,6 +59,8 @@ class Gateway:
         self._store: Store | None = None
         self._owns_store = False
         self._channel_task: asyncio.Task[None] | None = None
+        self._job_task: asyncio.Task[None] | None = None
+        self._jobs: JobRunner | None = None
         self._shutdown = asyncio.Event()
         self._beats = 0
         self.validated_refs: tuple[str, ...] = ()
@@ -154,7 +157,10 @@ class Gateway:
                 broker=broker,
                 store=store,
             )
+            self._jobs = JobRunner(store, household, self._channel, self._settings)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
+        if self._jobs is not None:
+            self._job_task = asyncio.create_task(self._jobs.run(self._shutdown))
         log.info("gateway.signal_started", account=self._settings.signal_account)
 
     async def _run_channel(self, channel: ChannelRunner) -> None:
@@ -165,19 +171,24 @@ class Gateway:
             self.request_shutdown("signal_channel_failed")
 
     async def _stop_signal(self) -> None:
-        if self._channel_task is None:
-            return
         self._shutdown.set()
+        await self._await_task(self._channel_task)
+        await self._await_task(self._job_task)
+        self._channel_task = None
+        self._job_task = None
+
+    async def _await_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
         try:
             await asyncio.wait_for(
-                self._channel_task,
+                task,
                 timeout=self._settings.shutdown_grace_seconds,
             )
         except TimeoutError:
-            self._channel_task.cancel()
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._channel_task
-        self._channel_task = None
+                await task
 
     async def _close_owned(self) -> None:
         if self._owns_signal and self._signal is not None:

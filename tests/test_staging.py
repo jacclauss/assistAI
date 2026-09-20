@@ -56,3 +56,58 @@ def test_a_relay_preview_shows_the_stored_body() -> None:
     assert "Queued" not in preview
     assert "yes" in preview.lower()
     assert "relay from you" in preview.lower()
+
+
+def test_a_job_create_preview_shows_the_stored_schedule() -> None:
+    preview = format_proposal(
+        (
+            ToolCall(
+                id="c1",
+                name="job_create",
+                arguments=(
+                    '{"kind": "schedule", "name": "morning email", '
+                    '"prompt": "summarize important mail", "every_seconds": 86400}'
+                ),
+            ),
+        ),
+        tainted=False,
+    )
+
+    assert "morning email" in preview
+    assert "summarize important mail" in preview
+    assert "86400" in preview
+    assert "yes" in preview.lower()
+
+
+def test_a_job_cancel_preview_names_the_job() -> None:
+    preview = format_proposal(
+        (ToolCall(id="c1", name="job_cancel", arguments='{"name": "morning email"}'),),
+        tainted=False,
+    )
+
+    assert "morning email" in preview
+    assert "cancel" in preview.lower()
+    assert "yes" in preview.lower()
+
+
+def test_cancel_then_create_preview_names_the_jobs() -> None:
+    preview = format_proposal(
+        (
+            ToolCall(id="c1", name="job_cancel", arguments='{"name": "morning email"}'),
+            ToolCall(
+                id="c2",
+                name="job_create",
+                arguments=(
+                    '{"kind": "schedule", "name": "morning email", '
+                    '"prompt": "summarize important mail", "every_seconds": 86400}'
+                ),
+            ),
+        ),
+        tainted=False,
+    )
+
+    assert "morning email" in preview
+    assert "cancel" in preview.lower()
+    assert "summarize important mail" in preview
+    assert "`job_cancel`" not in preview
+    assert "yes" in preview.lower()

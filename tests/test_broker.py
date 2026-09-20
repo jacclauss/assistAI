@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from assistai.agents import AgentSpec
 from assistai.broker import AUDIT_LIMIT, AuditEvent, Scope, ToolBroker, builtin_catalog
 from assistai.inference.types import Message, ToolCall, ToolSpec
+from assistai.jobs import Job, bind_jobs
+from assistai.store import Store
 from tests.agent_fakes import agent, household
 from tests.fakes import body, tool_call
 
@@ -295,6 +298,316 @@ async def test_an_empty_relay_body_is_not_staged() -> None:
 
     assert staged["error"] == "invalid_arguments"
     assert surface.take_staged() == ()
+
+
+async def test_job_create_is_staged() -> None:
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+    arguments = (
+        '{"kind": "schedule", "name": "morning email", '
+        '"prompt": "summarize important mail", "every_seconds": 86400}'
+    )
+    call = ToolCall(id="c1", name="job_create", arguments=arguments)
+
+    staged = await body(surface, call)
+
+    assert staged["status"] == "staged"
+    assert surface.take_staged() == (call,)
+
+
+async def test_a_watch_without_ttl_is_not_staged() -> None:
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    staged = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=(
+                '{"kind": "watch", "name": "flights", '
+                '"prompt": "look for cheaper flights", "every_seconds": 3600}'
+            ),
+        ),
+    )
+
+    assert staged["error"] == "invalid_arguments"
+    assert surface.take_staged() == ()
+
+
+async def test_duplicate_job_name_is_not_staged(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+    )
+    for name, handler in bind_jobs(store).items():
+        broker.bind(name, handler)
+    surface = broker.for_agent(jacob)
+
+    staged = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=(
+                '{"kind": "schedule", "name": "morning email", '
+                '"prompt": "summarize important mail", "every_seconds": 86400}'
+            ),
+        ),
+    )
+
+    assert staged["error"] == "invalid_arguments"
+    assert "already exists" in staged["message"]
+    assert surface.take_staged() == ()
+    store.close()
+
+
+async def test_a_second_create_in_the_same_turn_cannot_reuse_the_name() -> None:
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+    first = (
+        '{"kind": "schedule", "name": "morning email", '
+        '"prompt": "summarize important mail", "every_seconds": 86400}'
+    )
+    second = (
+        '{"kind": "schedule", "name": "Morning Email", "prompt": "again", "every_seconds": 86400}'
+    )
+
+    assert (await body(surface, ToolCall(id="c1", name="job_create", arguments=first)))[
+        "status"
+    ] == "staged"
+    duplicate = await body(surface, ToolCall(id="c2", name="job_create", arguments=second))
+
+    assert duplicate["error"] == "invalid_arguments"
+    assert "already exists" in duplicate["message"]
+    assert len(surface.take_staged()) == 1
+
+
+async def test_cancel_then_recreate_can_reuse_the_name(tmp_path: Path) -> None:
+    """A replace in one yes is cancel-then-create. The live row must not block it."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "job_cancel"))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+    )
+    surface = broker.for_agent(jacob)
+
+    cancel = await body(
+        surface,
+        ToolCall(id="c1", name="job_cancel", arguments='{"name": "morning email"}'),
+    )
+    create = await body(
+        surface,
+        ToolCall(
+            id="c2",
+            name="job_create",
+            arguments=(
+                '{"kind": "schedule", "name": "morning email", '
+                '"prompt": "summarize important mail", "every_seconds": 86400}'
+            ),
+        ),
+    )
+
+    assert cancel["status"] == "staged"
+    assert create["status"] == "staged"
+    assert len(surface.take_staged()) == 2
+    store.close()
+
+
+async def test_commit_surfaces_job_error_text(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+    )
+    for name, handler in bind_jobs(store).items():
+        broker.bind(name, handler)
+
+    committed = await broker.for_agent(jacob).commit(
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=(
+                '{"kind": "schedule", "name": "morning email", '
+                '"prompt": "summarize important mail", "every_seconds": 86400}'
+            ),
+        )
+    )
+    payload = json.loads(committed.content)
+    assert payload["error"] == "tool_failed"
+    assert "already exists" in payload["message"]
+    store.close()
+
+
+async def test_cancel_with_mismatched_name_and_id_is_not_staged(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="morning email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    store.save_job(
+        Job(
+            id="jeeee9999",
+            agent="jacob",
+            kind="schedule",
+            name="evening email",
+            prompt="check mail",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("job_cancel",))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+    )
+    surface = broker.for_agent(jacob)
+
+    staged = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_cancel",
+            arguments='{"name": "morning email", "id": "jeeee9999"}',
+        ),
+    )
+
+    assert staged["error"] == "invalid_arguments"
+    assert staged["message"] == "no matching job"
+    assert surface.take_staged() == ()
+    store.close()
+
+
+async def test_reschedule_longer_than_ttl_is_not_staged(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="watch",
+            name="flights",
+            prompt="look",
+            every_seconds=3600,
+            ttl_seconds=3600,
+            created_at=1.0,
+            expires_at=3601.0,
+            next_run_at=61.0,
+            last_run_at=None,
+            cancelled_at=None,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("job_reschedule",))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+    )
+    for name, handler in bind_jobs(store).items():
+        broker.bind(name, handler)
+    surface = broker.for_agent(jacob)
+
+    staged = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_reschedule",
+            arguments='{"name": "flights", "every_seconds": 7200}',
+        ),
+    )
+
+    assert staged["error"] == "invalid_arguments"
+    assert surface.take_staged() == ()
+    store.close()
+
+
+async def test_report_only_surface_hides_relay_and_jobs() -> None:
+    jacob = agent("jacob", "+15555550101", tools=("get_time", "relay", "job_create"))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob, report_only=True)
+
+    assert [spec.name for spec in surface.specs()] == ["get_time"]
+    denied = await body(surface, ToolCall(id="c1", name="relay", arguments='{"body": "hi"}'))
+    assert denied["reason"] == "acl"
 
 
 async def test_web_access_false_hides_and_denies_web_tools() -> None:

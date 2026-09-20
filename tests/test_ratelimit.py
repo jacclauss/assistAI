@@ -31,6 +31,26 @@ def test_senders_are_independent() -> None:
     assert limiter.allow("+2") is True
 
 
+def test_would_allow_does_not_spend_the_budget() -> None:
+    ticks = [0.0]
+    limiter = RateLimiter(1, 60.0, clock=lambda: ticks[0])
+
+    assert limiter.would_allow("+1") is True
+    assert limiter.would_allow("+1") is True
+    assert limiter.allow("+1") is True
+    assert limiter.would_allow("+1") is False
+
+
+def test_record_spends_the_budget_after_success() -> None:
+    ticks = [0.0]
+    limiter = RateLimiter(1, 60.0, clock=lambda: ticks[0])
+
+    assert limiter.would_allow("+1") is True
+    limiter.record("+1")
+    assert limiter.would_allow("+1") is False
+    assert limiter.allow("+1") is False
+
+
 def test_key_count_is_bounded() -> None:
     ticks = [0.0]
     limiter = RateLimiter(5, 60.0, max_keys=8, clock=lambda: ticks[0])

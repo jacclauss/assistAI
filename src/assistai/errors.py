@@ -41,3 +41,7 @@ class HouseholdConfigError(AssistAIError):
 
 class StoreError(AssistAIError):
     """The state database is missing, unreadable, or newer than this build."""
+
+
+class JobError(AssistAIError):
+    """A job could not be created, changed, or run."""

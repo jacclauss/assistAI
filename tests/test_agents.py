@@ -30,8 +30,22 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert jacob.name == "jacob"
     assert spouse.name == "spouse"
     assert household.agent_for_signal_dm("+15555550199") is None
-    assert jacob.tools == ("relay",)
-    assert spouse.tools == ("relay",)
+    assert jacob.tools == (
+        "get_time",
+        "relay",
+        "job_create",
+        "job_list",
+        "job_cancel",
+        "job_reschedule",
+    )
+    assert spouse.tools == (
+        "get_time",
+        "relay",
+        "job_create",
+        "job_list",
+        "job_cancel",
+        "job_reschedule",
+    )
     assert jacob.writes == ()
     assert spouse.writes == ()
     assert jacob.web_access is True

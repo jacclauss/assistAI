@@ -8,22 +8,20 @@ from typing import TypedDict
 import httpx
 import pytest
 
-from assistai.agents import Household
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.errors import StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.types import ToolSpec
 from assistai.signal.channel import SignalChannel
 from assistai.signal.envelopes import InboundText
-from assistai.signal.policy import AccessPolicy
 from assistai.staging import Proposal
 from assistai.store import Store
-from tests.agent_fakes import agent, broker_for, household
+from tests.agent_fakes import agent, household
+from tests.channel_fakes import channel_for, policy_for, store_for
 from tests.fakes import (
     Handler,
     client_for,
     completion_stream,
-    manifest,
     recorded,
     sequence,
     text_event,
@@ -31,52 +29,9 @@ from tests.fakes import (
 )
 from tests.signal_fakes import FakeSignal, envelope, inbound, signal_settings
 
-
-def _store(tmp_path: Path) -> Store:
-    return Store(tmp_path / "assistai.sqlite")
-
-
-def _policy(
-    tmp_path: Path,
-    bootstrap: tuple[str, ...] = ("+15555550101",),
-    *,
-    store: Store | None = None,
-) -> AccessPolicy:
-    return AccessPolicy(
-        bootstrap,
-        store=store or _store(tmp_path),
-        pairing_ttl_seconds=60,
-    )
-
-
-def _channel(
-    tmp_path: Path,
-    signal: FakeSignal,
-    fireworks: FireworksClient | None,
-    *,
-    jacob_tools: tuple[str, ...] = (),
-    home: Household | None = None,
-    broker: ToolBroker | None = None,
-    store: Store | None = None,
-    **overrides: object,
-) -> SignalChannel:
-    settings = signal_settings(state_dir=tmp_path, **overrides)
-    peers = settings.allow_from or ("+15555550101",)
-    roster = home or household(
-        agent("jacob", peers[0], tools=jacob_tools),
-        agent("spouse", peers[1] if len(peers) > 1 else "+15555550102"),
-    )
-    db = store or _store(tmp_path)
-    return SignalChannel(
-        settings,
-        signal,
-        policy=_policy(tmp_path, settings.allow_from, store=db),
-        fireworks=fireworks,
-        manifest=manifest() if fireworks is not None else None,
-        household=roster,
-        broker=broker or broker_for(roster),
-        store=db,
-    )
+_store = store_for
+_policy = policy_for
+_channel = channel_for
 
 
 async def test_allowed_sender_gets_model_reply(tmp_path: Path) -> None:

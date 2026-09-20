@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     # something the person has forgotten about.
     staging_ttl_seconds: float = Field(default=600.0, gt=0)
 
+    # In-process job runner. One box, few jobs; poll often enough for tests
+    # and a daily digest, without a second daemon.
+    job_poll_seconds: float = Field(default=1.0, gt=0)
+    # Job sends are metered separately from conversational turns so a tight
+    # schedule cannot spend the person's Signal budget.
+    signal_job_messages_per_hour: int = Field(default=30, gt=0)
+
     @field_validator("signal_account", mode="before")
     @classmethod
     def _account(cls, value: object) -> object:

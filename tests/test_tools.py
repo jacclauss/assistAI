@@ -67,6 +67,22 @@ async def test_a_raising_handler_becomes_a_tool_error(failing: str) -> None:
     assert result["name"] == "get_time"
 
 
+async def test_job_error_includes_a_safe_message() -> None:
+    from assistai.errors import JobError
+
+    registry = default_registry()
+    registry.register(
+        GET_TIME_SPEC,
+        lambda _a: (_ for _ in ()).throw(JobError("a job named 'mail' already exists")),
+    )
+
+    result = await body(registry, tool_call())
+
+    assert result["error"] == "tool_failed"
+    assert "already exists" in result["message"]
+    assert "fw-secret" not in result["message"]
+
+
 async def test_handler_failures_do_not_echo_the_exception() -> None:
     """The model is untrusted context. Exception text can carry secrets."""
     registry = default_registry()
