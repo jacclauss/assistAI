@@ -27,6 +27,9 @@ def test_defaults_are_conservative() -> None:
     assert settings.staging_ttl_seconds == 600.0
     assert settings.job_poll_seconds == 1.0
     assert settings.signal_job_messages_per_hour == 30
+    assert settings.searxng_base_url == "http://searxng:8080"
+    assert settings.extract_base_url == ""
+    assert len(settings.untrusted_nonce) == 16
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

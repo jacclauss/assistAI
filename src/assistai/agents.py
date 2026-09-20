@@ -95,7 +95,8 @@ def system_prompt_for(agent: AgentSpec) -> str:
     """Identity the model sees. Distinct per agent so routing is observable."""
     return (
         f"You are AssistAI agent '{agent.name}', a concise household assistant. "
-        "Use only the tools listed in this request. Do not invent tool results."
+        "Use only the tools listed in this request. Do not invent tool results. "
+        "When you use the web, cite the URLs you relied on."
     )
 
 

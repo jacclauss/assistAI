@@ -42,6 +42,7 @@ from assistai.jobs import (
     parse_reschedule,
 )
 from assistai.relay import RELAY_SPEC, RELAY_TOOL, RelayError, parse_body, using_agent
+from assistai.research.tools import WEB_FETCH_SPEC, WEB_SEARCH_SPEC
 
 log = structlog.get_logger(__name__)
 
@@ -71,12 +72,19 @@ class ToolMeta:
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """One allow, deny, or stage. Tests read this; production logs it."""
+    """One allow, deny, or stage. Tests read this; production logs it.
+
+    ``tainted`` records whether untrusted content was already in the
+    conversation when this happened. Reading the log after the fact is how you
+    answer "was that proposal shaped by a page the assistant read?", so the
+    preview text alone is not enough.
+    """
 
     agent: str
     tool: str
     action: AuditAction
     reason: DenyReason | None = None
+    tainted: bool = False
 
 
 @dataclass
@@ -174,12 +182,23 @@ class ToolBroker:
                 agent=event.agent,
                 tool=event.tool,
                 reason=event.reason,
+                tainted=event.tainted,
             )
             return
         if event.action == "stage":
-            log.info("broker.staged", agent=event.agent, tool=event.tool)
+            log.info(
+                "broker.staged",
+                agent=event.agent,
+                tool=event.tool,
+                tainted=event.tainted,
+            )
             return
-        log.info("broker.executed", agent=event.agent, tool=event.tool)
+        log.info(
+            "broker.executed",
+            agent=event.agent,
+            tool=event.tool,
+            tainted=event.tainted,
+        )
 
 
 class BoundSurface:
@@ -244,7 +263,13 @@ class BoundSurface:
         denied = self._deny_reason(call.name)
         if denied is not None:
             self._record(
-                AuditEvent(agent=self._agent.name, tool=call.name, action="deny", reason=denied)
+                AuditEvent(
+                    agent=self._agent.name,
+                    tool=call.name,
+                    action="deny",
+                    reason=denied,
+                    tainted=self._scope.tainted,
+                )
             )
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
@@ -261,7 +286,14 @@ class BoundSurface:
                 )
                 return ToolResult(body)
             self._staged.append(call)
-            self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="stage"))
+            self._record(
+                AuditEvent(
+                    agent=self._agent.name,
+                    tool=call.name,
+                    action="stage",
+                    tainted=self._scope.tainted,
+                )
+            )
             body = json.dumps({"status": "staged", "name": call.name, "arguments": call.arguments})
             return ToolResult(body)
         return await self._run(call, meta)
@@ -271,7 +303,13 @@ class BoundSurface:
         denied = self._deny_reason(call.name)
         if denied is not None:
             self._record(
-                AuditEvent(agent=self._agent.name, tool=call.name, action="deny", reason=denied)
+                AuditEvent(
+                    agent=self._agent.name,
+                    tool=call.name,
+                    action="deny",
+                    reason=denied,
+                    tainted=self._scope.tainted,
+                )
             )
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
@@ -280,10 +318,20 @@ class BoundSurface:
     async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
         with using_agent(self._agent):
             result = await self._catalog.execute(call)
+        # Read before this call's own result taints the scope: the question the
+        # log answers is what was already in context when the tool ran.
+        tainted = self._scope.tainted
         if not meta.trusted:
             self._scope.tainted = True
             self._fetched_untrusted = True
-        self._record(AuditEvent(agent=self._agent.name, tool=call.name, action="allow"))
+        self._record(
+            AuditEvent(
+                agent=self._agent.name,
+                tool=call.name,
+                action="allow",
+                tainted=tainted,
+            )
+        )
         return ToolResult(result.content, untrusted=not meta.trusted)
 
     def _deny_reason(self, name: str) -> DenyReason | None:
@@ -388,8 +436,9 @@ def _staged_cancel_covers(job: Job, staged: Sequence[ToolCall]) -> bool:
 def builtin_catalog() -> ToolCatalog:
     """The tools this build actually implements.
 
-    ``relay`` and the job tools are on the catalog so household ACLs can name
-    them. Live handlers are bound when the Signal channel has a store.
+    ``relay``, the job tools, and the research tools are on the catalog so
+    household ACLs can name them. Live handlers are bound when the Signal
+    channel has a store (and, for research, settings).
     """
     catalog = ToolCatalog()
     catalog.add(GET_TIME_SPEC, get_time, trusted=True)
@@ -408,4 +457,6 @@ def builtin_catalog() -> ToolCatalog:
     catalog.add(JOB_RESCHEDULE_SPEC, _unbound, trusted=True, staging=True)
     catalog.add(JOB_LIST_SPEC, _unbound, trusted=True)
     catalog.add(JOB_CANCEL_SPEC, _unbound, trusted=True, staging=True)
+    catalog.add(WEB_SEARCH_SPEC, _unbound, trusted=False, web=True)
+    catalog.add(WEB_FETCH_SPEC, _unbound, trusted=False, web=True)
     return catalog

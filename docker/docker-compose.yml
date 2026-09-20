@@ -1,4 +1,7 @@
 # Phase 2: gateway + signal-cli on a private network. No published ports.
+# Phase 8: SearXNG + extract sidecar on a research network the gateway can
+# reach, but they cannot reach signal-cli or the state volume. Extract does
+# not load .env, so it never sees FIREWORKS_API_KEY.
 #
 # First-time Signal setup (link or register) runs through the gateway image so
 # it can reach signal-cli without exposing 8080 on the LAN:
@@ -7,8 +10,7 @@
 # which binds 8080 to 127.0.0.1 only.
 #
 # Later services:
-#   phase 5  searxng + fetch/extract on an egress-restricted network
-#   phase 8  renderer (headless Chromium, needs shm_size >= 1gb)
+#   phase 8+  renderer (headless Chromium, needs shm_size >= 1gb)
 
 name: assistai
 
@@ -22,6 +24,10 @@ services:
     depends_on:
       signal-cli:
         condition: service_healthy
+      searxng:
+        condition: service_started
+      extract:
+        condition: service_started
     env_file:
       - ../.env
     environment:
@@ -29,8 +35,11 @@ services:
       ASSISTAI_STATE_DIR: /app/state
       ASSISTAI_MANIFEST_PATH: /app/manifest.toml
       ASSISTAI_AGENTS_CONFIG: /app/config/assistai.toml
+      ASSISTAI_SEARXNG_BASE_URL: http://searxng:8080
+      ASSISTAI_EXTRACT_BASE_URL: http://extract:8080
     networks:
       - internal
+      - research
     volumes:
       - gateway-state:/app/state
       - ../manifest.toml:/app/manifest.toml:ro
@@ -42,6 +51,60 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # The Pi has 8 GB for the whole stack. A limit turns a runaway page into a
+    # restarted container instead of an OOM killer picking a victim at random.
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  extract:
+    image: assistai/gateway:local
+    restart: unless-stopped
+    command: ["extract"]
+    # No env_file: this process parses hostile HTML and must never hold
+    # FIREWORKS_API_KEY or touch the state volume.
+    environment:
+      ASSISTAI_LOG_LEVEL: info
+    networks:
+      - research
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    # The image rewrites the placeholder secret in settings.yml on boot, which
+    # is why this mount stays writable. Override SEARXNG_SECRET in .env.
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-assistai-internal-no-published-ports}
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    networks:
+      - research
+    cap_drop:
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - MKNOD
+      - AUDIT_WRITE
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
     logging:
       driver: json-file
       options:
@@ -86,6 +149,12 @@ networks:
   # No published ports. Nothing in this stack is reachable from the LAN;
   # operator access is over SSH or a tailnet to loopback.
   internal:
+    driver: bridge
+  # Gateway can call SearXNG and extract. Neither can reach signal-cli or the
+  # state volume. They share a bridge with the gateway, which is what lets the
+  # gateway call them; the gateway publishes no port on it, so there is nothing
+  # for them to connect back to.
+  research:
     driver: bridge
 
 volumes:

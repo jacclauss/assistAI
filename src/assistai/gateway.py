@@ -19,6 +19,7 @@ from assistai.broker import ToolBroker, builtin_catalog
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
+from assistai.research.tools import assert_isolated_extract, bind_research
 from assistai.scheduler import JobRunner
 from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
@@ -129,6 +130,10 @@ class Gateway:
                 known_tools=builtin_catalog().names(),
             )
             self._household = household
+            assert_isolated_extract(
+                self._settings,
+                {tool for agent in household.agents for tool in agent.tools},
+            )
             unbound = [
                 number
                 for number in self._settings.allow_from
@@ -157,6 +162,12 @@ class Gateway:
                 broker=broker,
                 store=store,
             )
+            for name, handler in bind_research(
+                self._settings,
+                fireworks=self._client,
+                quarantine=self._manifest.quarantine if self._manifest is not None else None,
+            ).items():
+                broker.bind(name, handler)
             self._jobs = JobRunner(store, household, self._channel, self._settings)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         if self._jobs is not None:

@@ -1,0 +1,24 @@
+# Internal SearXNG. JSON format is required: the web_search tool talks to
+# /search?format=json, which upstream disables on public instances.
+use_default_settings: true
+
+general:
+  instance_name: assistai
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  # Placeholder. The image substitutes $SEARXNG_SECRET here on boot, so the
+  # real value comes from compose and is never committed.
+  secret_key: "ultrasecretkey"
+  limiter: false
+  image_proxy: false
+  port: 8080
+  bind_address: "0.0.0.0"

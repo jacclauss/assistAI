@@ -13,9 +13,10 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 7 of 13. Jobs are first-class: a schedule always texts the owner, a
-watch stays quiet unless it finds something, fails, or hits its TTL, and
-both survive a reboot. They report; they do not act.
+Phase 8 of 13. Research tools are live: `web_search` talks to a self-hosted
+SearXNG, `web_fetch` GETs a public URL through an SSRF-hardened extractor,
+and a sink proposed under taint is labelled as such. Jobs may search and
+fetch when they report; they still cannot act.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -27,7 +28,7 @@ both survive a reboot. They report; they do not act.
 | 5 | Staged actions: propose, confirm, execute | done |
 | 6 | Relay, including attachments | done |
 | 7 | Jobs: schedules and TTL'd watches | done |
-| 8 | Research tools: search, fetch, extract | |
+| 8 | Research tools: search, fetch, extract | done |
 | 9 | Shared calendar (iCloud CalDAV) | |
 | 10 | Email (Gmail: read / file / draft) | |
 | 11 | Shared store with ACLs | |
@@ -55,7 +56,7 @@ Containerized:
 ```bash
 make lock                 # required before the first image build
 make build
-make up                   # gateway + signal-cli, no published ports
+make up                   # gateway + signal-cli + SearXNG + extract
 make logs                 # ctrl-c to detach; `make down` to stop
 ```
 
@@ -107,8 +108,8 @@ from its own account, so a personal number cannot text its own assistant.
 
    Job tools on the roster let you schedule and cancel from Signal. A schedule
    always texts you; a watch stays quiet unless it finds something, fails, or
-   expires. Until mail, calendar, and research land, a job can only report
-   with `get_time` plus whatever the model already knows. Copy the example
+   expires. Research tools (`web_search`, `web_fetch`) need both `web_access`
+   and a place on `tools`. Jobs may use them when reporting. Copy the example
    tools into a live `config/assistai.toml` that was created earlier.
 
 Unknown numbers hear nothing. Set `ASSISTAI_SIGNAL_DM_POLICY=pairing` if a

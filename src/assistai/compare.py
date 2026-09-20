@@ -1,7 +1,7 @@
 """Score candidate models against the real tool schemas.
 
 Benchmarks do not predict how a model handles this broker's JSON. The
-comparison advertises ``get_time`` — the only implemented tool today — and
+comparison advertises ``get_time`` — a stable, side-effect-free schema — and
 records whether the model called it with valid arguments. One failing
 candidate does not abort the rest.
 """

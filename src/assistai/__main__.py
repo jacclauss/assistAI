@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> None:
     models_sub = models.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser("compare", help="score primary and candidates on get_time")
 
+    sub.add_parser("extract", help="HTML extract sidecar (no Fireworks key)")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "chat":
@@ -66,11 +68,23 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(_signal(args))
         elif args.command == "models":
             asyncio.run(_models(args))
+        elif args.command == "extract":
+            asyncio.run(_extract())
         else:
             asyncio.run(_gateway())
     except AssistAIError as exc:
         print(f"assistai: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+
+async def _extract() -> None:
+    """Fetch+extract HTTP sidecar. Compose does not pass FIREWORKS_API_KEY."""
+    from assistai.research.server import serve
+
+    settings = Settings()
+    configure_logging(level=settings.log_level, console=settings.log_console)
+    # Bound on all interfaces inside the compose network; no published ports.
+    await serve("0.0.0.0", 8080, settings)  # noqa: S104
 
 
 async def _gateway() -> None:

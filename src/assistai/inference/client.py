@@ -95,7 +95,9 @@ class FireworksClient:
         """Stream a chat completion and accumulate content plus tool calls."""
         body: dict[str, Any] = {
             "model": pin.ref,
-            "messages": [message.to_openai() for message in messages],
+            "messages": [
+                message.to_openai(nonce=self._settings.untrusted_nonce) for message in messages
+            ],
             "max_tokens": self._settings.max_tokens,
             "temperature": self._settings.temperature,
             "stream": True,
@@ -130,6 +132,39 @@ class FireworksClient:
             # Timeouts and dropped connections are the common failure on a home
             # network. Speak AssistAIError so callers can fall back.
             raise InferenceError(f"Fireworks is unreachable ({type(exc).__name__})") from exc
+
+    async def complete_json(self, pin: ModelPin, messages: list[Message]) -> dict[str, Any]:
+        """Non-streaming JSON object completion for the quarantined summarizer."""
+        body: dict[str, Any] = {
+            "model": pin.ref,
+            "messages": [
+                message.to_openai(nonce=self._settings.untrusted_nonce) for message in messages
+            ],
+            "max_tokens": min(self._settings.max_tokens, 1024),
+            "temperature": 0,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        url = f"{self._settings.fireworks_base_url.rstrip('/')}/chat/completions"
+        try:
+            response = await self._http.post(url, headers=self._headers(), json=body)
+        except httpx.HTTPError as exc:
+            raise InferenceError(f"Fireworks is unreachable ({type(exc).__name__})") from exc
+        if response.status_code in {401, 403}:
+            raise InferenceError("Fireworks rejected the API key")
+        if response.status_code == 404:
+            raise ModelNotAvailableError(f"Fireworks does not serve {pin.ref}")
+        if response.status_code >= 400:
+            raise InferenceError(_http_error(response))
+        try:
+            payload: object = response.json()
+        except json.JSONDecodeError as exc:
+            raise InferenceError("Fireworks returned invalid JSON") from exc
+        text = _json_message(payload)
+        try:
+            return _parse_json_object(text)
+        except json.JSONDecodeError as exc:
+            raise InferenceError("Fireworks JSON object was not valid JSON") from exc
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -180,6 +215,39 @@ def _catalog_names(payload: object) -> set[str]:
 def _http_error(response: httpx.Response) -> str:
     body = response.text[:300].replace("\n", " ")
     return f"Fireworks HTTP {response.status_code}: {body}"
+
+
+def _json_message(payload: object) -> str:
+    if not isinstance(payload, dict):
+        raise InferenceError("Fireworks JSON object was not valid JSON")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise InferenceError("Fireworks JSON object was empty")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise InferenceError("Fireworks JSON object was empty")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise InferenceError("Fireworks JSON object was empty")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise InferenceError("Fireworks JSON object was empty")
+    return content
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: -len("```")]
+        cleaned = cleaned.strip()
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+    payload: object = json.loads(cleaned)
+    if not isinstance(payload, dict):
+        raise json.JSONDecodeError("expected object", cleaned, 0)
+    return payload
 
 
 class _StreamState:

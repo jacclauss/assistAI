@@ -83,6 +83,22 @@ async def test_job_error_includes_a_safe_message() -> None:
     assert "fw-secret" not in result["message"]
 
 
+async def test_research_error_includes_a_safe_message() -> None:
+    from assistai.errors import ResearchError
+
+    registry = default_registry()
+    registry.register(
+        GET_TIME_SPEC,
+        lambda _a: (_ for _ in ()).throw(ResearchError("that host is not allowed")),
+    )
+
+    result = await body(registry, tool_call())
+
+    assert result["error"] == "tool_failed"
+    assert "not allowed" in result["message"]
+    assert "fw-secret" not in result["message"]
+
+
 async def test_handler_failures_do_not_echo_the_exception() -> None:
     """The model is untrusted context. Exception text can carry secrets."""
     registry = default_registry()

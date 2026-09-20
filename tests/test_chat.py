@@ -5,7 +5,6 @@ import json
 from assistai.agents import BrokerPolicy
 from assistai.broker import builtin_catalog
 from assistai.chat import _broker, chat_once, chat_repl
-from assistai.inference.types import ToolSpec
 from tests.fakes import (
     catalog_then_completions,
     client_for,
@@ -89,12 +88,7 @@ async def test_once_denies_a_tool_the_model_invents() -> None:
 async def test_once_denies_a_catalog_tool_off_the_acl() -> None:
     """web_fetch in the catalog must not become callable from make chat."""
     catalog = builtin_catalog()
-    catalog.add(
-        ToolSpec(name="web_fetch", description="fetch a URL", parameters={}),
-        lambda _a: '{"ok": true}',
-        trusted=False,
-        web=True,
-    )
+    assert catalog.spec("web_fetch") is not None
     handler, seen = recorded(
         sequence(
             completion_stream(

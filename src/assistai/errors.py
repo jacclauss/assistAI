@@ -45,3 +45,7 @@ class StoreError(AssistAIError):
 
 class JobError(AssistAIError):
     """A job could not be created, changed, or run."""
+
+
+class ResearchError(AssistAIError):
+    """Search or fetch could not complete. Messages must not include secrets."""

@@ -25,20 +25,20 @@ dm_policy = "allowlist"
 allow_from = ["+15555550101", "+15555550102"]
 
 # web_access defaults to false. Only the two personal agents opt in; research
-# tools (phase 8) will still be refused unless they also appear on `tools`.
+# tools are still refused unless they also appear on `tools`.
 
 [agents.jacob]
 binds_to = { channel = "signal", peer = "+15555550101" }
 reads = ["own", "shared"]
 writes = []
-tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule"]
+tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch"]
 web_access = true
 
 [agents.spouse]
 binds_to = { channel = "signal", peer = "+15555550102" }
 reads = ["own", "shared"]
 writes = []
-tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule"]
+tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch"]
 web_access = true
 
 [broker]

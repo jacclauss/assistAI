@@ -6,6 +6,7 @@ ACLs are loaded from ``config/assistai.toml``; see ``config/assistai.example.tom
 
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 from typing import Literal
 
@@ -99,6 +100,16 @@ class Settings(BaseSettings):
     # Job sends are metered separately from conversational turns so a tight
     # schedule cannot spend the person's Signal budget.
     signal_job_messages_per_hour: int = Field(default=30, gt=0)
+
+    # Research. SearXNG and the extract sidecar sit on the research network.
+    searxng_base_url: str = "http://searxng:8080"
+    # Empty means parse HTML in this process. The gateway refuses to start that
+    # way when an agent has web_fetch, unless the next flag says otherwise.
+    extract_base_url: str = ""
+    allow_in_process_extract: bool = False
+    # Per-process nonce so a page cannot forge the untrusted delimiter. Short
+    # or empty would make the delimiter guessable, so it has a floor.
+    untrusted_nonce: str = Field(default_factory=lambda: secrets.token_hex(8), min_length=16)
 
     @field_validator("signal_account", mode="before")
     @classmethod

@@ -11,6 +11,7 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "structlog>=24.4",
+    "trafilatura>=2.2.0",  # HTML readability extract; the architecture's reason for Python
     "websockets>=14",  # json-rpc receive is WebSocket-only; polling drops messages
 ]
 
@@ -56,3 +57,7 @@ python_version = "3.12"
 strict = true
 files = ["src", "tests"]
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["trafilatura", "trafilatura.*"]
+ignore_missing_imports = true

@@ -205,10 +205,10 @@ Relay carries documents and images eventually, but this phase does not pull
 file bytes onto the Pi. Receive keeps `ignore_attachments=true` so the
 websocket does not carry binaries; signal-cli still lists name, type, and
 size on the envelope. Frames larger than `ASSISTAI_SIGNAL_MAX_RECEIVE_BYTES`
-are dropped. Downloading the bytes, MIME-checking them, and extracting text
-wait on the isolated extractor that lands with research; until then a
-file-only DM is turned into a prompt that asks the sender to paste a link.
-Outbound relays this phase are text (and links in that text).
+are dropped. Downloading attachment bytes, MIME-checking them, and extracting
+text still wait; until then a file-only DM is turned into a prompt that asks
+the sender to paste a link. Outbound relays this phase are text (and links
+in that text). Web pages already go through the isolated extractor.
 
 Text extraction runs in the same isolated extractor as web pages, so a
 malformed PDF or image cannot exploit a parser inside the gateway. Mail HTML
@@ -239,8 +239,11 @@ Three tiers, in increasing order of cost and risk.
 
 1. **`web_search`** — SearXNG container. Returns titles, URLs, snippets only.
 2. **`web_fetch`** — HTTP GET plus readability extraction to markdown. SSRF-hardened:
-   private and link-local ranges rejected, redirects re-validated at each hop,
-   hard caps on bytes and elapsed time.
+   private, loopback, CGNAT, and link-local ranges rejected; redirects re-validated
+   at each hop; the validated address is pinned and dialled directly so a second
+   lookup cannot rebind to a private host; the body is streamed against a byte cap
+   so a compressed bomb cannot expand into memory; and a whole fetch, redirects
+   included, is bounded by one elapsed-time budget.
 3. **`browser_render`** — deferred. Headless Chromium in an isolated container,
    read-only, no cookie jar and no credentials, only for pages that require JS.
 
@@ -272,8 +275,13 @@ a per-process random nonce, so a page cannot forge the delimiter. Untrusted
 content is placed mid-prompt: models attend most strongly to the beginning and
 end of context, which is where injected instructions do the most damage.
 
-**Network isolation.** Fetch, extract, and render containers sit on a network
-with no route to the gateway, the store, or the Fireworks credential.
+**Network isolation.** Fetch, extract, and render run in their own containers,
+holding no Fireworks credential and no state volume, with the HTML parser kept
+out of the gateway process entirely. They share a bridge with the gateway
+because the gateway has to call them; the gateway listens on nothing, so the
+reachability is one-directional in practice. The gateway refuses to start if
+`web_fetch` is granted while no extract sidecar is configured, because that
+would quietly move the parser back in-process.
 
 ### Relay specifically
 
@@ -307,8 +315,8 @@ Phase 3 shipped assumptions the PRD overturns. These are the concrete changes
 that remain:
 
 - Jobs can send without an inbound trigger, but they still cannot stage an
-  action. Mail, calendar, and research tools are not implemented yet, so a
-  job's report is `get_time` plus whatever the model already knows.
+  action. Mail and calendar are not implemented yet. Research tools may be
+  used in a report; a job still cannot file, draft, write, or relay.
 
 ## Build phases
 

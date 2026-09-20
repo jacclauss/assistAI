@@ -33,7 +33,7 @@ Signal's server APIs change.
 ref = "searxng/searxng:latest"
 digest = ""
 platforms = ["linux/amd64", "linux/arm64"]
-notes = "Phase 5. Metasearch backend for the web_search tool."
+notes = "Phase 8. Metasearch backend for the web_search tool."
 
 # Phase 8 at the earliest. Deferred: multi-gigabyte image, and Chromium needs
 # shm_size >= 1gb or it dies mid-run.

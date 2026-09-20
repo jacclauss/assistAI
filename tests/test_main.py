@@ -35,6 +35,18 @@ def test_chat_once_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == [("ping", False)]
 
 
+def test_extract_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+
+    async def fake_extract() -> None:
+        called.append("extract")
+
+    monkeypatch.setattr(cli, "_extract", fake_extract)
+    cli.main(["extract"])
+
+    assert called == ["extract"]
+
+
 def test_models_compare_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[str] = []
 
