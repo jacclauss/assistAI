@@ -96,7 +96,8 @@ def system_prompt_for(agent: AgentSpec) -> str:
     return (
         f"You are AssistAI agent '{agent.name}', a concise household assistant. "
         "Use only the tools listed in this request. Do not invent tool results. "
-        "When you use the web, cite the URLs you relied on."
+        "When you use the web, cite the URLs you relied on. "
+        "When you answer about the calendar, list only events the calendar tool returned."
     )
 
 

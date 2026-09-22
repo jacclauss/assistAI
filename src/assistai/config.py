@@ -9,6 +9,8 @@ from __future__ import annotations
 import secrets
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -110,6 +112,50 @@ class Settings(BaseSettings):
     # Per-process nonce so a page cannot forge the untrusted delimiter. Short
     # or empty would make the delimiter guessable, so it has a floor.
     untrusted_nonce: str = Field(default_factory=lambda: secrets.token_hex(8), min_length=16)
+
+    # Shared iCloud calendar. One Apple ID that can see the household calendar.
+    # The password is an app-specific password, never the Apple ID password.
+    # "Today" is a day in this timezone, not UTC.
+    caldav_base_url: str = "https://caldav.icloud.com/"
+    caldav_username: str = ""
+    # Last resort. The gateway prefers the macOS Keychain, then a mode-600 file
+    # outside the repo. A value here is how tests inject a password, and how a
+    # forgotten .env entry still works until it is moved.
+    caldav_password: SecretStr | None = None
+    caldav_password_file: Path | None = None
+    caldav_calendar: str = ""
+    timezone: str = "UTC"
+
+    @field_validator("caldav_password_file", mode="before")
+    @classmethod
+    def _caldav_password_file(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        return value
+
+    @field_validator("caldav_base_url")
+    @classmethod
+    def _caldav_base_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("caldav_base_url must be an https URL")
+        cleaned = value.strip()
+        parts = urlsplit(cleaned)
+        # Basic auth would send the app-specific password. Refuse cleartext.
+        if parts.scheme != "https" or not parts.hostname:
+            raise ValueError("caldav_base_url must be an https URL")
+        return cleaned
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("timezone must be an IANA name")
+        cleaned = value.strip()
+        try:
+            ZoneInfo(cleaned)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown timezone: {cleaned}") from exc
+        return cleaned
 
     @field_validator("signal_account", mode="before")
     @classmethod

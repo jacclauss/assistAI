@@ -37,6 +37,7 @@ services:
       ASSISTAI_AGENTS_CONFIG: /app/config/assistai.toml
       ASSISTAI_SEARXNG_BASE_URL: http://searxng:8080
       ASSISTAI_EXTRACT_BASE_URL: http://extract:8080
+      ASSISTAI_CALDAV_PASSWORD_FILE: /run/assistai/caldav-password
     networks:
       - internal
       - research
@@ -44,6 +45,11 @@ services:
       - gateway-state:/app/state
       - ../manifest.toml:/app/manifest.toml:ro
       - ../config:/app/config:ro
+      # Calendar app-specific password. Leave this pointed at /dev/null until
+      # the Pi has a mode-600 file outside the repo. `make run` on a Mac uses
+      # the Keychain and does not read this mount. Do not put the password in
+      # the project directory.
+      - ${ASSISTAI_CALDAV_PASSWORD_FILE:-/dev/null}:/run/assistai/caldav-password:ro
     read_only: true
     tmpfs:
       - /tmp

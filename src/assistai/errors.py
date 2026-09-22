@@ -49,3 +49,11 @@ class JobError(AssistAIError):
 
 class ResearchError(AssistAIError):
     """Search or fetch could not complete. Messages must not include secrets."""
+
+
+class CalendarError(AssistAIError):
+    """The shared calendar could not be read. Messages must not include secrets."""
+
+
+class SecretsError(AssistAIError):
+    """A secret file is present but not safe to read. The message must not include it."""

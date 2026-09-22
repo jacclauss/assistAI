@@ -1,5 +1,9 @@
 .DEFAULT_GOAL := help
-COMPOSE := docker compose -f docker/docker-compose.yml
+# Repo .env supplies compose interpolation (the calendar password *file path*).
+# The password itself is not in that file. Skip the flag when .env is absent
+# so `make build` still works on a fresh checkout.
+COMPOSE_ENV := $(if $(wildcard .env),--env-file .env)
+COMPOSE := docker compose $(COMPOSE_ENV) -f docker/docker-compose.yml
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yml
 
 .PHONY: help

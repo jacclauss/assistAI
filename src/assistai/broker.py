@@ -19,6 +19,7 @@ from typing import Literal, Protocol
 import structlog
 
 from assistai.agents import AgentSpec, BrokerPolicy
+from assistai.calendar.tools import CALENDAR_TODAY_SPEC
 from assistai.errors import JobError
 from assistai.inference.tools import (
     GET_TIME_SPEC,
@@ -436,9 +437,9 @@ def _staged_cancel_covers(job: Job, staged: Sequence[ToolCall]) -> bool:
 def builtin_catalog() -> ToolCatalog:
     """The tools this build actually implements.
 
-    ``relay``, the job tools, and the research tools are on the catalog so
-    household ACLs can name them. Live handlers are bound when the Signal
-    channel has a store (and, for research, settings).
+    ``relay``, the job tools, research, and the calendar read are on the catalog
+    so household ACLs can name them. Live handlers are bound when the Signal
+    channel has a store (and, for research and calendar, settings).
     """
     catalog = ToolCatalog()
     catalog.add(GET_TIME_SPEC, get_time, trusted=True)
@@ -459,4 +460,6 @@ def builtin_catalog() -> ToolCatalog:
     catalog.add(JOB_CANCEL_SPEC, _unbound, trusted=True, staging=True)
     catalog.add(WEB_SEARCH_SPEC, _unbound, trusted=False, web=True)
     catalog.add(WEB_FETCH_SPEC, _unbound, trusted=False, web=True)
+    # Invites are attacker-controlled text, so a calendar read taints the turn.
+    catalog.add(CALENDAR_TODAY_SPEC, _unbound, trusted=False)
     return catalog

@@ -13,10 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 8 of 13. Research tools are live: `web_search` talks to a self-hosted
-SearXNG, `web_fetch` GETs a public URL through an SSRF-hardened extractor,
-and a sink proposed under taint is labelled as such. Jobs may search and
-fetch when they report; they still cannot act.
+Phase 9 of 13. "What's on the docket today" reads one shared iCloud calendar.
+The model cannot pick a different calendar and cannot write events. Event text
+is untrusted. Jobs may read that calendar when they report; they still cannot act.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -29,7 +28,7 @@ fetch when they report; they still cannot act.
 | 6 | Relay, including attachments | done |
 | 7 | Jobs: schedules and TTL'd watches | done |
 | 8 | Research tools: search, fetch, extract | done |
-| 9 | Shared calendar (iCloud CalDAV) | |
+| 9 | Shared calendar (iCloud CalDAV) | done |
 | 10 | Email (Gmail: read / file / draft) | |
 | 11 | Shared store with ACLs | |
 | 12 | Update watcher | |
@@ -109,8 +108,13 @@ from its own account, so a personal number cannot text its own assistant.
    Job tools on the roster let you schedule and cancel from Signal. A schedule
    always texts you; a watch stays quiet unless it finds something, fails, or
    expires. Research tools (`web_search`, `web_fetch`) need both `web_access`
-   and a place on `tools`. Jobs may use them when reporting. Copy the example
-   tools into a live `config/assistai.toml` that was created earlier.
+   and a place on `tools`. `calendar_today` reads the shared iCloud calendar
+   named by `ASSISTAI_CALDAV_CALENDAR`. Put the Apple ID, that name, and
+   `ASSISTAI_TIMEZONE` in `.env`. The app-specific password stays in the macOS
+   Keychain (`security add-generic-password -s assistai -a caldav -U -w`) or,
+   on the Pi, in a mode-600 file outside this repo. Jobs may use research and
+   the calendar when reporting. Copy the example tools into a live
+   `config/assistai.toml` that was created earlier.
 
 Unknown numbers hear nothing. Set `ASSISTAI_SIGNAL_DM_POLICY=pairing` if a
 stranger should receive a code you can approve from an **operator** phone
@@ -154,8 +158,10 @@ purpose. Adding to it needs a reason in the pull request.
 **Pin everything external.** Images, models, and the Python lockfile are pinned
 in `manifest.toml` and `uv.lock`. The update watcher notifies; it never applies.
 
-**Secrets live in `.env`,** which is gitignored, and are read as `SecretStr` so
-they do not leak into logs or tracebacks.
+**API keys live in `.env`,** which is gitignored, and are read as `SecretStr`
+so they do not leak into logs or tracebacks. The calendar app-specific
+password does not: the Mac reads it from the Keychain, and the Pi reads a
+mode-600 file outside this repo.
 
 **No published ports.** Nothing in the stack listens on the LAN. Operator access
 is over SSH or a tailnet to loopback.

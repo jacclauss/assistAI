@@ -30,6 +30,12 @@ def test_defaults_are_conservative() -> None:
     assert settings.searxng_base_url == "http://searxng:8080"
     assert settings.extract_base_url == ""
     assert len(settings.untrusted_nonce) == 16
+    assert settings.caldav_base_url == "https://caldav.icloud.com/"
+    assert settings.caldav_username == ""
+    assert settings.caldav_password is None
+    assert settings.caldav_password_file is None
+    assert settings.caldav_calendar == ""
+    assert settings.timezone == "UTC"
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,11 +59,14 @@ def test_fireworks_key_read_without_prefix(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_secret_does_not_leak_into_repr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FIREWORKS_API_KEY", "fw-secret")
+    monkeypatch.setenv("ASSISTAI_CALDAV_PASSWORD", "app-secret-password")
 
     settings = Settings()
 
     assert "fw-secret" not in repr(settings)
     assert "fw-secret" not in str(settings)
+    assert "app-secret-password" not in repr(settings)
+    assert "app-secret-password" not in str(settings)
 
 
 def test_unknown_log_level_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,6 +89,16 @@ def test_signal_allow_from_parses_csv(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert settings.signal_account == "+15555550100"
     assert settings.allow_from == ("+15555550101", "+15555550102")
+
+
+def test_calendar_url_must_be_https() -> None:
+    with pytest.raises(ValidationError):
+        Settings(caldav_base_url="http://caldav.icloud.com/")
+
+
+def test_unknown_timezone_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(timezone="Not/AZone")
 
 
 def test_invalid_signal_account_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

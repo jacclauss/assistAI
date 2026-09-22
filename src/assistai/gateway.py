@@ -16,11 +16,13 @@ import structlog
 from assistai import __version__
 from assistai.agents import Household, load_household, resolve_household_path
 from assistai.broker import ToolBroker, builtin_catalog
+from assistai.calendar.tools import bind_calendar
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
 from assistai.research.tools import assert_isolated_extract, bind_research
 from assistai.scheduler import JobRunner
+from assistai.secrets import apply_caldav_password
 from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
@@ -113,6 +115,10 @@ class Gateway:
             log.info("gateway.skip_signal", reason="no_account")
             return
         if self._channel is None:
+            # Keychain can wait on an Allow prompt. Run it off the event loop
+            # so a shutdown signal is still delivered, and fail before Signal
+            # or the store are opened.
+            self._settings = await asyncio.to_thread(apply_caldav_password, self._settings)
             if self._signal is None:
                 self._signal = SignalClient(self._settings)
                 self._owns_signal = True
@@ -167,6 +173,8 @@ class Gateway:
                 fireworks=self._client,
                 quarantine=self._manifest.quarantine if self._manifest is not None else None,
             ).items():
+                broker.bind(name, handler)
+            for name, handler in bind_calendar(self._settings).items():
                 broker.bind(name, handler)
             self._jobs = JobRunner(store, household, self._channel, self._settings)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))

@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 # Kept deliberately short. Every entry here is attack surface; justify additions
 # in the pull request that adds them. Exact versions and hashes live in uv.lock.
 dependencies = [
+    "defusedxml>=0.7.1",  # CalDAV XML from iCloud; stdlib ElementTree is the billion-laughs path
     "httpx>=0.27",  # async HTTP + SSE to Fireworks; no SDK, we own the wire format
+    "icalendar>=7.3.0",  # iCloud VEVENT bodies; folded lines, timezones, and VALUE=DATE
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "structlog>=24.4",
@@ -59,5 +61,5 @@ files = ["src", "tests"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["trafilatura", "trafilatura.*"]
+module = ["trafilatura", "trafilatura.*", "icalendar", "icalendar.*", "defusedxml", "defusedxml.*"]
 ignore_missing_imports = true
