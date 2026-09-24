@@ -1,4 +1,4 @@
-"""Model-facing calendar read. One shared calendar, one day, no writes."""
+"""Model-facing calendar tools. One shared calendar. Writes wait for a yes."""
 
 from __future__ import annotations
 
@@ -8,12 +8,14 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from assistai.calendar.client import Agenda, CalendarClient
+from assistai.calendar.draft import parse_add
 from assistai.calendar.parse import CalendarEvent
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from assistai.inference.types import ToolSpec
 
 CALENDAR_TODAY = "calendar_today"
+CALENDAR_ADD = "calendar_add"
 
 CALENDAR_TODAY_SPEC = ToolSpec(
     name=CALENDAR_TODAY,
@@ -37,6 +39,38 @@ CALENDAR_TODAY_SPEC = ToolSpec(
     },
 )
 
+CALENDAR_ADD_SPEC = ToolSpec(
+    name=CALENDAR_ADD,
+    description=(
+        "Add one event to the shared household calendar. Nothing is written "
+        "until the person replies yes. You cannot pick a different calendar "
+        "or invite anyone. start is YYYY-MM-DD for an all-day event, or "
+        "YYYY-MM-DDTHH:MM in household local time with no timezone suffix. "
+        "end is optional: the last day of an all-day event, or the end time "
+        "of a timed one. Omit end for one day, or for one hour when start "
+        "has a time."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Event title."},
+            "start": {
+                "type": "string",
+                "description": "YYYY-MM-DD, or YYYY-MM-DDTHH:MM in household local time.",
+            },
+            "end": {
+                "type": "string",
+                "description": "Last all-day date, or end time. Omit for one day or one hour.",
+            },
+            "all_day": {"type": "boolean"},
+            "location": {"type": "string"},
+            "description": {"type": "string"},
+        },
+        "required": ["summary", "start"],
+        "additionalProperties": False,
+    },
+)
+
 
 def bind_calendar(
     settings: Settings,
@@ -51,7 +85,11 @@ def bind_calendar(
         agenda = await calendar.agenda(day)
         return json.dumps(_payload(agenda), ensure_ascii=False)
 
-    return {CALENDAR_TODAY: today}
+    async def add(arguments: dict[str, Any]) -> str:
+        draft = parse_add(arguments)
+        return await calendar.create(draft)
+
+    return {CALENDAR_TODAY: today, CALENDAR_ADD: add}
 
 
 def _day(value: object) -> date | None:

@@ -52,7 +52,7 @@ class ResearchError(AssistAIError):
 
 
 class CalendarError(AssistAIError):
-    """The shared calendar could not be read. Messages must not include secrets."""
+    """The shared calendar could not be read or written. Messages must not include secrets."""
 
 
 class SecretsError(AssistAIError):

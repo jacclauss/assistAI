@@ -10,8 +10,10 @@ import pytest
 
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.calendar.client import CalendarClient, host_allowed
+from assistai.calendar.draft import parse_add
+from assistai.calendar.ics import render_event
 from assistai.calendar.parse import events_on
-from assistai.calendar.tools import CALENDAR_TODAY, bind_calendar
+from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_TODAY, bind_calendar
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from tests.agent_fakes import agent, household
@@ -395,7 +397,7 @@ async def test_report_only_keeps_the_calendar_read() -> None:
     jacob = agent(
         "jacob",
         "+15555550101",
-        tools=("get_time", "calendar_today", "relay", "job_create"),
+        tools=("get_time", "calendar_today", "calendar_add", "relay", "job_create"),
     )
     surface = ToolBroker(
         builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
@@ -431,3 +433,120 @@ END:VEVENT"""
     await http.aclose()
     assert agenda.truncated is True
     assert len(agenda.events) == 40
+
+
+def test_a_title_cannot_smuggle_another_event() -> None:
+    draft = parse_add(
+        {
+            "summary": "Hello; SUMMARY:Pwned",
+            "start": "2026-09-24T15:00",
+            "description": "note\nSUMMARY:Pwned",
+            "location": "Office, room 2",
+        },
+        today=date(2026, 9, 24),
+    )
+    ics = render_event(
+        draft,
+        uid="abc",
+        zone=ZoneInfo("America/Chicago"),
+        stamp=datetime(2026, 9, 24, 12, tzinfo=UTC),
+    )
+    found = events_on(ics, day=date(2026, 9, 24), zone=ZoneInfo("America/Chicago"))
+    assert [event.summary for event in found] == ["Hello; SUMMARY:Pwned"]
+    assert found[0].description == "note SUMMARY:Pwned"
+    assert found[0].location == "Office, room 2"
+    assert found[0].start.hour == 15
+    assert found[0].end.hour == 16
+
+
+def test_all_day_end_is_the_last_day() -> None:
+    draft = parse_add(
+        {"summary": "Trip", "start": "2026-09-22", "end": "2026-09-24"},
+        today=date(2026, 9, 22),
+    )
+    ics = render_event(
+        draft,
+        uid="trip",
+        zone=ZoneInfo("America/Chicago"),
+        stamp=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    assert "DTEND;VALUE=DATE:20260925" in ics
+    on_last = events_on(ics, day=date(2026, 9, 24), zone=ZoneInfo("America/Chicago"))
+    after = events_on(ics, day=date(2026, 9, 25), zone=ZoneInfo("America/Chicago"))
+    assert [event.summary for event in on_last] == ["Trip"]
+    assert after == []
+
+
+def test_add_rejects_a_time_that_is_not_local() -> None:
+    with pytest.raises(CalendarError, match="YYYY-MM-DD"):
+        parse_add({"summary": "Dentist", "start": "2026-09-24T15:00Z"}, today=date(2026, 9, 24))
+
+
+async def test_create_puts_one_event_on_the_named_calendar() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert _PASSWORD not in str(request.url)
+        assert _PASSWORD.encode() not in request.content
+        path = request.url.path
+        if request.method == "PROPFIND" and path == "/":
+            return _principal()
+        if request.method == "PROPFIND" and path.endswith("/principal/"):
+            return _home()
+        if request.method == "PROPFIND" and path.endswith("/calendars/"):
+            return _calendars()
+        if request.method == "PUT":
+            assert path.startswith("/123/calendars/home/")
+            assert path.endswith(".ics")
+            assert "personal" not in path
+            assert request.headers["if-none-match"] == "*"
+            assert request.headers["content-type"].startswith("text/calendar")
+            assert b"SUMMARY:Dentist" in request.content
+            return httpx.Response(201)
+        raise AssertionError(f"{request.method} {path}")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    client = CalendarClient(_configured(), http=http)
+    draft = parse_add(
+        {"summary": "Dentist", "start": "2026-09-24T15:00", "end": "2026-09-24T16:00"},
+        today=date(2026, 9, 24),
+    )
+    message = await client.create(draft, stamp=datetime(2026, 9, 24, tzinfo=UTC))
+    await http.aclose()
+    assert message == "Added 'Dentist' for 2026-09-24 15:00-16:00 (household local time)."
+    assert any(request.method == "PUT" for request in seen)
+
+
+async def test_calendar_add_stages_until_commit() -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def handler(arguments: dict[str, Any]) -> str:
+        calls.append(arguments)
+        return "Added"
+
+    jacob = agent("jacob", "+15555550101", tools=("calendar_add",))
+    catalog = builtin_catalog()
+    catalog.bind(CALENDAR_ADD, handler)
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+    staged_result = await surface.execute(
+        tool_call(
+            name=CALENDAR_ADD,
+            arguments='{"summary": "Dentist", "start": "2026-09-24T15:00"}',
+        )
+    )
+    assert calls == []
+    assert "staged" in staged_result.content
+    pending = surface.take_staged()
+    assert len(pending) == 1
+    committed = await surface.commit(pending[0])
+    assert committed.content == "Added"
+    assert calls[0]["summary"] == "Dentist"
+
+    refused = await surface.execute(
+        tool_call(name=CALENDAR_ADD, arguments='{"summary": "", "start": "2026-09-24"}')
+    )
+    assert "summary is required" in refused.content
+    assert surface.take_staged() == ()

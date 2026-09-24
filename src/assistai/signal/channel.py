@@ -504,15 +504,6 @@ class SignalChannel:
             return replace(inbound, sender=cached)
         found = await self._signal.number_for_uuid(inbound.sender)
         if found is None:
-            mapped = set(self._uuid_numbers.values())
-            allow = [
-                number
-                for number in self._settings.allow_from
-                if number != self._settings.signal_account and number not in mapped
-            ]
-            if len(allow) == 1:
-                found = allow[0]
-        if found is None:
             log.warning("signal.unresolved_sender", source=inbound.sender)
             return None
         self._uuid_numbers[inbound.sender] = found

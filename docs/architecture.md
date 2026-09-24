@@ -120,9 +120,9 @@ token. The operator has filesystem access to both. That is an accepted property
 of a single-box household appliance, not something the broker can fix.
 
 The shared calendar is the exception: one Apple ID that can see that calendar,
-one app-specific password, and the calendar's display name. v1 reads that
-calendar only. The model does not choose another calendar, and there is no
-write tool. "Today" is a day in `ASSISTAI_TIMEZONE`. iCloud is asked to expand
+one app-specific password, and the calendar's display name. The model does
+not choose another calendar. A read lists one day. Adding an event stages
+and waits for a yes; it does not invite anyone. "Today" is a day in `ASSISTAI_TIMEZONE`. iCloud is asked to expand
 recurrences into that local day. Event text is untrusted, because an invite is
 attacker-controlled text. The app-specific password is not stored in the repo
 or in `.env`. The Mac gateway reads it from the Keychain; the Pi reads a
@@ -294,11 +294,11 @@ would quietly move the parser back in-process.
 
 ### Relay specifically
 
-Relay is not a free `message:other_peer` sink. Delivery is: propose exact bytes
-and attachments → sender confirms → Signal send verbatim → append a record to
-the recipient's history so their assistant knows who sent it and what it said.
-The recipient's model never rewrites the outbound text, which is both a fidelity
-property and a security one. The injected record is untrusted on her side:
+Relay is not a free `message:other_peer` sink. The sender's assistant drafts
+the message. A critique replaces that draft. Delivery is: confirm the draft
+on screen → Signal sends those bytes → append a record to the recipient's
+history so their assistant knows who sent it and what it said. Nothing is
+rewritten between confirm and send. The injected record is untrusted on her side:
 confirmation authorized the delivery to her phone, not her assistant's later
 tool use.
 
@@ -343,7 +343,7 @@ Calendar and mail can move earlier if credentials are ready sooner.
 | 3 | Agents + broker | Two numbers reach two agents with distinct, empty tool sets; candidate models compared on real schemas |
 | 4 | Persistence | History, untrusted labels, and the allowlist survive a restart; a reboot does not clear taint |
 | 5 | Staged actions | A staging tool proposes, waits, and on yes executes the stored call, not a re-rendered one |
-| 6 | Relay | Text, link, or attachment reaches the other phone verbatim after one confirm, and her assistant knows what arrived |
+| 6 | Relay | A drafted message reaches the other phone after one confirm, and her assistant knows what arrived |
 | 7 | Jobs | Schedule and TTL'd watch, report-only, cancellable in Signal, failures ping, survive a reboot |
 | 8 | Research tiers 1-2 | Cited answer; a sink proposed under taint is labelled as such in the audit log |
 | 9 | Calendar | "What's on the docket today" reads the iCloud shared calendar |

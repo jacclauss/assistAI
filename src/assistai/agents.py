@@ -98,6 +98,20 @@ def system_prompt_for(agent: AgentSpec) -> str:
         "Use only the tools listed in this request. Do not invent tool results. "
         "When you use the web, cite the URLs you relied on. "
         "When you answer about the calendar, list only events the calendar tool returned."
+        + (
+            " To add an event on the shared calendar, call calendar_add. "
+            "It is not saved until the person replies yes."
+            if "calendar_add" in agent.tools
+            else ""
+        )
+        + (
+            " When they want to tell the other person something, draft it and "
+            "call relay. Do not ask them to write the exact message. If they "
+            "critique the draft, call relay again with the revision. Nothing "
+            "is sent until they reply yes."
+            if "relay" in agent.tools
+            else ""
+        )
     )
 
 

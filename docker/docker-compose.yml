@@ -28,6 +28,8 @@ services:
         condition: service_started
       extract:
         condition: service_started
+      caldav-secret:
+        condition: service_completed_successfully
     env_file:
       - ../.env
     environment:
@@ -45,11 +47,10 @@ services:
       - gateway-state:/app/state
       - ../manifest.toml:/app/manifest.toml:ro
       - ../config:/app/config:ro
-      # Calendar app-specific password. Leave this pointed at /dev/null until
-      # the Pi has a mode-600 file outside the repo. `make run` on a Mac uses
-      # the Keychain and does not read this mount. Do not put the password in
-      # the project directory.
-      - ${ASSISTAI_CALDAV_PASSWORD_FILE:-/dev/null}:/run/assistai/caldav-password:ro
+      # The password the gateway reads. caldav-secret copies the host file in
+      # and makes it mode 600 owned by uid 10001. Docker Desktop mounts files
+      # as the Mac user, so the host file has to be readable by that user.
+      - caldav-secret:/run/assistai:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -65,6 +66,30 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  caldav-secret:
+    image: assistai/gateway:local
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        if [ -f /src/caldav-password ]; then
+          cp /src/caldav-password /run/assistai/caldav-password
+        else
+          : > /run/assistai/caldav-password
+        fi
+        chown 10001:10001 /run/assistai/caldav-password
+        chmod 600 /run/assistai/caldav-password
+    volumes:
+      - ${ASSISTAI_CALDAV_PASSWORD_FILE:-/dev/null}:/src/caldav-password:ro
+      - caldav-secret:/run/assistai
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
 
   extract:
     image: assistai/gateway:local
@@ -166,3 +191,4 @@ networks:
 volumes:
   gateway-state:
   signal-cli-config:
+  caldav-secret:

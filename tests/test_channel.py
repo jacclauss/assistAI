@@ -48,15 +48,15 @@ async def test_allowed_sender_gets_model_reply(tmp_path: Path) -> None:
 _PRIVACY_UUID = "429cce0e-9174-4d7a-a98b-1cb9208b1951"
 
 
-async def test_uuid_sender_maps_via_unique_allow_from(tmp_path: Path) -> None:
-    """Phone-number privacy hides E.164; a single allowlisted number is enough."""
+async def test_uuid_sender_is_not_guessed_from_the_allow_list(tmp_path: Path) -> None:
+    """An unknown privacy id must not be treated as the only allowlisted number."""
     signal = FakeSignal()
     fireworks = client_for(lambda _req: completion_stream(text_event("pong", finish="stop")))
     channel = _channel(tmp_path, signal, fireworks)
 
     await channel.handle(inbound(sender=_PRIVACY_UUID, text="ping"))
 
-    assert signal.sent == [("+15555550101", "pong")]
+    assert signal.sent == []
     await fireworks.aclose()
 
 
@@ -1182,6 +1182,7 @@ async def test_relay_preview_is_the_stored_body_not_model_prose(tmp_path: Path) 
 
     preview = signal.sent[-1][1]
     assert "pick up milk" in preview
+    assert "what to change" in preview
     assert "I will tell her" not in preview
     assert signal.sent[-1][0] == "+15555550101"
     await fireworks.aclose()

@@ -13,6 +13,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from assistai.calendar.draft import CalendarDraft, parse_add
+from assistai.errors import CalendarError
 from assistai.inference.types import ToolCall
 
 Decision = Literal["confirm", "reject"]
@@ -56,6 +58,8 @@ def format_proposal(calls: Sequence[ToolCall], *, tainted: bool) -> str:
         return _format_job_reschedule(calls[0], tainted=tainted)
     if len(calls) == 1 and calls[0].name == "job_cancel":
         return _format_job_cancel(calls[0], tainted=tainted)
+    if len(calls) == 1 and calls[0].name == "calendar_add":
+        return _format_calendar_add(calls[0], tainted=tainted)
     lines = [_heading(len(calls))]
     lines.extend(f"- {_proposal_line(call)}" for call in calls)
     lines.append("")
@@ -94,7 +98,7 @@ def _format_relay(call: ToolCall, *, tainted: bool) -> str:
         f"From you:\n{body}",
         "",
         "They will see it as a relay from you, not as their assistant.",
-        _CONFIRM_HINT_ONE,
+        "Reply yes to send this, no to discard, or say what to change.",
     ]
     if tainted:
         lines.append(_TAINT_NOTE)
@@ -196,6 +200,10 @@ def _proposal_line(call: ToolCall) -> str:
         line = _job_reschedule_line(call)
         if line is not None:
             return line
+    elif call.name == "calendar_add":
+        line = _calendar_add_line(call)
+        if line is not None:
+            return line
     return f"`{call.name}` {_preview_args(call.arguments)}"
 
 
@@ -241,6 +249,42 @@ def _job_reschedule_line(call: ToolCall) -> str | None:
         return None
     label = spec.name or spec.id or "this job"
     return f"Change {label} to every {spec.every_seconds} seconds"
+
+
+def _format_calendar_add(call: ToolCall, *, tainted: bool) -> str:
+    draft = _calendar_draft(call)
+    if draft is None:
+        return _generic_preview(call, tainted=tainted)
+    lines = [
+        "I will add this to the shared calendar when you confirm:\n",
+        draft.summary,
+        draft.label(),
+    ]
+    if draft.location:
+        lines.append(f"Location: {draft.location}")
+    if draft.description:
+        lines.append(draft.description)
+    lines.extend(["", _CONFIRM_HINT_ONE])
+    if tainted:
+        lines.append(_TAINT_NOTE)
+    return "\n".join(lines)
+
+
+def _calendar_add_line(call: ToolCall) -> str | None:
+    draft = _calendar_draft(call)
+    if draft is None:
+        return None
+    return f"Add {draft.summary!r} {draft.label()}"
+
+
+def _calendar_draft(call: ToolCall) -> CalendarDraft | None:
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        if not isinstance(parsed, dict):
+            return None
+        return parse_add(parsed)
+    except (CalendarError, json.JSONDecodeError):
+        return None
 
 
 def _preview_args(raw: str) -> str:

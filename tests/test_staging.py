@@ -55,6 +55,7 @@ def test_a_relay_preview_shows_the_stored_body() -> None:
     assert "pick up milk" in preview
     assert "Queued" not in preview
     assert "yes" in preview.lower()
+    assert "what to change" in preview.lower()
     assert "relay from you" in preview.lower()
 
 
@@ -76,6 +77,26 @@ def test_a_job_create_preview_shows_the_stored_schedule() -> None:
     assert "morning email" in preview
     assert "summarize important mail" in preview
     assert "86400" in preview
+    assert "yes" in preview.lower()
+
+
+def test_a_calendar_add_preview_shows_the_stored_event() -> None:
+    preview = format_proposal(
+        (
+            ToolCall(
+                id="c1",
+                name="calendar_add",
+                arguments=(
+                    '{"summary": "Dentist", "start": "2026-09-24T15:00", "location": "Office"}'
+                ),
+            ),
+        ),
+        tainted=False,
+    )
+
+    assert "Dentist" in preview
+    assert "2026-09-24 15:00-16:00" in preview
+    assert "Office" in preview
     assert "yes" in preview.lower()
 
 

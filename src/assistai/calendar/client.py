@@ -1,8 +1,9 @@
-"""iCloud CalDAV read of one named calendar. HTTPS only; no writes."""
+"""iCloud CalDAV for one named calendar. Writes are a single new event."""
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
@@ -12,6 +13,8 @@ import httpx
 import structlog
 
 from assistai.bounded import ACCEPT_ENCODING, BodyTooLargeError, BodyUnreadableError, read_bounded
+from assistai.calendar.draft import CalendarDraft
+from assistai.calendar.ics import render_event
 from assistai.calendar.parse import CalendarEvent, events_on
 from assistai.config import Settings
 from assistai.errors import CalendarError, ResearchError
@@ -113,6 +116,32 @@ class CalendarClient:
             truncated=len(events) > MAX_EVENTS,
         )
 
+    async def create(self, draft: CalendarDraft, *, stamp: datetime | None = None) -> str:
+        """PUT one new event on the configured calendar. Returns a short confirmation."""
+        _require_configured(self._settings)
+        zone = ZoneInfo(self._settings.timezone)
+        moment = stamp if stamp is not None else datetime.now(UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        base_host = _configured_host(self._settings.caldav_base_url)
+        owns = self._http is None
+        http = self._http or httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+            auth=_auth(self._settings),
+        )
+        try:
+            async with asyncio.timeout(TOTAL_SECONDS):
+                collection = await self._collection(http, base_host)
+                await self._put_new(http, collection, base_host, draft, zone, moment)
+        except TimeoutError as exc:
+            raise CalendarError("that calendar took too long") from exc
+        finally:
+            if owns:
+                await http.aclose()
+        return f"Added {draft.summary!r} for {draft.label()}."
+
     async def _collection(self, http: httpx.AsyncClient, base_host: str) -> str:
         if self._calendar_url is not None:
             return self._calendar_url
@@ -190,6 +219,37 @@ class CalendarClient:
         _raise_for_status(status)
         return _xml(raw)
 
+    async def _put_new(
+        self,
+        http: httpx.AsyncClient,
+        collection: str,
+        base_host: str,
+        draft: CalendarDraft,
+        zone: ZoneInfo,
+        stamp: datetime,
+    ) -> None:
+        folder = collection if collection.endswith("/") else collection + "/"
+        for _attempt in range(2):
+            uid = uuid.uuid4().hex
+            body = render_event(draft, uid=uid, zone=zone, stamp=stamp)
+            target = urljoin(folder, f"{uid}.ics")
+            status, _raw = await self._send(
+                http,
+                "PUT",
+                target,
+                base_host,
+                body=body,
+                depth=None,
+                content_type="text/calendar; charset=utf-8",
+                if_none_match=True,
+            )
+            if status in {200, 201, 204}:
+                log.info("calendar.created")
+                return
+            if status not in {409, 412}:
+                _raise_for_status(status)
+        raise CalendarError("calendar could not store that event")
+
     async def _send(
         self,
         http: httpx.AsyncClient,
@@ -198,15 +258,20 @@ class CalendarClient:
         base_host: str,
         *,
         body: str,
-        depth: str,
+        depth: str | None,
+        content_type: str = "application/xml; charset=utf-8",
+        if_none_match: bool = False,
     ) -> tuple[int, bytes]:
         current = url
         payload = body.encode("utf-8")
         headers = {
-            "Depth": depth,
-            "Content-Type": "application/xml; charset=utf-8",
+            "Content-Type": content_type,
             "Accept-Encoding": ACCEPT_ENCODING,
         }
+        if depth is not None:
+            headers["Depth"] = depth
+        if if_none_match:
+            headers["If-None-Match"] = "*"
         for _ in range(MAX_REDIRECTS + 1):
             guard_url(current, base_host)
             try:

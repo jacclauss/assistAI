@@ -43,8 +43,8 @@ them, not drop the rest after the first tool call.
 Cross-person traffic is a relay, never a session.
 
 **Irreversible and cross-boundary actions stage first.** Proposed trash goes to
-a folder before delete is ever granted. A relay shows the exact text, waits for
-yes, then sends those bytes.
+a folder before delete is ever granted. A relay shows a draft, waits for
+yes, then sends those bytes. A critique replaces the draft; it does not send.
 
 **Scheduled work talks. Background work dies.** An indefinite schedule (daily
 email) always produces a Signal message. A silent background watch (flights)
@@ -63,8 +63,8 @@ without pasting.
 - Email, starting with Jacob's inbox; hers as soon as credentials exist. Read,
   summarize, archive, star, move, draft. Staged-trash folder as a move target.
   No send. No delete.
-- Shared household calendar, read first; write when the calendar tools land.
-  More calendars later.
+- Shared household calendar. Reads are immediate. Adding an event stages
+  and waits for a yes. More calendars later.
 - First-class jobs: create, list, change schedule, cancel, by talking to the
   bot ("stop the morning email check").
 - Research: "look this up" via search + fetch, cited, in Signal. In MVP.
@@ -120,6 +120,9 @@ trash has been lived with.
   if Apple auth on a headless Pi is unworkable, not the plan.
 - v1 is that shared calendar, not a merge of personal calendars.
 - "What's on the docket today" is a read of that calendar.
+- Adding an event stages. The person replies yes, and the stored event is
+  what gets written. The model cannot pick another calendar or add attendees.
+  Jobs still only read.
 - Calendar writes in the app already notify the other person; the bot does not
   need to announce those. Relays are for things the calendar will not show.
 
@@ -156,8 +159,9 @@ Two kinds, both brokered, both inspectable in conversation:
 Not `message:other_peer` as a free tool, and not a pass through the recipient's
 agent loop.
 
-1. Sender's assistant proposes the exact Signal body (and any attachment).
-2. Sender confirms.
+1. Sender's assistant drafts the Signal body (and any attachment). The sender
+   can critique that draft; each revision is a new proposal.
+2. Sender confirms the draft on screen.
 3. Gateway sends those bytes and attachments to the recipient's number, labeled
    so it is obviously a relay (`From Jacob:`, not her assistant speaking).
 4. Recipient reads it on the phone immediately (no extra LLM rewrite).

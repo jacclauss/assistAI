@@ -19,8 +19,9 @@ from typing import Literal, Protocol
 import structlog
 
 from assistai.agents import AgentSpec, BrokerPolicy
-from assistai.calendar.tools import CALENDAR_TODAY_SPEC
-from assistai.errors import JobError
+from assistai.calendar.draft import parse_add
+from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_ADD_SPEC, CALENDAR_TODAY_SPEC
+from assistai.errors import CalendarError, JobError
 from assistai.inference.tools import (
     GET_TIME_SPEC,
     ToolHandler,
@@ -376,6 +377,9 @@ def _staging_error(
         if call.name == RELAY_TOOL:
             parse_body(parsed, from_name=agent.name)
             return None
+        if call.name == CALENDAR_ADD:
+            parse_add(parsed)
+            return None
         if call.name == JOB_CREATE:
             created = parse_create(parsed)
             existing = store.find_job(agent.name, name=created.name) if store is not None else None
@@ -408,7 +412,7 @@ def _staging_error(
             if found is None or _staged_cancel_covers(found, staged):
                 return "no matching job"
             return None
-    except (RelayError, JobError) as exc:
+    except (RelayError, JobError, CalendarError) as exc:
         return str(exc)
     except json.JSONDecodeError:
         return "arguments are not valid JSON"
@@ -462,4 +466,12 @@ def builtin_catalog() -> ToolCatalog:
     catalog.add(WEB_FETCH_SPEC, _unbound, trusted=False, web=True)
     # Invites are attacker-controlled text, so a calendar read taints the turn.
     catalog.add(CALENDAR_TODAY_SPEC, _unbound, trusted=False)
+    # A write waits for yes. Jobs never see it: staging tools are report-only excluded.
+    catalog.add(
+        CALENDAR_ADD_SPEC,
+        _unbound,
+        trusted=True,
+        sink="calendar:write",
+        staging=True,
+    )
     return catalog

@@ -109,7 +109,8 @@ from its own account, so a personal number cannot text its own assistant.
    always texts you; a watch stays quiet unless it finds something, fails, or
    expires. Research tools (`web_search`, `web_fetch`) need both `web_access`
    and a place on `tools`. `calendar_today` reads the shared iCloud calendar
-   named by `ASSISTAI_CALDAV_CALENDAR`. Put the Apple ID, that name, and
+   named by `ASSISTAI_CALDAV_CALENDAR`. `calendar_add` proposes one event and
+   writes it only after a yes. Put the Apple ID, that name, and
    `ASSISTAI_TIMEZONE` in `.env`. The app-specific password stays in the macOS
    Keychain (`security add-generic-password -s assistai -a caldav -U -w`) or,
    on the Pi, in a mode-600 file outside this repo. Jobs may use research and

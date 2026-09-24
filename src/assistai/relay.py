@@ -25,17 +25,18 @@ RELAY_TOOL = "relay"
 RELAY_SPEC = ToolSpec(
     name=RELAY_TOOL,
     description=(
-        "Propose a verbatim Signal message to the other household member. "
-        "The body is what they will receive after the sender confirms. "
-        "Do not invent a body; use the sender's words. Attachments are not "
-        "supported yet — tell the sender to paste a link instead."
+        "Propose a Signal message to the other household member. Draft the "
+        "body from what they asked to pass on. Do not ask them to dictate "
+        "the wording. If they critique the draft, call this again with the "
+        "revised body. Nothing is sent until they reply yes. Attachments "
+        "are not supported yet — ask them to paste a link instead."
     ),
     parameters={
         "type": "object",
         "properties": {
             "body": {
                 "type": "string",
-                "description": "Exact text to send. No extra greeting or rewrite.",
+                "description": "Draft the other person will read, written by you.",
             }
         },
         "required": ["body"],

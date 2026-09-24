@@ -575,6 +575,14 @@ def test_wrap_strips_a_nonce_rebuilt_by_removal() -> None:
     assert "abcd" not in inner
 
 
+def test_an_assistant_reply_is_not_wrapped_again() -> None:
+    echoed = wrap_untrusted("On the calendar: dentist at 9.", _NONCE)
+    message = Message(role="assistant", content=echoed, untrusted=True)
+    payload = message.to_openai(nonce="different-nonce-value")
+    assert "<untrusted" not in (payload["content"] or "")
+    assert payload["content"] == "On the calendar: dentist at 9."
+
+
 def test_untrusted_tool_result_is_wrapped_for_the_provider() -> None:
     message = Message(
         role="tool",

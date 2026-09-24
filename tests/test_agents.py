@@ -40,6 +40,7 @@ def test_example_roster_loads(repo_root: Path) -> None:
         "web_search",
         "web_fetch",
         "calendar_today",
+        "calendar_add",
     )
     assert spouse.tools == (
         "get_time",
@@ -51,6 +52,7 @@ def test_example_roster_loads(repo_root: Path) -> None:
         "web_search",
         "web_fetch",
         "calendar_today",
+        "calendar_add",
     )
     assert jacob.writes == ()
     assert spouse.writes == ()

@@ -14,7 +14,7 @@ import structlog
 from assistai.errors import ToolLoopError
 from assistai.inference.client import FireworksClient
 from assistai.inference.tools import ToolSurface
-from assistai.inference.types import Message, TextDelta
+from assistai.inference.types import Message, TextDelta, strip_untrusted_wrappers
 from assistai.manifest import ModelPin
 
 log = structlog.get_logger(__name__)
@@ -52,9 +52,12 @@ async def run_turn(
                 prompt_tokens=completion.usage.prompt_tokens,
                 completion_tokens=completion.usage.completion_tokens,
             )
+        spoken = completion.content
+        if spoken:
+            spoken = strip_untrusted_wrappers(spoken) or None
         assistant = Message(
             role="assistant",
-            content=completion.content or None,
+            content=spoken,
             tool_calls=list(completion.tool_calls),
             untrusted=derived_from_untrusted,
             created_at=time.time(),
