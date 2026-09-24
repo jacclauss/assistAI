@@ -9,7 +9,7 @@ from typing import Any
 from assistai.config import Settings
 from assistai.errors import MailError
 from assistai.inference.types import ToolSpec
-from assistai.mail.actions import parse_draft, parse_file
+from assistai.mail.actions import parse_draft, parse_file, parse_message_id
 from assistai.mail.client import GmailClient, TokenStore
 from assistai.relay import active_agent
 
@@ -136,10 +136,7 @@ def bind_mail(
         )
 
     async def read(arguments: dict[str, Any]) -> str:
-        message_id = arguments.get("id")
-        if not isinstance(message_id, str) or not message_id.strip():
-            raise MailError("id is required")
-        return await gmail.read(active_agent().name, message_id.strip())
+        return await gmail.read(active_agent().name, parse_message_id(arguments.get("id")))
 
     async def file_mail(arguments: dict[str, Any]) -> str:
         batch = parse_file(arguments)

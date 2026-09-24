@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from assistai.errors import CalendarError, JobError, ResearchError
+from assistai.errors import CalendarError, JobError, MailError, ResearchError
 from assistai.inference.types import ToolCall, ToolSpec
 
 log = structlog.get_logger(__name__)
@@ -85,7 +85,7 @@ class ToolRegistry:
         try:
             result = handler(arguments)
             content = result if isinstance(result, str) else await result
-        except (JobError, ResearchError, CalendarError) as exc:
+        except (JobError, ResearchError, CalendarError, MailError) as exc:
             log.exception("tool.failed", name=call.name)
             return ToolResult(
                 json.dumps(

@@ -1,8 +1,8 @@
 """The only Gmail scope this process is allowed to hold.
 
-``gmail.modify`` reads, labels, archives, stars, moves to Trash, and creates
-drafts. It does not include ``gmail.send`` or permanent delete. Those scopes
-are never requested, and the client refuses those URL paths.
+``gmail.modify`` is the narrowest scope that can change labels. Google's
+grant also authorizes send. This process never calls send or permanent
+delete, and the client refuses those URL paths.
 """
 
 from __future__ import annotations

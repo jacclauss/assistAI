@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 
 from assistai.chat import chat_once, chat_repl
@@ -156,25 +157,42 @@ def _prompt_code() -> str:
     return input("code: ")
 
 
+def _authorization_code(raw: str) -> str:
+    """Accept the code itself or the whole redirect URL from the address bar."""
+    from urllib.parse import unquote
+
+    text = raw.strip()
+    match = re.search(r"(?:^|[?&])code=([^&]*)", text)
+    if match is None:
+        return text
+    code = unquote(match.group(1)).strip()
+    return code or text
+
+
 async def _mail(args: argparse.Namespace) -> None:
+    from assistai.agents import load_household, resolve_household_path
     from assistai.mail.client import GmailClient
     from assistai.store import Store, store_path
 
     settings = Settings()
     configure_logging(level=settings.log_level, console=True)
+    if args.mail_command != "login":
+        raise AssistAIError(f"unknown mail command: {args.mail_command}")
+    household = load_household(resolve_household_path(settings))
+    names = sorted(agent.name for agent in household.agents)
+    if args.agent not in names:
+        raise AssistAIError(f"unknown agent {args.agent!r}; expected {' or '.join(names)}")
     redirect = "http://127.0.0.1:8731/"
     store = Store(store_path(settings.state_dir))
     client = GmailClient(settings, store)
     try:
-        if args.mail_command != "login":
-            raise AssistAIError(f"unknown mail command: {args.mail_command}")
         print(client.authorization_url(redirect_uri=redirect))
         print(
-            "Open that URL, approve Gmail, and paste the code from the browser address bar.",
+            "Open that URL, approve Gmail, and paste the code or the address-bar URL.",
             file=sys.stderr,
         )
-        code = args.code if isinstance(args.code, str) and args.code.strip() else _prompt_code()
-        await client.exchange(args.agent, code, redirect_uri=redirect)
+        raw = args.code if isinstance(args.code, str) and args.code.strip() else _prompt_code()
+        await client.exchange(args.agent, _authorization_code(raw), redirect_uri=redirect)
         print(f"gmail signed in for {args.agent}")
     finally:
         await client.aclose()

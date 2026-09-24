@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import html
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from email.message import EmailMessage
 from typing import Any, Protocol
 from urllib.parse import quote, urlencode
 
@@ -13,7 +16,7 @@ import httpx
 
 from assistai.config import Settings
 from assistai.errors import MailError
-from assistai.mail.actions import DraftMessage, FileBatch
+from assistai.mail.actions import DraftMessage, FileBatch, parse_message_id
 from assistai.mail.scope import GMAIL_SCOPE, assert_scope_allowed
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -59,34 +62,47 @@ class GmailClient:
         assert_scope_allowed(GMAIL_SCOPE)
         self._settings = settings
         self._store = store
+        self._owns_http = http is None
         self._http = http or httpx.AsyncClient(timeout=20.0, trust_env=False)
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        if self._owns_http:
+            await self._http.aclose()
 
     async def inbox(self, agent: str, *, query: str = "") -> list[ListedMail]:
         params = {"maxResults": str(MAX_LIST)}
         cleaned = " ".join(query.split())
-        if cleaned:
-            params["q"] = cleaned[:300]
+        params["q"] = cleaned[:300] if cleaned else "in:inbox"
         payload = await self._json(agent, "GET", "/messages", params=params)
         rows = payload.get("messages")
         if not isinstance(rows, list):
             return []
         found: list[ListedMail] = []
         for row in rows[:MAX_LIST]:
-            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            if not isinstance(row, dict):
                 continue
-            found.append(await self._metadata(agent, row["id"]))
+            try:
+                message_id = parse_message_id(row.get("id"))
+            except MailError:
+                continue
+            try:
+                found.append(await self._metadata(agent, message_id))
+            except MailError as exc:
+                if str(exc) != "gmail message is gone":
+                    raise
         return found
 
     async def read(self, agent: str, message_id: str) -> str:
+        message_id = parse_message_id(message_id)
         payload = await self._json(
             agent, "GET", f"/messages/{quote(message_id, safe='')}", params={"format": "full"}
         )
         meta = _listed(message_id, payload)
-        body = _plain_text(payload.get("payload"))[:MAX_BODY]
-        return f"From: {meta.sender}\nSubject: {meta.subject}\nDate: {meta.date}\n\n{body}"
+        body = _plain_text(payload.get("payload"))
+        if not body.strip():
+            body = await self._attachment_text(agent, message_id, payload.get("payload"))
+        shown = body[:MAX_BODY]
+        return f"From: {meta.sender}\nSubject: {meta.subject}\nDate: {meta.date}\n\n{shown}"
 
     async def apply(self, agent: str, batch: FileBatch) -> str:
         """Check every preview, then change labels. A mismatch changes nothing."""
@@ -100,13 +116,16 @@ class GmailClient:
             shown = ", ".join(mismatches[:5])
             raise MailError(f"those messages no longer match the preview: {shown}")
         add, remove = await self._label_change(agent, batch)
-        for item in batch.messages:
-            await self._json(
-                agent,
-                "POST",
-                f"/messages/{quote(item.id, safe='')}/modify",
-                json={"addLabelIds": add, "removeLabelIds": remove},
-            )
+        await self._json(
+            agent,
+            "POST",
+            "/messages/batchModify",
+            json={
+                "ids": [item.id for item in batch.messages],
+                "addLabelIds": add,
+                "removeLabelIds": remove,
+            },
+        )
         return f"{batch.action} applied to {len(batch.messages)}."
 
     async def draft(self, agent: str, message: DraftMessage) -> str:
@@ -130,7 +149,7 @@ class GmailClient:
 
     def authorization_url(self, *, redirect_uri: str) -> str:
         client_id = self._settings.gmail_client_id.strip()
-        if not client_id:
+        if not client_id or _client_secret(self._settings) is None:
             raise MailError("gmail is not configured")
         query = urlencode(
             {
@@ -167,6 +186,21 @@ class GmailClient:
                         return label_id
         raise MailError(f"no label named {name}")
 
+    async def _attachment_text(self, agent: str, message_id: str, payload: object) -> str:
+        found = _text_attachment(payload)
+        if found is None:
+            return ""
+        attachment_id, mime, charset = found
+        loaded = await self._json(
+            agent,
+            "GET",
+            f"/messages/{quote(message_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+        )
+        text = _decode_body(loaded, charset)
+        if mime == "text/html":
+            return _html_to_text(text)
+        return text
+
     async def _metadata(self, agent: str, message_id: str) -> ListedMail:
         payload = await self._json(
             agent,
@@ -184,9 +218,10 @@ class GmailClient:
         *,
         params: Mapping[str, str | list[str]] | None = None,
         json: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         _refuse_path(method, path)
-        token = await self._access_token(agent)
+        token = await self._access_token(agent, force=force)
         try:
             response = await self._http.request(
                 method,
@@ -197,8 +232,12 @@ class GmailClient:
             )
         except httpx.HTTPError as exc:
             raise MailError("gmail is unavailable") from exc
+        if response.status_code == 401 and not force:
+            return await self._json(agent, method, path, params=params, json=json, force=True)
         if response.status_code in {401, 403}:
             raise MailError("gmail login was rejected")
+        if response.status_code == 404 and _missing_message(method, path):
+            raise MailError("gmail message is gone")
         if response.status_code >= 400:
             raise MailError("gmail is unavailable")
         if response.status_code == 204 or not response.content:
@@ -211,12 +250,12 @@ class GmailClient:
             raise MailError("gmail returned unreadable data")
         return payload
 
-    async def _access_token(self, agent: str) -> str:
+    async def _access_token(self, agent: str, *, force: bool = False) -> str:
         stored = self._store.gmail_token(agent)
         if stored is None:
             raise MailError("gmail is not signed in for this agent")
         refresh, access, expires_at = stored
-        if access and expires_at > time.time() + 30:
+        if not force and access and expires_at > time.time() + 30:
             return access
         secret = _client_secret(self._settings)
         client_id = self._settings.gmail_client_id.strip()
@@ -274,9 +313,15 @@ class GmailClient:
         )
 
 
+def _missing_message(method: str, path: str) -> bool:
+    """True for GET /messages/{id}, not for a list, attachment, or draft."""
+    return method.upper() == "GET" and path.count("/") == 2 and path.startswith("/messages/")
+
+
 def _refuse_path(method: str, path: str) -> None:
-    lowered = path.lower()
-    if method.upper() == "DELETE" or lowered.endswith("/send") or "/delete" in lowered:
+    segments = {part for part in path.lower().split("/") if part}
+    blocked = {"send", "delete", "batchdelete"}
+    if method.upper() == "DELETE" or segments & blocked:
         raise MailError("gmail send and permanent delete are not available")
 
 
@@ -307,32 +352,102 @@ def _headers(payload: object) -> dict[str, str]:
     found: dict[str, str] = {}
     if not isinstance(rows, list):
         return found
+    wanted = {item.casefold() for item in _HEADER}
     for row in rows:
         if not isinstance(row, dict):
             continue
         name = row.get("name")
         value = row.get("value")
-        if isinstance(name, str) and name in _HEADER and isinstance(value, str):
-            found[name.lower()] = " ".join(value.split())[:500]
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        key = name.casefold()
+        if key in wanted and not found.get(key):
+            found[key] = " ".join(value.split())[:500]
     return found
 
 
 def _plain_text(payload: object) -> str:
-    if not isinstance(payload, dict):
+    plain, html_body = _parts(payload)
+    if plain.strip():
+        return plain
+    if not html_body.strip():
         return ""
+    return _html_to_text(html_body)
+
+
+def _parts(payload: object) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return "", ""
     mime = payload.get("mimeType")
-    if mime == "text/plain":
-        return _decode_body(payload.get("body"))
+    charset = _charset(payload)
+    plain = _decode_body(payload.get("body"), charset) if mime == "text/plain" else ""
+    html_body = _decode_body(payload.get("body"), charset) if mime == "text/html" else ""
     parts = payload.get("parts")
     if isinstance(parts, list):
         for part in parts:
-            text = _plain_text(part)
-            if text:
-                return text
-    return _decode_body(payload.get("body"))
+            nested_plain, nested_html = _parts(part)
+            plain = plain if plain.strip() else nested_plain
+            html_body = html_body if html_body.strip() else nested_html
+    return plain, html_body
 
 
-def _decode_body(body: object) -> str:
+def _html_to_text(html_body: str) -> str:
+    text = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", " ", html_body)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return html.unescape(text)
+
+
+def _text_attachment(payload: object) -> tuple[str, str, str] | None:
+    """First text part that Gmail stored as an attachment instead of inline data."""
+    plain: tuple[str, str, str] | None = None
+    html_part: tuple[str, str, str] | None = None
+
+    def walk(part: object) -> None:
+        nonlocal plain, html_part
+        if not isinstance(part, dict) or plain is not None:
+            return
+        mime = part.get("mimeType")
+        body = part.get("body")
+        if isinstance(body, dict) and mime in {"text/plain", "text/html"}:
+            data = body.get("data")
+            attachment_id = body.get("attachmentId")
+            inline = isinstance(data, str) and bool(data)
+            if not inline and isinstance(attachment_id, str) and attachment_id:
+                chosen = (attachment_id, mime, _charset(part))
+                if mime == "text/plain":
+                    plain = chosen
+                    return
+                if html_part is None:
+                    html_part = chosen
+        rows = part.get("parts")
+        if isinstance(rows, list):
+            for row in rows:
+                walk(row)
+
+    walk(payload)
+    return plain or html_part
+
+
+def _charset(payload: Mapping[str, Any]) -> str:
+    rows = payload.get("headers")
+    if not isinstance(rows, list):
+        return "utf-8"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        value = row.get("value")
+        if not isinstance(name, str) or name.casefold() != "content-type":
+            continue
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"charset\s*=\s*\"?([^\"\s;]+)", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return "utf-8"
+
+
+def _decode_body(body: object, charset: str) -> str:
     if not isinstance(body, dict):
         return ""
     data = body.get("data")
@@ -340,18 +455,20 @@ def _decode_body(body: object) -> str:
         return ""
     padded = data + "=" * (-len(data) % 4)
     try:
-        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
-    except (ValueError, UnicodeError):
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except ValueError:
         return ""
+    try:
+        text = raw.decode(charset, errors="replace")
+    except LookupError:
+        text = raw.decode("utf-8", errors="replace")
+    return text[:200_000]
 
 
 def _rfc822(message: DraftMessage) -> str:
-    lines = [
-        f"To: {message.to}",
-        f"Subject: {message.subject}",
-        "Content-Type: text/plain; charset=utf-8",
-        "",
-        message.body,
-    ]
-    raw = "\r\n".join(lines).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii")
+    draft = EmailMessage()
+    if message.to:
+        draft["To"] = message.to
+    draft["Subject"] = message.subject
+    draft.set_content(message.body)
+    return base64.urlsafe_b64encode(draft.as_bytes()).decode("ascii")

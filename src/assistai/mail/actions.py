@@ -44,6 +44,12 @@ class DraftMessage:
     body: str
 
 
+def parse_message_id(value: object) -> str:
+    if not isinstance(value, str) or not _ID.fullmatch(value.strip()):
+        raise MailError("message id is not a Gmail id")
+    return value.strip()
+
+
 def parse_file(arguments: dict[str, Any]) -> FileBatch:
     action = arguments.get("action")
     if not isinstance(action, str) or action not in _ACTIONS:
@@ -54,6 +60,11 @@ def parse_file(arguments: dict[str, Any]) -> FileBatch:
     if len(raw) > MAX_BATCH:
         raise MailError(f"a batch can change at most {MAX_BATCH} messages")
     messages = tuple(_ref(item) for item in raw)
+    seen: set[str] = set()
+    for item in messages:
+        if item.id in seen:
+            raise MailError("that batch lists the same message twice")
+        seen.add(item.id)
     label = ""
     if action == "move":
         label = _line(arguments.get("label"), field="label", required=True)
@@ -71,9 +82,7 @@ def parse_draft(arguments: dict[str, Any]) -> DraftMessage:
 def _ref(value: object) -> MailRef:
     if not isinstance(value, dict):
         raise MailError("each message needs an id, subject, and from")
-    raw_id = value.get("id")
-    if not isinstance(raw_id, str) or not _ID.fullmatch(raw_id):
-        raise MailError("message id is not a Gmail id")
+    raw_id = parse_message_id(value.get("id"))
     return MailRef(
         id=raw_id,
         subject=_line(value.get("subject", ""), field="subject"),
