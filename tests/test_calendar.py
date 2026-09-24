@@ -155,6 +155,51 @@ END:VCALENDAR
     assert found[0].end == datetime(2026, 9, 22, 17, 30, tzinfo=UTC)
 
 
+def test_repeated_summary_uses_the_first_text() -> None:
+    found = events_on(
+        """BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:twice
+DTSTART:20260922T160000Z
+DTEND:20260922T170000Z
+SUMMARY:First
+SUMMARY:Second
+END:VEVENT
+END:VCALENDAR
+""",
+        day=date(2026, 9, 22),
+        zone=ZoneInfo("UTC"),
+    )
+
+    assert [event.summary for event in found] == ["First"]
+
+
+def test_more_than_one_vcalendar_in_a_chunk_is_read() -> None:
+    found = events_on(
+        """BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:a
+DTSTART:20260922T160000Z
+DTEND:20260922T170000Z
+SUMMARY:A
+END:VEVENT
+END:VCALENDAR
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:b
+DTSTART:20260922T180000Z
+DTEND:20260922T190000Z
+SUMMARY:B
+END:VEVENT
+END:VCALENDAR
+""",
+        day=date(2026, 9, 22),
+        zone=ZoneInfo("UTC"),
+    )
+
+    assert [event.summary for event in found] == ["A", "B"]
+
+
 def test_event_with_both_end_and_duration_is_skipped() -> None:
     found = events_on(
         """BEGIN:VCALENDAR

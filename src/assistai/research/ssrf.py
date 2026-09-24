@@ -45,16 +45,32 @@ def check_url(url: str) -> SplitResult:
         raise ResearchError("only http and https URLs are allowed")
     if parts.username is not None or parts.password is not None:
         raise ResearchError("URLs with userinfo are not allowed")
-    host = parts.hostname
-    if host is None or not host:
-        raise ResearchError("url is missing a host")
-    host = host.rstrip(".").lower()
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ResearchError("url has an invalid port") from exc
+    if port == 0:
+        raise ResearchError("url has an invalid port")
+    host = url_host(parts).rstrip(".")
     if host in _BLOCKED_HOSTS or host.endswith(_BLOCKED_SUFFIXES):
         raise ResearchError("that host is not allowed")
     literal = _literal_ip(host)
     if literal is not None:
         check_ip(literal)
     return parts
+
+
+def url_host(parts: SplitResult) -> str:
+    """ASCII host for DNS, Host, and SNI. International names go to punycode."""
+    host = parts.hostname
+    if not host:
+        raise ResearchError("url is missing a host")
+    if host.isascii():
+        return host.lower()
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ResearchError("url has an invalid host") from exc
 
 
 def check_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
@@ -92,7 +108,8 @@ async def resolve_public(host: str) -> str:
         return str(literal)
     try:
         infos = await _getaddrinfo(host)
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # UnicodeError: an empty or over-long label is rejected by the idna codec.
         raise ResearchError("that host could not be resolved") from exc
     pinned: str | None = None
     for info in infos:

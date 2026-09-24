@@ -11,8 +11,9 @@ from urllib.parse import SplitResult, urljoin, urlunsplit
 import httpx
 import trafilatura
 
+from assistai.bounded import ACCEPT_ENCODING, BodyTooLargeError, BodyUnreadableError, read_bounded
 from assistai.errors import ResearchError
-from assistai.research.ssrf import check_url, resolve_public
+from assistai.research.ssrf import check_url, resolve_public, url_host
 
 MAX_BYTES = 1_000_000
 MAX_REDIRECTS = 5
@@ -59,7 +60,9 @@ async def fetch_url(
         max_bytes=max_bytes,
         resolve=resolve,
     )
-    return extract_page(html, url=final_url)
+    # trafilatura is synchronous and slow on hostile HTML. On a thread it no
+    # longer stalls Signal (in-process) or other sidecar requests.
+    return await asyncio.to_thread(extract_page, html, url=final_url)
 
 
 async def get_html(
@@ -101,11 +104,10 @@ async def _walk(
 ) -> tuple[str, str]:
     """Follow redirects by hand so each hop is checked before it is dialled."""
     current = url
-    for _ in range(MAX_REDIRECTS):
+    # The first request plus MAX_REDIRECTS hops.
+    for _ in range(MAX_REDIRECTS + 1):
         parts = check_url(current)
-        host = parts.hostname
-        if host is None:
-            raise ResearchError("url is missing a host")
+        host = url_host(parts)
         address = await resolve(host)
         location: str | None = None
         try:
@@ -151,13 +153,14 @@ def _headers(parts: SplitResult) -> dict[str, str]:
     return {
         "User-Agent": _USER_AGENT,
         "Accept": _ACCEPT,
+        "Accept-Encoding": ACCEPT_ENCODING,
         # Dialling an IP would otherwise send the IP as Host and miss vhosts.
         "Host": _host_header(parts),
     }
 
 
 def _host_header(parts: SplitResult) -> str:
-    host = parts.hostname or ""
+    host = url_host(parts)
     if ":" in host:
         host = f"[{host}]"
     return f"{host}:{parts.port}" if parts.port else host
@@ -216,20 +219,18 @@ async def _read_body(
 ) -> str:
     """Read up to ``max_bytes`` of decoded body, then give up on the page.
 
-    httpx decompresses as it iterates, so the cap applies to the expanded
-    size and a small compressed bomb cannot outgrow it.
+    The cap applies to the inflated size, with inflation itself bounded, so a
+    small compressed bomb cannot outgrow it.
     """
-    chunks: list[bytes] = []
-    total = 0
     try:
-        async for part in response.aiter_bytes():
-            total += len(part)
-            if total > max_bytes:
-                raise ResearchError(too_large)
-            chunks.append(part)
+        raw = await read_bounded(response, max_bytes=max_bytes)
+    except BodyTooLargeError:
+        raise ResearchError(too_large) from None
+    except BodyUnreadableError as exc:
+        raise ResearchError(f"{failed} ({exc})") from None
     except httpx.HTTPError as exc:
         raise ResearchError(f"{failed} ({type(exc).__name__})") from exc
-    return b"".join(chunks).decode("utf-8", errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
 
 def _media_type(response: httpx.Response) -> str:

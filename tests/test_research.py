@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import ipaddress
 import json
-from collections.abc import AsyncIterator
+import tracemalloc
+import zlib
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
@@ -13,6 +16,7 @@ from assistai.errors import HouseholdConfigError, ResearchError
 from assistai.inference.types import Message, ToolCall, wrap_untrusted
 from assistai.research import ssrf
 from assistai.research.fetch import (
+    MAX_REDIRECTS,
     MAX_TITLE_CHARS,
     MAX_TOTAL_SECONDS,
     SIDECAR_TIMEOUT_SECONDS,
@@ -315,6 +319,171 @@ async def test_body_is_streamed_against_the_cap() -> None:
     assert produced["bytes"] < 1_000_000
 
 
+def _pinned_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), trust_env=False, follow_redirects=False
+    )
+
+
+async def _public(_host: str) -> str:
+    return "93.184.216.34"
+
+
+async def _raw_stream(data: bytes) -> AsyncIterator[bytes]:
+    """Streamed like a socket, so httpx does not decode it up front."""
+    for start in range(0, len(data), 65_536):
+        yield data[start : start + 65_536]
+
+
+async def test_stacked_gzip_bomb_is_refused_without_inflating_it() -> None:
+    bomb = gzip.compress(gzip.compress(b"A" * 50_000_000))
+    assert len(bomb) < 100_000
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": "gzip, gzip"},
+            content=_raw_stream(bomb),
+        )
+
+    http = _pinned_client(handler)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ResearchError):
+            await get_html("https://example.com/", http=http, resolve=_public)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        await http.aclose()
+
+    assert peak < 20_000_000
+
+
+async def test_single_gzip_bomb_is_capped_while_inflating() -> None:
+    bomb = gzip.compress(b"A" * 100_000_000)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": "gzip"},
+            content=_raw_stream(bomb),
+        )
+
+    http = _pinned_client(handler)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ResearchError, match="too large"):
+            await get_html("https://example.com/", http=http, resolve=_public)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        await http.aclose()
+
+    assert peak < 20_000_000
+
+
+@pytest.mark.parametrize(
+    ("encoding", "encode"),
+    [
+        ("gzip", gzip.compress),
+        ("deflate", zlib.compress),
+        ("deflate", lambda data: zlib.compress(data)[2:-4]),
+    ],
+)
+async def test_a_compressed_page_still_reads(
+    encoding: str, encode: Callable[[bytes], bytes]
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": encoding},
+            content=_raw_stream(encode(_PAGE.encode())),
+        )
+
+    http = _pinned_client(handler)
+    html, _ = await get_html("https://example.com/", http=http, resolve=_public)
+    await http.aclose()
+
+    assert "12 dollars" in html
+    assert seen[0].headers["Accept-Encoding"] == "gzip, deflate"
+
+
+async def test_an_unsupported_encoding_is_refused() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": "br"},
+            content=_raw_stream(b"\x00\x01"),
+        )
+
+    http = _pinned_client(handler)
+    with pytest.raises(ResearchError, match="unsupported content encoding"):
+        await get_html("https://example.com/", http=http, resolve=_public)
+    await http.aclose()
+
+
+async def test_five_redirects_are_followed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        hop = int(request.url.path.strip("/") or "0")
+        if hop < MAX_REDIRECTS:
+            return httpx.Response(302, headers={"location": f"/{hop + 1}"})
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=_PAGE)
+
+    http = _pinned_client(handler)
+    _, final = await get_html("https://example.com/0", http=http, resolve=_public)
+    await http.aclose()
+
+    assert final == f"https://example.com/{MAX_REDIRECTS}"
+
+
+async def test_six_redirects_are_too_many() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        hop = int(request.url.path.strip("/") or "0")
+        return httpx.Response(302, headers={"location": f"/{hop + 1}"})
+
+    http = _pinned_client(handler)
+    with pytest.raises(ResearchError, match="too many redirects"):
+        await get_html("https://example.com/0", http=http, resolve=_public)
+    await http.aclose()
+
+
+@pytest.mark.parametrize(
+    "url", ["http://example.com:abc/", "http://example.com:99999/", "http://example.com:0/"]
+)
+def test_a_bad_port_is_a_research_error(url: str) -> None:
+    with pytest.raises(ResearchError, match="port"):
+        check_url(url)
+
+
+async def test_an_international_domain_is_sent_as_punycode() -> None:
+    seen: list[httpx.Request] = []
+    resolved: list[str] = []
+
+    async def resolve(host: str) -> str:
+        resolved.append(host)
+        return "93.184.216.34"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=_PAGE)
+
+    http = _pinned_client(handler)
+    await get_html("https://bücher.de/", http=http, resolve=resolve)
+    await http.aclose()
+
+    assert resolved == ["xn--bcher-kva.de"]
+    assert seen[0].headers["Host"] == "xn--bcher-kva.de"
+    assert seen[0].extensions["sni_hostname"] == "xn--bcher-kva.de"
+
+
+async def test_a_malformed_dns_name_is_a_research_error() -> None:
+    with pytest.raises(ResearchError):
+        await ssrf.resolve_public("a..b")
+
+
 async def test_an_unreadable_content_type_is_rejected_before_the_body() -> None:
     produced = {"bytes": 0}
 
@@ -398,6 +567,12 @@ def test_wrap_strips_a_forged_nonce() -> None:
     assert "abc" not in inner
     assert wrapped.startswith('<untrusted nonce="abc">')
     assert wrapped.endswith('</untrusted nonce="abc">')
+
+
+def test_wrap_strips_a_nonce_rebuilt_by_removal() -> None:
+    wrapped = wrap_untrusted("ababcdcd and aabcdbcd", "abcd")
+    inner = wrapped.split("instructions.\n", 1)[1].rsplit("\n</untrusted", 1)[0]
+    assert "abcd" not in inner
 
 
 def test_untrusted_tool_result_is_wrapped_for_the_provider() -> None:

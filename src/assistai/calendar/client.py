@@ -11,6 +11,7 @@ import defusedxml.ElementTree as ElementTree
 import httpx
 import structlog
 
+from assistai.bounded import ACCEPT_ENCODING, BodyTooLargeError, BodyUnreadableError, read_bounded
 from assistai.calendar.parse import CalendarEvent, events_on
 from assistai.config import Settings
 from assistai.errors import CalendarError, ResearchError
@@ -204,6 +205,7 @@ class CalendarClient:
         headers = {
             "Depth": depth,
             "Content-Type": "application/xml; charset=utf-8",
+            "Accept-Encoding": ACCEPT_ENCODING,
         }
         for _ in range(MAX_REDIRECTS + 1):
             guard_url(current, base_host)
@@ -375,11 +377,9 @@ def _calendar_data(root: ElementTree.Element) -> list[str]:
 
 
 async def _read_capped(response: httpx.Response) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    async for part in response.aiter_bytes():
-        total += len(part)
-        if total > MAX_RESPONSE_BYTES:
-            raise CalendarError("calendar returned too much")
-        chunks.append(part)
-    return b"".join(chunks)
+    try:
+        return await read_bounded(response, max_bytes=MAX_RESPONSE_BYTES)
+    except BodyTooLargeError:
+        raise CalendarError("calendar returned too much") from None
+    except BodyUnreadableError:
+        raise CalendarError("calendar returned unreadable data") from None

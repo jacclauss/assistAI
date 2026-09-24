@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from assistai.bounded import ACCEPT_ENCODING
 from assistai.errors import ResearchError
 from assistai.research.fetch import _read_body
 from assistai.research.ssrf import check_url
@@ -52,6 +53,7 @@ async def web_search(
                 "GET",
                 url,
                 params={"q": cleaned, "format": "json", "language": "en"},
+                headers={"Accept-Encoding": ACCEPT_ENCODING},
             ) as response:
                 if response.status_code >= 400:
                     raise ResearchError("search is unavailable")

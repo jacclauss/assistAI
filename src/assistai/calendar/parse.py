@@ -40,17 +40,18 @@ class CalendarEvent:
 def events_on(ics: str, *, day: date, zone: ZoneInfo) -> list[CalendarEvent]:
     """Events in ``ics`` that overlap ``day`` in ``zone``. Cancelled ones drop out."""
     try:
-        parsed: object = Calendar.from_ical(ics)
+        parsed: object = Calendar.from_ical(ics, multiple=True)
     except (ValueError, TypeError) as exc:
         raise CalendarError("calendar returned unreadable data") from exc
-    if not isinstance(parsed, Calendar):
+    if not isinstance(parsed, list) or not all(isinstance(item, Calendar) for item in parsed):
         raise CalendarError("calendar returned unreadable data")
     found: list[CalendarEvent] = []
-    for component in parsed.walk("VEVENT"):
-        event = _event(component, zone)
-        if event is None or not _overlaps(event, day, zone):
-            continue
-        found.append(event)
+    for calendar in parsed:
+        for component in calendar.walk("VEVENT"):
+            event = _event(component, zone)
+            if event is None or not _overlaps(event, day, zone):
+                continue
+            found.append(event)
     found.sort(key=lambda item: (item.start, item.summary))
     return found
 
@@ -98,6 +99,9 @@ def _overlaps(event: CalendarEvent, day: date, zone: ZoneInfo) -> bool:
 
 
 def _text(value: object, limit: int) -> str:
+    # A repeated property (two SUMMARY lines) comes back as a list.
+    if isinstance(value, list):
+        value = value[0] if value else None
     if value is None:
         return ""
     text = " ".join(str(value).split())
