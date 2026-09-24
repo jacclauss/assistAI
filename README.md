@@ -13,9 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 9 of 13. "What's on the docket today" reads one shared iCloud calendar.
-The model cannot pick a different calendar and cannot write events. Event text
-is untrusted. Jobs may read that calendar when they report; they still cannot act.
+Phase 10 of 13. Gmail is per person: a digest reads the inbox, filing is one
+confirmed batch, and a draft is saved in Gmail for them to send. The
+program refuses Gmail's send and permanent-delete endpoints.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ is untrusted. Jobs may read that calendar when they report; they still cannot ac
 | 7 | Jobs: schedules and TTL'd watches | done |
 | 8 | Research tools: search, fetch, extract | done |
 | 9 | Shared calendar (iCloud CalDAV) | done |
-| 10 | Email (Gmail: read / file / draft) | |
+| 10 | Email (Gmail: read / file / draft) | done |
 | 11 | Shared store with ACLs | |
 | 12 | Update watcher | |
 | 13 | Raspberry Pi migration | |

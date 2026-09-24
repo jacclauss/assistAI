@@ -60,6 +60,10 @@ def format_proposal(calls: Sequence[ToolCall], *, tainted: bool) -> str:
         return _format_job_cancel(calls[0], tainted=tainted)
     if len(calls) == 1 and calls[0].name == "calendar_add":
         return _format_calendar_add(calls[0], tainted=tainted)
+    if len(calls) == 1 and calls[0].name == "mail_file":
+        return _format_mail_file(calls[0], tainted=tainted)
+    if len(calls) == 1 and calls[0].name == "mail_draft":
+        return _format_mail_draft(calls[0], tainted=tainted)
     lines = [_heading(len(calls))]
     lines.extend(f"- {_proposal_line(call)}" for call in calls)
     lines.append("")
@@ -285,6 +289,53 @@ def _calendar_draft(call: ToolCall) -> CalendarDraft | None:
         return parse_add(parsed)
     except (CalendarError, json.JSONDecodeError):
         return None
+
+
+def _format_mail_file(call: ToolCall, *, tainted: bool) -> str:
+    from assistai.errors import MailError
+    from assistai.mail.actions import parse_file
+
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        batch = parse_file(parsed) if isinstance(parsed, dict) else None
+    except (MailError, json.JSONDecodeError):
+        batch = None
+    if batch is None:
+        return _generic_preview(call, tainted=tainted)
+    lines = [
+        "I will change this mail when you confirm:\n",
+        batch.label_text(),
+        "",
+        _CONFIRM_HINT_ONE,
+    ]
+    if tainted:
+        lines.append(_TAINT_NOTE)
+    return "\n".join(lines)
+
+
+def _format_mail_draft(call: ToolCall, *, tainted: bool) -> str:
+    from assistai.errors import MailError
+    from assistai.mail.actions import parse_draft
+
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        draft = parse_draft(parsed) if isinstance(parsed, dict) else None
+    except (MailError, json.JSONDecodeError):
+        draft = None
+    if draft is None:
+        return _generic_preview(call, tainted=tainted)
+    lines = [
+        "I will save this Gmail draft when you confirm. It will not be sent.\n",
+        f"To: {draft.to or '(none)'}",
+        f"Subject: {draft.subject}",
+        "",
+        draft.body,
+        "",
+        _CONFIRM_HINT_ONE,
+    ]
+    if tainted:
+        lines.append(_TAINT_NOTE)
+    return "\n".join(lines)
 
 
 def _preview_args(raw: str) -> str:

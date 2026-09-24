@@ -112,6 +112,13 @@ def system_prompt_for(agent: AgentSpec) -> str:
             if "relay" in agent.tools
             else ""
         )
+        + (
+            " To read this person's Gmail, call mail_inbox or mail_read. "
+            "To archive, star, trash, move, or save a draft, call mail_file "
+            "or mail_draft. Those wait for a yes and cannot send or permanently delete."
+            if "mail_inbox" in agent.tools
+            else ""
+        )
     )
 
 

@@ -1,8 +1,8 @@
 """Durable household state. One SQLite file in the gateway state volume.
 
-History, untrusted labels, the pairing allowlist, staged proposals, and jobs
-live here so a reboot cannot forget a conversation, silently clear taint,
-skip a confirmation, or drop a schedule.
+History, untrusted labels, the pairing allowlist, staged proposals, jobs,
+and per-person Gmail refresh tokens live here so a reboot cannot forget a
+conversation, silently clear taint, skip a confirmation, or drop a schedule.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
 CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
+
+CREATE TABLE IF NOT EXISTS gmail_tokens (
+    agent TEXT PRIMARY KEY NOT NULL,
+    refresh_token TEXT NOT NULL,
+    access_token TEXT,
+    expires_at REAL NOT NULL DEFAULT 0
+);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_agent_active_name
     ON jobs(agent, lower(name)) WHERE cancelled_at IS NULL;
 """
@@ -430,6 +437,47 @@ class Store:
                 )
         except sqlite3.Error as exc:
             raise StoreError(f"job {job_id} could not be saved") from exc
+
+    def gmail_token(self, agent: str) -> tuple[str, str, float] | None:
+        """Refresh token, access token, and expiry. None when this agent has not signed in."""
+        try:
+            row = self._conn.execute(
+                "SELECT refresh_token, access_token, expires_at FROM gmail_tokens WHERE agent = ?",
+                (agent,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError(f"gmail token for {agent} is unreadable") from exc
+        if row is None:
+            return None
+        refresh = row["refresh_token"]
+        access = row["access_token"] if isinstance(row["access_token"], str) else ""
+        if not isinstance(refresh, str) or not refresh:
+            return None
+        return refresh, access, float(row["expires_at"] or 0)
+
+    def save_gmail_token(
+        self,
+        agent: str,
+        *,
+        refresh_token: str,
+        access_token: str,
+        expires_at: float,
+    ) -> None:
+        if not refresh_token:
+            raise StoreError("gmail refresh token is empty")
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO gmail_tokens (agent, refresh_token, access_token, expires_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(agent) DO UPDATE SET "
+                    "refresh_token = excluded.refresh_token, "
+                    "access_token = excluded.access_token, "
+                    "expires_at = excluded.expires_at",
+                    (agent, refresh_token, access_token, expires_at),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(f"gmail token for {agent} could not be saved") from exc
 
     def _init_schema(self) -> None:
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])

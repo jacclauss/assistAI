@@ -19,6 +19,7 @@ from assistai.broker import ToolBroker, builtin_catalog
 from assistai.calendar.tools import bind_calendar
 from assistai.config import Settings
 from assistai.inference.client import FireworksClient
+from assistai.mail.tools import bind_mail
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
 from assistai.research.tools import assert_isolated_extract, bind_research
 from assistai.scheduler import JobRunner
@@ -175,6 +176,8 @@ class Gateway:
             ).items():
                 broker.bind(name, handler)
             for name, handler in bind_calendar(self._settings).items():
+                broker.bind(name, handler)
+            for name, handler in bind_mail(self._settings, store).items():
                 broker.bind(name, handler)
             self._jobs = JobRunner(store, household, self._channel, self._settings)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))

@@ -52,7 +52,7 @@ async def run_turn(
                 prompt_tokens=completion.usage.prompt_tokens,
                 completion_tokens=completion.usage.completion_tokens,
             )
-        spoken = completion.content
+        spoken: str | None = completion.content
         if spoken:
             spoken = strip_untrusted_wrappers(spoken) or None
         assistant = Message(

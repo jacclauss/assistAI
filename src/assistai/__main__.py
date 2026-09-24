@@ -60,6 +60,12 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("extract", help="HTML extract sidecar (no Fireworks key)")
 
+    mail = sub.add_parser("mail", help="Gmail sign-in for one agent")
+    mail_sub = mail.add_subparsers(dest="mail_command", required=True)
+    login = mail_sub.add_parser("login", help="store a Gmail refresh token for one agent")
+    login.add_argument("agent", help="agent name, jacob or spouse")
+    login.add_argument("--code", default=None, help="code from the browser redirect URL")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "chat":
@@ -70,6 +76,8 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(_models(args))
         elif args.command == "extract":
             asyncio.run(_extract())
+        elif args.command == "mail":
+            asyncio.run(_mail(args))
         else:
             asyncio.run(_gateway())
     except AssistAIError as exc:
@@ -142,6 +150,35 @@ async def _signal(args: argparse.Namespace) -> None:
             return
     finally:
         await client.aclose()
+
+
+def _prompt_code() -> str:
+    return input("code: ")
+
+
+async def _mail(args: argparse.Namespace) -> None:
+    from assistai.mail.client import GmailClient
+    from assistai.store import Store, store_path
+
+    settings = Settings()
+    configure_logging(level=settings.log_level, console=True)
+    redirect = "http://127.0.0.1:8731/"
+    store = Store(store_path(settings.state_dir))
+    client = GmailClient(settings, store)
+    try:
+        if args.mail_command != "login":
+            raise AssistAIError(f"unknown mail command: {args.mail_command}")
+        print(client.authorization_url(redirect_uri=redirect))
+        print(
+            "Open that URL, approve Gmail, and paste the code from the browser address bar.",
+            file=sys.stderr,
+        )
+        code = args.code if isinstance(args.code, str) and args.code.strip() else _prompt_code()
+        await client.exchange(args.agent, code, redirect_uri=redirect)
+        print(f"gmail signed in for {args.agent}")
+    finally:
+        await client.aclose()
+        store.close()
 
 
 async def _models(args: argparse.Namespace) -> None:

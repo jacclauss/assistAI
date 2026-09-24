@@ -51,6 +51,10 @@ class ResearchError(AssistAIError):
     """Search or fetch could not complete. Messages must not include secrets."""
 
 
+class MailError(AssistAIError):
+    """Gmail could not be read or changed. Messages must not include tokens."""
+
+
 class CalendarError(AssistAIError):
     """The shared calendar could not be read or written. Messages must not include secrets."""
 

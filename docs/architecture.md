@@ -324,8 +324,8 @@ Phase 3 shipped assumptions the PRD overturns. These are the concrete changes
 that remain:
 
 - Jobs can send without an inbound trigger, but they still cannot stage an
-  action. Mail is not implemented yet. A job may read the shared calendar and
-  the web when it reports; it still cannot file, draft, write, or relay.
+  action. A job may read mail, the shared calendar, and the web when it
+  reports; it still cannot file, draft, write, or relay.
 
 ## Build phases
 

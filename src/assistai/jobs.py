@@ -53,7 +53,7 @@ JOB_CREATE_SPEC = ToolSpec(
         "when it runs, even if the report is empty. A watch stays silent unless "
         "it finds something, fails, or expires, and it requires ttl_seconds. "
         "Jobs only report; they cannot file, draft, write, or relay. "
-        "They may search, fetch, and read the shared calendar. "
+        "They may search, fetch, read the shared calendar, and read this person's mail. "
         "every_seconds is the interval (86400 for daily)."
     ),
     parameters={
@@ -243,7 +243,7 @@ def job_user_prompt(job: Job) -> str:
     return (
         f"Scheduled job '{job.name}': {job.prompt}\n\n"
         "Report only. Do not create jobs, relay, file, draft, or propose actions. "
-        "You may search, fetch, and read the shared calendar; cite URLs. "
+        "You may search, fetch, read the shared calendar, and read this person's mail; cite URLs. "
         "If you have nothing to report, reply with the single word NONE."
     )
 

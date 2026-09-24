@@ -126,6 +126,11 @@ class Settings(BaseSettings):
     caldav_calendar: str = ""
     timezone: str = "UTC"
 
+    # Gmail. One OAuth client for the household; each agent has their own
+    # refresh token in the state database. The scope is gmail.modify only.
+    gmail_client_id: str = ""
+    gmail_client_secret: SecretStr | None = None
+
     @field_validator("caldav_password_file", mode="before")
     @classmethod
     def _caldav_password_file(cls, value: object) -> object:
