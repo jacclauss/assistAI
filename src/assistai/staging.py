@@ -326,8 +326,14 @@ def _format_shared_change(call: ToolCall, *, tainted: bool) -> str:
         change = None
     if change is None:
         return _generic_preview(call, tainted=tainted)
+    if change.share:
+        heading = "I will share this private list when you confirm:\n"
+    elif change.private:
+        heading = "I will change this private list when you confirm:\n"
+    else:
+        heading = "I will change this shared list when you confirm:\n"
     lines = [
-        "I will change this shared list when you confirm:\n",
+        heading,
         change.label_text(),
         "",
         _CONFIRM_HINT_ONE,

@@ -103,6 +103,40 @@ def test_checking_an_item_off_does_not_partially_apply(tmp_path: Path) -> None:
     store.close()
 
 
+def test_checking_one_off_frees_a_slot_on_a_full_list(tmp_path: Path) -> None:
+    organizer, store = _organizer(tmp_path)
+    jacob = agent("jacob", "+15555550101", writes=("shared",), reads=("shared",))
+    for start in range(0, 50, 20):
+        batch = [f"item{index}" for index in range(start, min(start + 20, 50))]
+        organizer.apply(jacob, parse_change({"list": "shopping", "add": batch}))
+    organizer.apply(
+        jacob, parse_change({"list": "shopping", "done": ["item0"], "add": ["item50"]})
+    )
+    text = organizer.read(jacob, "shopping")
+    assert "[done] item0" in text
+    assert "[open] item50" in text
+    store.close()
+
+
+def test_done_matches_the_stored_item_when_case_folding_differs(tmp_path: Path) -> None:
+    organizer, store = _organizer(tmp_path)
+    jacob = agent("jacob", "+15555550101", writes=("shared",), reads=("shared",))
+    organizer.apply(jacob, parse_change({"list": "shopping", "add": ["Straße"]}))
+    organizer.apply(jacob, parse_change({"list": "shopping", "done": ["STRASSE"]}))
+    text = organizer.read(jacob, "shopping")
+    assert "[done] Straße" in text
+    store.close()
+
+
+def test_a_private_preview_does_not_call_the_list_shared() -> None:
+    preview = format_proposal(
+        (tool_call(SHARED_CHANGE, '{"list": "gifts", "add": ["book"], "private": true}'),),
+        tainted=False,
+    )
+    assert "private list" in preview
+    assert "shared list" not in preview
+
+
 def test_shared_change_stages_and_jobs_cannot_see_it() -> None:
     import asyncio
 

@@ -72,6 +72,9 @@ class Organizer:
         if change.share:
             if current is None or current[1] != agent.name:
                 raise SharedError(_MISSING.format(name=change.name))
+            shared = [row for row in self._store.shared_snapshot() if row[1] is None]
+            if len(shared) >= MAX_LISTS:
+                raise SharedError(f"there can be at most {MAX_LISTS} lists of that kind")
         elif current is None:
             if not change.add or change.done or change.remove:
                 raise SharedError(_MISSING.format(name=change.name))
@@ -79,8 +82,9 @@ class Organizer:
             if len(scope) >= MAX_LISTS:
                 raise SharedError(f"there can be at most {MAX_LISTS} lists of that kind")
         else:
-            open_items = sum(1 for _text, done in current[2] if not done)
-            if open_items + len(change.add) > MAX_OPEN:
+            opening = {text.casefold() for text, done in current[2] if not done}
+            closing = {text.casefold() for text in (*change.done, *change.remove)}
+            if len(opening) - len(opening & closing) + len(change.add) > MAX_OPEN:
                 raise SharedError(f"a list can have at most {MAX_OPEN} open items")
         try:
             self._store.apply_shared(

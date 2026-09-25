@@ -572,15 +572,15 @@ class Store:
                     if any(not item["done"] for item in by_text.get(text.casefold(), [])):
                         raise StoreError(f"{text!r} is already on {name}")
                 for text in remove:
-                    self._conn.execute(
-                        "DELETE FROM shared_items WHERE list_id = ? AND lower(text) = lower(?)",
-                        (list_id, text),
-                    )
+                    for item in by_text[text.casefold()]:
+                        self._conn.execute("DELETE FROM shared_items WHERE id = ?", (item["id"],))
                 for text in done:
+                    match = next(
+                        item for item in by_text[text.casefold()] if not item["done"]
+                    )
                     self._conn.execute(
-                        "UPDATE shared_items SET done = 1, updated_at = ? "
-                        "WHERE list_id = ? AND lower(text) = lower(?) AND done = 0",
-                        (now, list_id, text),
+                        "UPDATE shared_items SET done = 1, updated_at = ? WHERE id = ?",
+                        (now, match["id"]),
                     )
                 for text in add:
                     self._conn.execute(

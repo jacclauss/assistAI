@@ -45,6 +45,7 @@ def parse_change(arguments: dict[str, Any]) -> ListChange:
     remove = _items(arguments.get("remove", []))
     if share and (add or done or remove):
         raise SharedError("share a private list on its own")
+    _reject_overlap(add, done, remove)
     if not share and not add and not done and not remove:
         raise SharedError("say what to add, check off, or remove")
     if len(add) + len(done) + len(remove) > MAX_ITEMS:
@@ -57,6 +58,19 @@ def parse_change(arguments: dict[str, Any]) -> ListChange:
         private=private,
         share=share,
     )
+
+
+def _reject_overlap(add: tuple[str, ...], done: tuple[str, ...], remove: tuple[str, ...]) -> None:
+    """One item, one operation. Otherwise a yes can check off a row that was also removed."""
+    folded = {
+        "add": {item.casefold() for item in add},
+        "done": {item.casefold() for item in done},
+        "remove": {item.casefold() for item in remove},
+    }
+    for left, right in (("add", "done"), ("add", "remove"), ("done", "remove")):
+        both = folded[left] & folded[right]
+        if both:
+            raise SharedError(f"{next(iter(both))!r} cannot be both {left} and {right}")
 
 
 def _flag(value: object, *, field: str) -> bool:
