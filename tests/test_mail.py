@@ -133,11 +133,46 @@ async def test_inbox_uses_that_agents_token_and_not_send() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = GmailClient(_configured(), _Tokens(signed_in={"jacob"}), http=http)
-    rows = await client.inbox("jacob")
+    page = await client.inbox("jacob")
     await http.aclose()
-    assert rows[0].subject == "Dentist"
-    assert rows[0].sender == "Ada <ada@example.com>"
+    assert page.messages[0].subject == "Dentist"
+    assert page.messages[0].sender == "Ada <ada@example.com>"
     assert seen
+
+
+async def test_inbox_reports_the_unread_count_and_flag() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/labels/INBOX"):
+            return httpx.Response(200, json={"messagesUnread": 4, "messagesTotal": 20})
+        if request.url.path.endswith("/messages/abc"):
+            return httpx.Response(
+                200,
+                json={
+                    "labelIds": ["INBOX", "UNREAD"],
+                    "payload": {"headers": [{"name": "Subject", "value": "New"}]},
+                },
+            )
+        if request.url.path.endswith("/messages/def"):
+            return httpx.Response(
+                200,
+                json={
+                    "labelIds": ["INBOX"],
+                    "payload": {"headers": [{"name": "Subject", "value": "Old"}]},
+                },
+            )
+        assert request.url.params["q"] == "in:inbox is:unread"
+        return httpx.Response(
+            200,
+            json={"messages": [{"id": "abc"}, {"id": "def"}], "resultSizeEstimate": 4},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = GmailClient(_configured(), _Tokens(signed_in={"jacob"}), http=http)
+    page = await client.inbox("jacob", query="in:inbox is:unread")
+    await http.aclose()
+    assert page.inbox_unread == 4
+    assert page.matches == 4
+    assert [(row.subject, row.unread) for row in page.messages] == [("New", True), ("Old", False)]
 
 
 async def test_a_missing_message_does_not_blank_the_inbox() -> None:
@@ -156,10 +191,10 @@ async def test_a_missing_message_does_not_blank_the_inbox() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = GmailClient(_configured(), _Tokens(signed_in={"jacob"}), http=http)
-    rows = await client.inbox("jacob")
+    page = await client.inbox("jacob")
     await http.aclose()
-    assert [row.id for row in rows] == ["abc"]
-    assert rows[0].subject == "Kept"
+    assert [row.id for row in page.messages] == ["abc"]
+    assert page.messages[0].subject == "Kept"
 
 
 async def test_a_rejected_access_token_is_refreshed_once() -> None:
@@ -199,7 +234,7 @@ async def test_a_rejected_access_token_is_refreshed_once() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = GmailClient(_configured(), _Store(signed_in={"jacob"}), http=http)
-    assert await client.inbox("jacob") == []
+    assert (await client.inbox("jacob")).messages == ()
     await http.aclose()
     assert any(path.endswith("/token") for path in calls)
 

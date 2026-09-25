@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from assistai.agents import BrokerPolicy, load_household, local_agent, resolve_household_path
+from assistai.agents import (
+    BrokerPolicy,
+    load_household,
+    local_agent,
+    resolve_household_path,
+    system_prompt_for,
+)
 from assistai.broker import builtin_catalog
 from assistai.config import Settings
 from assistai.errors import HouseholdConfigError
@@ -29,6 +35,9 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert jacob is not None and spouse is not None
     assert jacob.name == "jacob"
     assert spouse.name == "spouse"
+    prompt = system_prompt_for(jacob)
+    assert "call mail_inbox" in prompt
+    assert "inbox_unread" in prompt
     assert household.agent_for_signal_dm("+15555550199") is None
     assert jacob.tools == (
         "get_time",

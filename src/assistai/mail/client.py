@@ -47,6 +47,16 @@ class ListedMail:
     subject: str
     date: str
     snippet: str
+    unread: bool
+
+
+@dataclass(frozen=True)
+class Inbox:
+    """One inbox page plus the inbox unread count from the INBOX label."""
+
+    messages: tuple[ListedMail, ...]
+    inbox_unread: int | None
+    matches: int | None = None
 
 
 class GmailClient:
@@ -69,28 +79,33 @@ class GmailClient:
         if self._owns_http:
             await self._http.aclose()
 
-    async def inbox(self, agent: str, *, query: str = "") -> list[ListedMail]:
+    async def inbox(self, agent: str, *, query: str = "") -> Inbox:
         params = {"maxResults": str(MAX_LIST)}
         cleaned = " ".join(query.split())
         params["q"] = cleaned[:300] if cleaned else "in:inbox"
         payload = await self._json(agent, "GET", "/messages", params=params)
+        label = await self._json(agent, "GET", "/labels/INBOX")
         rows = payload.get("messages")
-        if not isinstance(rows, list):
-            return []
         found: list[ListedMail] = []
-        for row in rows[:MAX_LIST]:
-            if not isinstance(row, dict):
-                continue
-            try:
-                message_id = parse_message_id(row.get("id"))
-            except MailError:
-                continue
-            try:
-                found.append(await self._metadata(agent, message_id))
-            except MailError as exc:
-                if str(exc) != "gmail message is gone":
-                    raise
-        return found
+        if isinstance(rows, list):
+            for row in rows[:MAX_LIST]:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    message_id = parse_message_id(row.get("id"))
+                except MailError:
+                    continue
+                try:
+                    found.append(await self._metadata(agent, message_id))
+                except MailError as exc:
+                    if str(exc) != "gmail message is gone":
+                        raise
+        matches = _count(payload.get("resultSizeEstimate")) if cleaned else None
+        return Inbox(
+            messages=tuple(found),
+            inbox_unread=_count(label.get("messagesUnread")),
+            matches=matches,
+        )
 
     async def read(self, agent: str, message_id: str) -> str:
         message_id = parse_message_id(message_id)
@@ -336,13 +351,22 @@ def _client_secret(settings: Settings) -> str | None:
 def _listed(message_id: str, payload: dict[str, Any]) -> ListedMail:
     headers = _headers(payload.get("payload"))
     snippet = payload.get("snippet")
+    labels = payload.get("labelIds")
+    unread = isinstance(labels, list) and "UNREAD" in labels
     return ListedMail(
         id=message_id,
         sender=headers.get("from", ""),
         subject=headers.get("subject", "(no subject)"),
         date=headers.get("date", ""),
         snippet=snippet.strip()[:240] if isinstance(snippet, str) else "",
+        unread=unread,
     )
+
+
+def _count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _headers(payload: object) -> dict[str, str]:

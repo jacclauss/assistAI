@@ -113,9 +113,13 @@ def system_prompt_for(agent: AgentSpec) -> str:
             else ""
         )
         + (
-            " To read this person's Gmail, call mail_inbox or mail_read. "
-            "To archive, star, trash, move, or save a draft, call mail_file "
-            "or mail_draft. Those wait for a yes and cannot send or permanently delete."
+            " If they ask about email, the inbox, or unread mail, call mail_inbox "
+            "before you answer, even when an older inbox result is already in "
+            "the chat. Answer a count from inbox_unread only. Do not say the "
+            "count is missing, and do not explain the Gmail API. To read one "
+            "message, call mail_read. To archive, star, trash, move, or save a "
+            "draft, call mail_file or mail_draft. Those wait for a yes and "
+            "cannot send or permanently delete."
             if "mail_inbox" in agent.tools
             else ""
         )

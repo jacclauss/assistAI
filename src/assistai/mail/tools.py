@@ -21,15 +21,25 @@ MAIL_DRAFT = "mail_draft"
 MAIL_INBOX_SPEC = ToolSpec(
     name=MAIL_INBOX,
     description=(
-        "List this person's recent Gmail. Use it for a digest or 'what's in "
-        "my inbox'. Judge importance from what it returns. Omit query for the "
-        "inbox; otherwise pass a Gmail search such as newer_than:1d. "
-        "This does not archive, star, move, or draft."
+        "Call this for any question about this person's email, inbox, or "
+        "unread mail, even when an older inbox result is already in the chat. "
+        "inbox_unread is the unread count; answer from that field and do not "
+        "open messages to guess it. Each "
+        "message has unread true or false. Omit query for the inbox. To list "
+        "unread mail, pass query in:inbox is:unread. matches estimates that "
+        "search and is not a substitute for inbox_unread. This does not "
+        "archive, star, move, or draft."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Optional Gmail search. Omit for the inbox."}
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional Gmail search. Omit for the inbox. "
+                    "Use in:inbox is:unread to list unread mail."
+                ),
+            }
         },
         "additionalProperties": False,
     },
@@ -120,20 +130,24 @@ def bind_mail(
             query = ""
         if not isinstance(query, str):
             raise MailError("query must be text")
-        rows = await gmail.inbox(active_agent().name, query=query)
-        return json.dumps(
-            [
+        page = await gmail.inbox(active_agent().name, query=query)
+        body: dict[str, Any] = {
+            "inbox_unread": page.inbox_unread,
+            "messages": [
                 {
                     "id": row.id,
                     "from": row.sender,
                     "subject": row.subject,
                     "date": row.date,
                     "snippet": row.snippet,
+                    "unread": row.unread,
                 }
-                for row in rows
+                for row in page.messages
             ],
-            ensure_ascii=False,
-        )
+        }
+        if page.matches is not None:
+            body["matches"] = page.matches
+        return json.dumps(body, ensure_ascii=False)
 
     async def read(arguments: dict[str, Any]) -> str:
         return await gmail.read(active_agent().name, parse_message_id(arguments.get("id")))
