@@ -113,6 +113,14 @@ def system_prompt_for(agent: AgentSpec) -> str:
             else ""
         )
         + (
+            " To read lists, call shared_lists. A private list is visible only "
+            "to the person who owns it. To add, check off, or remove items, "
+            "call shared_change. Pass private true for a list the other person "
+            "must not see. Nothing is written until they reply yes."
+            if "shared_lists" in agent.tools
+            else ""
+        )
+        + (
             " If they ask about email, the inbox, or unread mail, call mail_inbox "
             "before you answer, even when an older inbox result is already in "
             "the chat. Answer a count from inbox_unread only. Do not say the "
@@ -184,6 +192,8 @@ def load_household(path: Path, *, known_tools: frozenset[str] | None = None) -> 
 def _parse_agent(name: object, block: object, *, known_tools: frozenset[str] | None) -> AgentSpec:
     if not isinstance(name, str) or not _AGENT_NAME.fullmatch(name):
         raise HouseholdConfigError(f"invalid agent name: {name!r}")
+    if name == "organizer":
+        raise HouseholdConfigError("organizer is a process, not a Signal agent")
     if not isinstance(block, dict):
         raise HouseholdConfigError(f"agents.{name} must be a table")
     binding = _parse_binding(name, block.get("binds_to"))

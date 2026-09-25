@@ -64,6 +64,8 @@ def format_proposal(calls: Sequence[ToolCall], *, tainted: bool) -> str:
         return _format_mail_file(calls[0], tainted=tainted)
     if len(calls) == 1 and calls[0].name == "mail_draft":
         return _format_mail_draft(calls[0], tainted=tainted)
+    if len(calls) == 1 and calls[0].name == "shared_change":
+        return _format_shared_change(calls[0], tainted=tainted)
     lines = [_heading(len(calls))]
     lines.extend(f"- {_proposal_line(call)}" for call in calls)
     lines.append("")
@@ -305,6 +307,28 @@ def _format_mail_file(call: ToolCall, *, tainted: bool) -> str:
     lines = [
         "I will change this mail when you confirm:\n",
         batch.label_text(),
+        "",
+        _CONFIRM_HINT_ONE,
+    ]
+    if tainted:
+        lines.append(_TAINT_NOTE)
+    return "\n".join(lines)
+
+
+def _format_shared_change(call: ToolCall, *, tainted: bool) -> str:
+    from assistai.errors import SharedError
+    from assistai.shared.records import parse_change
+
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+        change = parse_change(parsed) if isinstance(parsed, dict) else None
+    except (SharedError, json.JSONDecodeError):
+        change = None
+    if change is None:
+        return _generic_preview(call, tainted=tainted)
+    lines = [
+        "I will change this shared list when you confirm:\n",
+        change.label_text(),
         "",
         _CONFIRM_HINT_ONE,
     ]

@@ -30,15 +30,15 @@ allow_from = ["+15555550101", "+15555550102"]
 [agents.jacob]
 binds_to = { channel = "signal", peer = "+15555550101" }
 reads = ["own", "shared"]
-writes = []
-tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch", "calendar_today", "calendar_add", "mail_inbox", "mail_read", "mail_file", "mail_draft"]
+writes = ["own", "shared"]
+tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch", "calendar_today", "calendar_add", "mail_inbox", "mail_read", "mail_file", "mail_draft", "shared_lists", "shared_change"]
 web_access = true
 
 [agents.spouse]
 binds_to = { channel = "signal", peer = "+15555550102" }
 reads = ["own", "shared"]
-writes = []
-tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch", "calendar_today", "calendar_add", "mail_inbox", "mail_read", "mail_file", "mail_draft"]
+writes = ["own", "shared"]
+tools = ["get_time", "relay", "job_create", "job_list", "job_cancel", "job_reschedule", "web_search", "web_fetch", "calendar_today", "calendar_add", "mail_inbox", "mail_read", "mail_file", "mail_draft", "shared_lists", "shared_change"]
 web_access = true
 
 [broker]

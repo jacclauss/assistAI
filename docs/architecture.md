@@ -94,11 +94,18 @@ containers become necessary. Revisit this decision then, not before.
 Two agents are the product. Each is bound to exactly one number and reaches
 nothing else.
 
-An **organizer** is deferred to the shared-store phase. When it arrives it is a
-process, not a Signal identity: it owns structured household state and never
-browses, preserving the rule that the component with the broadest write
-authority never ingests the open web. Nobody texts it, and relays do not pass
-through it. The roster is two Signal DMs; a group binding is rejected at load.
+An **organizer** is a process, not a Signal identity. It owns the household
+lists and never browses, so the component with the broadest write authority
+never ingests the open web. Nobody texts it, and relays do not pass through it.
+The roster is two Signal DMs; a group binding, or an agent named organizer, is
+rejected at load. Each list is either shared or private to one agent. The `own`
+grant covers that agent's private lists. The `shared` grant covers lists both
+can see. A named lookup that misses stays inside the scope that was asked for,
+so one person cannot learn that the other has a private list of that name. A
+list change stages and waits for a yes, including the change that publishes a
+private list. Reading a list taints the turn, because item text can carry
+instructions. A tainted turn can still propose a change; the preview says so,
+and the stored call is what runs.
 
 Shared state is a SQLite database with typed tables and enforced ACLs, not a
 directory of files. A workspace directory is a default working directory, not a
@@ -348,6 +355,6 @@ Calendar and mail can move earlier if credentials are ready sooner.
 | 8 | Research tiers 1-2 | Cited answer; a sink proposed under taint is labelled as such in the audit log |
 | 9 | Calendar | "What's on the docket today" reads the iCloud shared calendar |
 | 10 | Email | Digest, batch-staged filing, Gmail drafts; send and delete scopes never requested |
-| 11 | Shared store | Structured household state with ACLs; organizer runs as a process and never browses |
+| 11 | Shared store | Shared and private lists with ACLs; organizer runs as a process and never browses |
 | 12 | Update watcher | Correctly flags a stale signal-cli and takes no action |
 | 13 | Pi migration | Survives reboot and a week unattended |

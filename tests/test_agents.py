@@ -54,6 +54,8 @@ def test_example_roster_loads(repo_root: Path) -> None:
         "mail_read",
         "mail_file",
         "mail_draft",
+        "shared_lists",
+        "shared_change",
     )
     assert spouse.tools == (
         "get_time",
@@ -70,9 +72,11 @@ def test_example_roster_loads(repo_root: Path) -> None:
         "mail_read",
         "mail_file",
         "mail_draft",
+        "shared_lists",
+        "shared_change",
     )
-    assert jacob.writes == ()
-    assert spouse.writes == ()
+    assert jacob.writes == ("own", "shared")
+    assert spouse.writes == ("own", "shared")
     assert jacob.web_access is True
     assert spouse.web_access is True
     assert all(agent.binding.is_signal_dm for agent in household.agents)

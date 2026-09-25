@@ -181,9 +181,12 @@ explicit confirm for those sinks too.
 
 ### Agents
 
-Jacob and spouse are the product. An organizer process may exist later as a
-place for shared structured data and the job runner, but it is not a person
-either of them texts, and it is not on the relay path.
+Jacob and spouse are the product. The organizer is a process that holds household
+lists. It is not a person either of them texts, and it is not on the relay path.
+A shared list is visible to both. A private list is visible only to the person
+who created it; the other assistant gets the same answer as for a list that
+does not exist. Publishing a private list is a separate staged change and waits
+for a yes. A job may read the lists visible to its owner and cannot change them.
 
 ## Success
 

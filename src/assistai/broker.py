@@ -21,7 +21,7 @@ import structlog
 from assistai.agents import AgentSpec, BrokerPolicy
 from assistai.calendar.draft import parse_add
 from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_ADD_SPEC, CALENDAR_TODAY_SPEC
-from assistai.errors import CalendarError, JobError, MailError
+from assistai.errors import CalendarError, JobError, MailError, SharedError
 from assistai.inference.tools import (
     GET_TIME_SPEC,
     ToolHandler,
@@ -54,6 +54,8 @@ from assistai.mail.tools import (
 )
 from assistai.relay import RELAY_SPEC, RELAY_TOOL, RelayError, parse_body, using_agent
 from assistai.research.tools import WEB_FETCH_SPEC, WEB_SEARCH_SPEC
+from assistai.shared.records import parse_change
+from assistai.shared.tools import SHARED_CHANGE, SHARED_CHANGE_SPEC, SHARED_LISTS_SPEC
 
 log = structlog.get_logger(__name__)
 
@@ -395,6 +397,13 @@ def _staging_error(
         if call.name == MAIL_DRAFT:
             parse_draft(parsed)
             return None
+        if call.name == SHARED_CHANGE:
+            change = parse_change(parsed)
+            if (change.private or change.share) and "own" not in agent.writes:
+                return "this agent cannot change private lists"
+            if (change.share or not change.private) and "shared" not in agent.writes:
+                return "this agent cannot change shared lists"
+            return None
         if call.name == JOB_CREATE:
             created = parse_create(parsed)
             existing = store.find_job(agent.name, name=created.name) if store is not None else None
@@ -427,7 +436,7 @@ def _staging_error(
             if found is None or _staged_cancel_covers(found, staged):
                 return "no matching job"
             return None
-    except (RelayError, JobError, CalendarError, MailError) as exc:
+    except (RelayError, JobError, CalendarError, MailError, SharedError) as exc:
         return str(exc)
     except json.JSONDecodeError:
         return "arguments are not valid JSON"
@@ -493,4 +502,14 @@ def builtin_catalog() -> ToolCatalog:
     catalog.add(MAIL_READ_SPEC, _unbound, trusted=False)
     catalog.add(MAIL_FILE_SPEC, _unbound, trusted=True, sink="gmail:file", staging=True)
     catalog.add(MAIL_DRAFT_SPEC, _unbound, trusted=True, sink="gmail:draft", staging=True)
+    # List text is untrusted. A change waits for yes. The organizer, not the
+    # model, is what writes. Jobs never see the change tool.
+    catalog.add(SHARED_LISTS_SPEC, _unbound, trusted=False)
+    catalog.add(
+        SHARED_CHANGE_SPEC,
+        _unbound,
+        trusted=True,
+        sink="shared:write",
+        staging=True,
+    )
     return catalog

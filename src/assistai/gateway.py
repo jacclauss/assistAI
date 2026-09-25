@@ -24,6 +24,8 @@ from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
 from assistai.research.tools import assert_isolated_extract, bind_research
 from assistai.scheduler import JobRunner
 from assistai.secrets import apply_caldav_password
+from assistai.shared.organizer import Organizer
+from assistai.shared.tools import bind_shared
 from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
@@ -178,6 +180,8 @@ class Gateway:
             for name, handler in bind_calendar(self._settings).items():
                 broker.bind(name, handler)
             for name, handler in bind_mail(self._settings, store).items():
+                broker.bind(name, handler)
+            for name, handler in bind_shared(Organizer(store)).items():
                 broker.bind(name, handler)
             self._jobs = JobRunner(store, household, self._channel, self._settings)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))

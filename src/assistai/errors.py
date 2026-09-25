@@ -55,6 +55,10 @@ class MailError(AssistAIError):
     """Gmail could not be read or changed. Messages must not include tokens."""
 
 
+class SharedError(AssistAIError):
+    """A shared list could not be read or changed."""
+
+
 class CalendarError(AssistAIError):
     """The shared calendar could not be read or written. Messages must not include secrets."""
 

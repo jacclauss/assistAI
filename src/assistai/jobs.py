@@ -243,7 +243,9 @@ def job_user_prompt(job: Job) -> str:
     return (
         f"Scheduled job '{job.name}': {job.prompt}\n\n"
         "Report only. Do not create jobs, relay, file, draft, or propose actions. "
-        "You may search, fetch, read the shared calendar, and read this person's mail; cite URLs. "
+        "You may search, fetch, read the shared calendar, read lists visible "
+        "to this person, and read this person's mail; cite URLs. Do not change "
+        "a list. Another person's private list is not visible to you. "
         "If you have nothing to report, reply with the single word NONE."
     )
 

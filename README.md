@@ -6,16 +6,17 @@ always-on appliance.
 
 Two people text a dedicated bot number. Each reaches their own assistant, with
 different read, write, and tool permissions enforced by a broker. There is no
-third chat; an organizer process may hold shared state later, and nobody texts it.
+third chat. An organizer process holds the shared lists, and nobody texts it.
 
 See [docs/prd.md](docs/prd.md) for what this is for, and
 [docs/architecture.md](docs/architecture.md) for how it is built.
 
 ## Status
 
-Phase 10 of 13. Gmail is per person: a digest reads the inbox, filing is one
-confirmed batch, and a draft is saved in Gmail for them to send. The
-program refuses Gmail's send and permanent-delete endpoints.
+Phase 11 of 13. Household lists live in the state database. A shared list is
+visible to both people. A private list is visible only to its owner. A change,
+including publishing a private list, waits for a yes. The organizer process is
+the only writer. It is not a Signal contact and it does not browse.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -30,7 +31,7 @@ program refuses Gmail's send and permanent-delete endpoints.
 | 8 | Research tools: search, fetch, extract | done |
 | 9 | Shared calendar (iCloud CalDAV) | done |
 | 10 | Email (Gmail: read / file / draft) | done |
-| 11 | Shared store with ACLs | |
+| 11 | Shared store with ACLs | done |
 | 12 | Update watcher | |
 | 13 | Raspberry Pi migration | |
 

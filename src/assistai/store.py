@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -23,7 +24,7 @@ from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -83,6 +84,27 @@ CREATE TABLE IF NOT EXISTS gmail_tokens (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_agent_active_name
     ON jobs(agent, lower(name)) WHERE cancelled_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS shared_lists (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    owner TEXT,
+    created_by TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_shared_name
+    ON shared_lists(lower(name)) WHERE owner IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_private_name
+    ON shared_lists(owner, lower(name)) WHERE owner IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS shared_items (
+    id TEXT PRIMARY KEY NOT NULL,
+    list_id TEXT NOT NULL REFERENCES shared_lists(id),
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 _PERSISTED_ROLES = frozenset({"user", "assistant", "tool"})
@@ -479,6 +501,103 @@ class Store:
         except sqlite3.Error as exc:
             raise StoreError(f"gmail token for {agent} could not be saved") from exc
 
+    def shared_snapshot(self) -> list[tuple[str, str | None, list[tuple[str, bool]]]]:
+        """Every list, its owner (none when shared), and its items."""
+        try:
+            lists = self._conn.execute(
+                "SELECT id, name, owner FROM shared_lists ORDER BY updated_at, name"
+            ).fetchall()
+            items = self._conn.execute(
+                "SELECT list_id, text, done FROM shared_items ORDER BY updated_at, id"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError("shared lists are unreadable") from exc
+        by_list: dict[str, list[tuple[str, bool]]] = {row["id"]: [] for row in lists}
+        for row in items:
+            bucket = by_list.get(row["list_id"])
+            if bucket is not None:
+                bucket.append((row["text"], bool(row["done"])))
+        found: list[tuple[str, str | None, list[tuple[str, bool]]]] = []
+        for row in lists:
+            owner = row["owner"] if isinstance(row["owner"], str) else None
+            found.append((row["name"], owner, by_list[row["id"]]))
+        return found
+
+    def apply_shared(
+        self,
+        *,
+        name: str,
+        add: tuple[str, ...],
+        done: tuple[str, ...],
+        remove: tuple[str, ...],
+        actor: str,
+        owner: str | None,
+        share: bool,
+        now: float,
+    ) -> None:
+        """Apply one confirmed list change. A missing item changes nothing."""
+        try:
+            with self._conn:
+                if share:
+                    self._share_private_list(name, actor, now)
+                    return
+                row = self._find_list(name, owner)
+                if row is None:
+                    if done or remove or not add:
+                        raise StoreError(f"there is no list named {name}")
+                    list_id = uuid.uuid4().hex
+                    self._conn.execute(
+                        "INSERT INTO shared_lists (id, name, owner, created_by, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (list_id, name, owner, actor, now),
+                    )
+                else:
+                    list_id = row["id"]
+                existing = self._conn.execute(
+                    "SELECT id, text, done FROM shared_items WHERE list_id = ?",
+                    (list_id,),
+                ).fetchall()
+                by_text: dict[str, list[sqlite3.Row]] = {}
+                for item in existing:
+                    by_text.setdefault(str(item["text"]).casefold(), []).append(item)
+                for text in done:
+                    open_items = by_text.get(text.casefold(), [])
+                    match = next((item for item in open_items if not item["done"]), None)
+                    if match is None:
+                        raise StoreError(f"{text!r} is not an open item on {name}")
+                for text in remove:
+                    if text.casefold() not in by_text:
+                        raise StoreError(f"{text!r} is not on {name}")
+                for text in add:
+                    if any(not item["done"] for item in by_text.get(text.casefold(), [])):
+                        raise StoreError(f"{text!r} is already on {name}")
+                for text in remove:
+                    self._conn.execute(
+                        "DELETE FROM shared_items WHERE list_id = ? AND lower(text) = lower(?)",
+                        (list_id, text),
+                    )
+                for text in done:
+                    self._conn.execute(
+                        "UPDATE shared_items SET done = 1, updated_at = ? "
+                        "WHERE list_id = ? AND lower(text) = lower(?) AND done = 0",
+                        (now, list_id, text),
+                    )
+                for text in add:
+                    self._conn.execute(
+                        "INSERT INTO shared_items "
+                        "(id, list_id, text, done, created_by, updated_at) "
+                        "VALUES (?, ?, ?, 0, ?, ?)",
+                        (uuid.uuid4().hex, list_id, text, actor, now),
+                    )
+                self._conn.execute(
+                    "UPDATE shared_lists SET updated_at = ? WHERE id = ?",
+                    (now, list_id),
+                )
+        except StoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise StoreError(f"shared list {name} could not be saved") from exc
+
     def _init_schema(self) -> None:
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
         if version > SCHEMA_VERSION:
@@ -490,6 +609,7 @@ class Store:
         with self._conn:
             self._conn.executescript(_SCHEMA)
             self._ensure_job_pending_columns()
+            self._ensure_shared_list_owner()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _ensure_job_pending_columns(self) -> None:
@@ -505,6 +625,49 @@ class Store:
         for name, decl in additions:
             if name not in cols:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
+
+    def _ensure_shared_list_owner(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(shared_lists)")}
+        if not cols:
+            return
+        if "owner" not in cols:
+            self._conn.execute("ALTER TABLE shared_lists ADD COLUMN owner TEXT")
+        self._conn.execute("DROP INDEX IF EXISTS shared_lists_name")
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_shared_name "
+            "ON shared_lists(lower(name)) WHERE owner IS NULL"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_private_name "
+            "ON shared_lists(owner, lower(name)) WHERE owner IS NOT NULL"
+        )
+
+    def _find_list(self, name: str, owner: str | None) -> sqlite3.Row | None:
+        if owner is None:
+            found = self._conn.execute(
+                "SELECT id FROM shared_lists WHERE lower(name) = lower(?) AND owner IS NULL",
+                (name,),
+            ).fetchone()
+        else:
+            found = self._conn.execute(
+                "SELECT id FROM shared_lists WHERE lower(name) = lower(?) AND owner = ?",
+                (name, owner),
+            ).fetchone()
+        if found is None:
+            return None
+        return cast(sqlite3.Row, found)
+
+    def _share_private_list(self, name: str, actor: str, now: float) -> None:
+        row = self._find_list(name, actor)
+        if row is None:
+            raise StoreError(f"there is no list named {name}")
+        taken = self._find_list(name, None)
+        if taken is not None:
+            raise StoreError(f"a shared list named {name} already exists")
+        self._conn.execute(
+            "UPDATE shared_lists SET owner = NULL, updated_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
 
     def _replace_history(self, agent: str, persisted: list[Message]) -> None:
         self._conn.execute("DELETE FROM messages WHERE agent = ?", (agent,))
