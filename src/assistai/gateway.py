@@ -30,6 +30,7 @@ from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
 from assistai.store import Store, store_path
+from assistai.updates.watcher import UpdateWatcher
 
 
 class ChannelRunner(Protocol):
@@ -67,6 +68,8 @@ class Gateway:
         self._channel_task: asyncio.Task[None] | None = None
         self._job_task: asyncio.Task[None] | None = None
         self._jobs: JobRunner | None = None
+        self._update_task: asyncio.Task[None] | None = None
+        self._updates: UpdateWatcher | None = None
         self._shutdown = asyncio.Event()
         self._beats = 0
         self.validated_refs: tuple[str, ...] = ()
@@ -184,9 +187,13 @@ class Gateway:
             for name, handler in bind_shared(Organizer(store)).items():
                 broker.bind(name, handler)
             self._jobs = JobRunner(store, household, self._channel, self._settings)
+            if self._signal is not None:
+                self._updates = UpdateWatcher(self._settings, store, self._signal)
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         if self._jobs is not None:
             self._job_task = asyncio.create_task(self._jobs.run(self._shutdown))
+        if self._updates is not None:
+            self._update_task = asyncio.create_task(self._updates.run(self._shutdown))
         log.info("gateway.signal_started", account=self._settings.signal_account)
 
     async def _run_channel(self, channel: ChannelRunner) -> None:
@@ -200,8 +207,10 @@ class Gateway:
         self._shutdown.set()
         await self._await_task(self._channel_task)
         await self._await_task(self._job_task)
+        await self._await_task(self._update_task)
         self._channel_task = None
         self._job_task = None
+        self._update_task = None
 
     async def _await_task(self, task: asyncio.Task[None] | None) -> None:
         if task is None:

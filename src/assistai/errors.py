@@ -11,6 +11,10 @@ class MissingAPIKeyError(AssistAIError):
     """Fireworks credential is required for this command and was not set."""
 
 
+class UpdateError(AssistAIError):
+    """An upstream update check failed. Nothing was changed."""
+
+
 class ManifestError(AssistAIError):
     """manifest.toml is missing, unreadable, or missing required pins."""
 

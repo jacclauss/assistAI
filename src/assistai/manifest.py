@@ -6,6 +6,7 @@ sends ``ref`` to Fireworks as-is.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,12 +27,25 @@ class ModelPin:
 
 
 @dataclass(frozen=True)
+class ImagePin:
+    """A container image pin. The watcher reads it and never rewrites it."""
+
+    name: str
+    ref: str
+    repository: str
+    tag: str
+    digest: str
+    priority: str
+
+
+@dataclass(frozen=True)
 class Manifest:
-    """The subset of the manifest that phase 1 needs."""
+    """Pinned models and container images."""
 
     primary: ModelPin
     quarantine: ModelPin
     candidates: dict[str, ModelPin]
+    images: tuple[ImagePin, ...] = ()
 
     def required_refs(self) -> tuple[str, ...]:
         """Refs that must be callable at startup: primary and quarantine."""
@@ -73,7 +87,12 @@ def load_manifest(path: Path) -> Manifest:
     primary = _required_pin(models, "primary")
     quarantine = _required_pin(models, "quarantine")
     candidates = _candidate_pins(models.get("candidates"))
-    return Manifest(primary=primary, quarantine=quarantine, candidates=candidates)
+    return Manifest(
+        primary=primary,
+        quarantine=quarantine,
+        candidates=candidates,
+        images=_image_pins(raw.get("images")),
+    )
 
 
 def _required_pin(models: dict[str, Any], name: str) -> ModelPin:
@@ -106,3 +125,54 @@ def _candidate_pins(block: object) -> dict[str, ModelPin]:
             raise ManifestError(f"models.candidates.{name}.ref must be a non-empty string")
         pins[name] = ModelPin(name=name, provider="fireworks", ref=ref.strip())
     return pins
+
+
+_REPO = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+def _image_pins(block: object) -> tuple[ImagePin, ...]:
+    if block is None:
+        return ()
+    if not isinstance(block, dict):
+        raise ManifestError("images must be a table")
+    pins: list[ImagePin] = []
+    for name, entry in block.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise ManifestError(f"images.{name} must be a table")
+        ref = entry.get("ref")
+        if not isinstance(ref, str) or not ref.strip():
+            raise ManifestError(f"images.{name}.ref must be a non-empty string")
+        repository, tag = _split_image_ref(name, ref.strip())
+        digest = entry.get("digest", "")
+        if not isinstance(digest, str):
+            raise ManifestError(f"images.{name}.digest must be a string")
+        priority = entry.get("priority", "normal")
+        if priority not in {"normal", "high"}:
+            raise ManifestError(f"images.{name}.priority must be normal or high")
+        pins.append(
+            ImagePin(
+                name=name,
+                ref=ref.strip(),
+                repository=repository,
+                tag=tag,
+                digest=digest.strip(),
+                priority=priority,
+            )
+        )
+    return tuple(pins)
+
+
+def _split_image_ref(name: str, ref: str) -> tuple[str, str]:
+    """Docker Hub image and tag. A registry host is refused."""
+    if "@" in ref or ref.count(":") != 1:
+        raise ManifestError(f"images.{name}.ref must be name:tag on Docker Hub")
+    image, tag = ref.split(":", 1)
+    if image.startswith("localhost") or "/" in tag or not _TAG.fullmatch(tag):
+        raise ManifestError(f"images.{name}.ref must be name:tag on Docker Hub")
+    if image.count("/") > 1:
+        raise ManifestError(f"images.{name}.ref must be name:tag on Docker Hub")
+    repository = image if "/" in image else f"library/{image}"
+    if _REPO.fullmatch(repository) is None:
+        raise ManifestError(f"images.{name}.ref must be name:tag on Docker Hub")
+    return repository, tag

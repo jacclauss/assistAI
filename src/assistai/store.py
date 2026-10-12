@@ -24,7 +24,7 @@ from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -104,6 +104,12 @@ CREATE TABLE IF NOT EXISTS shared_items (
     done INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS update_notices (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    report TEXT NOT NULL,
+    sent_at REAL NOT NULL
 );
 """
 
@@ -500,6 +506,31 @@ class Store:
                 )
         except sqlite3.Error as exc:
             raise StoreError(f"gmail token for {agent} could not be saved") from exc
+
+    def last_update_report(self) -> str:
+        """The last update summary sent to the operator, or empty."""
+        try:
+            row = self._conn.execute(
+                "SELECT report FROM update_notices WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError("update notice is unreadable") from exc
+        if row is None:
+            return ""
+        return str(row["report"])
+
+    def save_update_report(self, report: str, now: float) -> None:
+        """Remember a summary so the same stale pin is not texted again."""
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO update_notices (id, report, sent_at) VALUES (1, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "report = excluded.report, sent_at = excluded.sent_at",
+                    (report, now),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError("update notice could not be saved") from exc
 
     def shared_snapshot(self) -> list[tuple[str, str | None, list[tuple[str, bool]]]]:
         """Every list, its owner (none when shared), and its items."""

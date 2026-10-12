@@ -13,10 +13,9 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 11 of 13. Household lists live in the state database. A shared list is
-visible to both people. A private list is visible only to its owner. A change,
-including publishing a private list, waits for a yes. The organizer process is
-the only writer. It is not a Signal contact and it does not browse.
+Phase 12 of 13. The update watcher compares image pins in `manifest.toml`
+with Docker Hub and texts the operator when signal-cli is stale. It does not
+install, pull, or edit anything.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -32,7 +31,7 @@ the only writer. It is not a Signal contact and it does not browse.
 | 9 | Shared calendar (iCloud CalDAV) | done |
 | 10 | Email (Gmail: read / file / draft) | done |
 | 11 | Shared store with ACLs | done |
-| 12 | Update watcher | |
+| 12 | Update watcher | done |
 | 13 | Raspberry Pi migration | |
 
 ## Prerequisites

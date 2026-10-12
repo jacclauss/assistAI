@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     # In-process job runner. One box, few jobs; poll often enough for tests
     # and a daily digest, without a second daemon.
     job_poll_seconds: float = Field(default=1.0, gt=0)
+    # How often the update watcher diffs image pins. It notifies; it never applies.
+    update_check_seconds: float = Field(default=24 * 3600, gt=0)
     # Job sends are metered separately from conversational turns so a tight
     # schedule cannot spend the person's Signal budget.
     signal_job_messages_per_hour: int = Field(default=30, gt=0)

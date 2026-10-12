@@ -20,6 +20,9 @@ def test_loads_repo_manifest(repo_root: Path) -> None:
         manifest.primary.ref,
         manifest.quarantine.ref,
     )
+    signal_cli = next(pin for pin in manifest.images if pin.name == "signal_cli")
+    assert signal_cli.ref == "bbernhard/signal-cli-rest-api:0.100"
+    assert signal_cli.priority == "high"
 
 
 def test_swap_is_one_field(tmp_path: Path) -> None:

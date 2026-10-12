@@ -1,6 +1,6 @@
 # Pinned external dependencies.
 #
-# This file is the source of truth for the update watcher (phase 6). It diffs
+# This file is the source of truth for the update watcher (phase 12). It diffs
 # upstream releases against these pins and notifies the operator over Signal.
 # Nothing is ever applied automatically.
 #
