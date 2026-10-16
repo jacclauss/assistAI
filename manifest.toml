@@ -63,14 +63,14 @@ on Fireworks. All three are disqualifying for this architecture.
 
 [models.quarantine]
 provider = "fireworks"
-ref = "accounts/fireworks/models/deepseek-v4-flash-0731"
+ref = "accounts/fireworks/models/deepseek-v4p1-flash"
 price_per_mtok = { input = 0.22, output = 0.66 }
-context = 1_000_000
+context = 1_048_576
 notes = """
 Reads untrusted page content and emits a schema-conformant object, nothing
 else. Picked for native structured-output support, since schema conformance is
-the whole job. The serverless id is the dated snapshot (0731); the undated
-deepseek-v4-flash name is not callable.
+the whole job. The dated snapshot deepseek-v4-flash-0731 is no longer served;
+the callable id is deepseek-v4p1-flash. JSON object mode works on that id.
 
 Deliberately a different model lineage from models.primary. An injection
 crafted against one family is less likely to also defeat an unrelated one;

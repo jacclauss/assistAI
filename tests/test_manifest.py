@@ -14,7 +14,7 @@ def test_loads_repo_manifest(repo_root: Path) -> None:
 
     assert manifest.primary.ref == "accounts/fireworks/models/minimax-m3"
     assert manifest.primary.thinking == "disabled"
-    assert manifest.quarantine.ref == "accounts/fireworks/models/deepseek-v4-flash-0731"
+    assert manifest.quarantine.ref == "accounts/fireworks/models/deepseek-v4p1-flash"
     assert "glm_5p3" in manifest.candidates
     assert manifest.required_refs() == (
         manifest.primary.ref,

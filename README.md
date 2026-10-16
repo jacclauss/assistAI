@@ -13,9 +13,10 @@ See [docs/prd.md](docs/prd.md) for what this is for, and
 
 ## Status
 
-Phase 12 of 13. The update watcher compares image pins in `manifest.toml`
-with Docker Hub and texts the operator when signal-cli is stale. It does not
-install, pull, or edit anything.
+Phase 13 of 13. The Pi is the host. Release notes are in
+[docs/release-notes.md](docs/release-notes.md). The update watcher compares
+image pins in `manifest.toml` with Docker Hub and texts the operator when
+signal-cli is stale. It does not install, pull, or edit anything.
 
 | Phase | Deliverable | State |
 | --- | --- | --- |
@@ -32,7 +33,7 @@ install, pull, or edit anything.
 | 10 | Email (Gmail: read / file / draft) | done |
 | 11 | Shared store with ACLs | done |
 | 12 | Update watcher | done |
-| 13 | Raspberry Pi migration | |
+| 13 | Raspberry Pi migration | done |
 
 ## Prerequisites
 
@@ -144,6 +145,8 @@ reach it. Do not use that overlay on the Pi.
 ```
 docs/prd.md               what the product must do; wins over architecture.md
 docs/architecture.md      design, threat model, phase plan
+docs/pi-deploy.md         move to the Pi, and install a later image
+docs/release-notes.md     what the production build includes
 manifest.toml             pinned external dependencies; the update watcher reads this
 config/                   agent roster; copy assistai.example.toml to assistai.toml
 docker/                   Dockerfile and compose
@@ -165,6 +168,7 @@ password does not: the Mac reads it from the Keychain, and the Pi reads a
 mode-600 file outside this repo.
 
 **No published ports.** Nothing in the stack listens on the LAN. Operator access
-is over SSH or a tailnet to loopback.
+is over SSH or a tailnet to loopback. The Pi steps, including turning SSH
+off after cutover, are in [docs/pi-deploy.md](docs/pi-deploy.md).
 
 Privacy policy: https://github.com/jacclauss/assistAI/blob/main/docs/privacy.md
