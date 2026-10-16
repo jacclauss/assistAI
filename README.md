@@ -166,3 +166,5 @@ mode-600 file outside this repo.
 
 **No published ports.** Nothing in the stack listens on the LAN. Operator access
 is over SSH or a tailnet to loopback.
+
+Privacy policy: https://github.com/jacclauss/assistAI/blob/main/docs/privacy.md
