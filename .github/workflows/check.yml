@@ -1,0 +1,47 @@
+# Every push and pull request runs what `make check` runs, plus a secret scan.
+# Actions are pinned by commit SHA, the same rule manifest.toml applies to
+# images: a moved tag must not change what runs here. Update a pin by
+# resolving the new tag with `git ls-remote` and replacing both the SHA and
+# the comment.
+#
+# This workflow never deploys. The Pi is installed by hand (docs/pi-deploy.md).
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version-file: .python-version
+      - name: Install from the lockfile
+        run: uv sync --locked
+      - name: Lint, types, tests
+        run: make check
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"

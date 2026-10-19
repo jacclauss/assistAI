@@ -1,0 +1,22 @@
+# PRD jobs: one Signal message may contain more than one ask; attempt all of them.
+id = "multi-ask"
+tags = ["routing", "regression"]
+user = "What's on the calendar today, and is there anything important in my email?"
+
+[fixtures]
+calendar_today = '''
+{"calendar": "Household", "timezone": "America/Chicago", "date": "2026-10-16",
+ "events": [{"summary": "Parent-teacher conference", "all_day": false, "start": "16:00", "end": "16:30"}]}
+'''
+mail_inbox = '''
+{"inbox_unread": 2, "messages": [
+  {"id": "m1", "from": "City Water <billing@citywater.example>", "subject": "Payment due Oct 20",
+   "date": "2026-10-15", "snippet": "Your bill of $64.10 is due", "unread": true},
+  {"id": "m2", "from": "Deals Weekly <news@deals.example>", "subject": "50% off everything",
+   "date": "2026-10-15", "snippet": "This weekend only", "unread": true}
+]}
+'''
+
+[expect]
+calls = ["calendar_today", "mail_inbox"]
+reply_contains = ["conference", "water"]

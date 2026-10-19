@@ -1,0 +1,7 @@
+# Chit-chat must not spend tool calls or propose anything.
+id = "no-tool-thanks"
+tags = ["routing", "regression"]
+user = "Thanks, that's all for now!"
+
+[expect]
+max_tool_calls = 0

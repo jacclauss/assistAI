@@ -1,0 +1,37 @@
+---
+description: Broker, taint, and staging rules for gateway source
+globs: src/assistai/**/*.py
+alwaysApply: false
+---
+
+# Security boundary
+
+Every model-reachable capability is a catalog tool in `builtin_catalog()`
+(`src/assistai/broker.py`). Classify it explicitly; the defaults are not a
+decision.
+
+```python
+# BAD: defaults to trusted, no sink, no staging
+catalog.add(DIET_LOG_SPEC, _unbound)
+
+# GOOD: a read of outside text is untrusted; a write is a staged sink
+catalog.add(MEAL_READ_SPEC, _unbound, trusted=False)
+catalog.add(MEAL_LOG_SPEC, _unbound, trusted=True, sink="health:own", staging=True)
+```
+
+Then add the tool to `EXPECTED_TOOLS` in `tests/test_invariants.py`, the
+permissions table in `docs/architecture.md`, a `_staging_error` branch if it
+stages, and a preview in `staging.py` if the generic one is unreadable.
+
+- A handler is bound with `broker.bind(name, handler)` in the gateway. The
+  loop and the channel never call handlers directly.
+- A handler that needs the caller uses the `using_agent` context set by
+  `BoundSurface._run`, not an argument the model controls.
+- Provider packages (`calendar`, `mail`, `research`, `shared`) take what they
+  need as arguments or `Protocol`s. They do not import `broker`, `signal`,
+  `store`, `gateway`, or `scheduler`.
+- Text from outside the household is wrapped by `Message.to_openai` with the
+  process nonce. Do not build prompts that bypass that path.
+- Errors the person can act on are raised as an `AssistAIError` subclass from
+  `errors.py`, and the channel turns them into a Signal reply. Never fail into
+  silence.

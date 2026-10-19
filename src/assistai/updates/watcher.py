@@ -108,14 +108,10 @@ class UpdateWatcher:
             log.exception("updates.notice_unsaved")
         return report
 
-    async def _report_confirmed(
-        self, findings: list[UpdateFinding], previous: str
-    ) -> str:
+    async def _report_confirmed(self, findings: list[UpdateFinding], previous: str) -> str:
         """A failed lookup must not erase a notice or pretend the check finished."""
         fresh = [
-            item
-            for item in findings
-            if item.priority == "high" and item.detail not in previous
+            item for item in findings if item.priority == "high" and item.detail not in previous
         ]
         report = format_report(fresh)
         if not report:

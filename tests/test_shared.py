@@ -57,9 +57,7 @@ def test_a_private_list_is_invisible_to_the_other_person(tmp_path: Path) -> None
     organizer, store = _organizer(tmp_path)
     jacob = agent("jacob", "+15555550101", writes=("own", "shared"), reads=("own", "shared"))
     spouse = agent("spouse", "+15555550102", writes=("own", "shared"), reads=("own", "shared"))
-    organizer.apply(
-        jacob, parse_change({"list": "shopping", "add": ["milk"], "private": True})
-    )
+    organizer.apply(jacob, parse_change({"list": "shopping", "add": ["milk"], "private": True}))
     organizer.apply(jacob, parse_change({"list": "shopping", "add": ["bread"]}))
     private = organizer.read(jacob, "shopping", private=True)
     assert "milk" in private
@@ -109,9 +107,7 @@ def test_checking_one_off_frees_a_slot_on_a_full_list(tmp_path: Path) -> None:
     for start in range(0, 50, 20):
         batch = [f"item{index}" for index in range(start, min(start + 20, 50))]
         organizer.apply(jacob, parse_change({"list": "shopping", "add": batch}))
-    organizer.apply(
-        jacob, parse_change({"list": "shopping", "done": ["item0"], "add": ["item50"]})
-    )
+    organizer.apply(jacob, parse_change({"list": "shopping", "done": ["item0"], "add": ["item50"]}))
     text = organizer.read(jacob, "shopping")
     assert "[done] item0" in text
     assert "[open] item50" in text
@@ -153,9 +149,7 @@ def test_shared_change_stages_and_jobs_cannot_see_it() -> None:
     surface = ToolBroker(catalog, home.broker).for_agent(jacob)
     with using_agent(jacob):
         staged = asyncio.run(
-            surface.execute(
-                tool_call(SHARED_CHANGE, '{"list": "shopping", "add": ["milk"]}')
-            )
+            surface.execute(tool_call(SHARED_CHANGE, '{"list": "shopping", "add": ["milk"]}'))
         )
     assert "staged" in staged.content
     assert "shopping" in format_proposal(surface.take_staged(), tainted=True)
@@ -182,15 +176,12 @@ tools = ["get_time"]
         load_household(path, known_tools=builtin_catalog().names())
 
 
-def test_the_tool_uses_the_active_agent(tmp_path: Path) -> None:
+async def test_the_tool_uses_the_active_agent(tmp_path: Path) -> None:
     organizer, store = _organizer(tmp_path)
     jacob = agent("jacob", "+15555550101", writes=("shared",), reads=("shared",))
     handlers = bind_shared(organizer)
     with using_agent(jacob):
-        import asyncio
-
-        asyncio.run(handlers[SHARED_CHANGE]({"list": "shopping", "add": ["milk"]}))
-        text = asyncio.run(handlers[SHARED_LISTS]({"list": "shopping"}))
+        await handlers[SHARED_CHANGE]({"list": "shopping", "add": ["milk"]})
+        text = await handlers[SHARED_LISTS]({"list": "shopping"})
     assert "milk" in text
     store.close()
-

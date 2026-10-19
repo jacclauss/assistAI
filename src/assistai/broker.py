@@ -419,13 +419,13 @@ def _staging_error(
                     return f"a job named {created.name!r} already exists"
             return None
         if call.name == JOB_RESCHEDULE:
-            change = parse_reschedule(parsed)
+            reschedule = parse_reschedule(parsed)
             if store is None:
                 return None
-            found = store.find_job(agent.name, name=change.name, job_id=change.id)
+            found = store.find_job(agent.name, name=reschedule.name, job_id=reschedule.id)
             if found is None or _staged_cancel_covers(found, staged):
                 return "no matching job"
-            if found.ttl_seconds is not None and change.every_seconds > found.ttl_seconds:
+            if found.ttl_seconds is not None and reschedule.every_seconds > found.ttl_seconds:
                 return "every_seconds is longer than the watch TTL"
             return None
         if call.name == JOB_CANCEL:

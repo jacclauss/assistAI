@@ -1,0 +1,21 @@
+# PRD success: "Archive those newsletters" shows the list once and files them on one yes.
+id = "archive-newsletters"
+tags = ["mail", "staging", "regression"]
+user = "Archive the newsletters in my inbox."
+
+[fixtures]
+mail_inbox = '''
+{"inbox_unread": 3, "messages": [
+  {"id": "n1", "from": "Deals Weekly <news@deals.example>", "subject": "50% off",
+   "date": "2026-10-15", "snippet": "Unsubscribe", "unread": true},
+  {"id": "n2", "from": "Morning Brew <crew@brew.example>", "subject": "Today's brief",
+   "date": "2026-10-16", "snippet": "Unsubscribe", "unread": true},
+  {"id": "p1", "from": "Mom <mom@example.com>", "subject": "Thanksgiving plans",
+   "date": "2026-10-16", "snippet": "Are you coming?", "unread": true}
+]}
+'''
+
+[expect]
+calls = ["mail_inbox"]
+staged = ["mail_file"]
+no_staged = ["mail_draft", "relay"]

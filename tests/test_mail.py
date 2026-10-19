@@ -56,9 +56,7 @@ def test_a_pasted_redirect_url_yields_the_code() -> None:
     from assistai.__main__ import _authorization_code
 
     assert _authorization_code("4/0Acode") == "4/0Acode"
-    assert (
-        _authorization_code("http://127.0.0.1:8731/?code=4/0Acode&scope=gmail") == "4/0Acode"
-    )
+    assert _authorization_code("http://127.0.0.1:8731/?code=4/0Acode&scope=gmail") == "4/0Acode"
     assert _authorization_code("http://127.0.0.1:8731/?code=4/0A+code&scope=gmail") == "4/0A+code"
 
 

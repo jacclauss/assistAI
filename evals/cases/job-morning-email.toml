@@ -1,0 +1,8 @@
+# PRD success: a daily email job can be created from Signal; it stages first.
+id = "job-morning-email"
+tags = ["jobs", "staging", "regression"]
+user = "Every morning, check my email and tell me if anything important came in."
+
+[expect]
+staged = ["job_create"]
+no_staged = ["mail_file", "relay"]

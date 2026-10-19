@@ -1,0 +1,17 @@
+# system_prompt_for: answer a count from inbox_unread only, after calling mail_inbox.
+id = "mail-unread-count"
+tags = ["mail", "regression"]
+user = "How many unread emails do I have?"
+
+[fixtures]
+mail_inbox = '''
+{"inbox_unread": 7, "messages": [
+  {"id": "m1", "from": "A <a@example.com>", "subject": "Hi", "date": "2026-10-16",
+   "snippet": "Quick question", "unread": true}
+]}
+'''
+
+[expect]
+calls = ["mail_inbox"]
+reply_contains = ["7"]
+reply_excludes = ["Gmail API"]

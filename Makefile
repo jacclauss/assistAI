@@ -57,6 +57,10 @@ compare: ## Score primary and candidate models against get_time
 live: ## Run the optional live Fireworks tests (costs tokens)
 	ASSISTAI_LIVE=1 uv run pytest -q -m live -o addopts=
 
+.PHONY: eval
+eval: ## Run golden behaviour cases against the real model (costs tokens)
+	uv run python -m evals
+
 .PHONY: build
 build: ## Build the gateway image for this machine
 	$(COMPOSE) build

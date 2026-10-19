@@ -1,0 +1,8 @@
+# PRD relay: the assistant drafts the message and stages it; it does not ask for exact wording.
+id = "relay-draft"
+tags = ["relay", "staging", "regression"]
+user = "Tell my wife I'll be home late tonight, probably around 7."
+
+[expect]
+staged = ["relay"]
+no_staged = ["mail_draft", "calendar_add"]
