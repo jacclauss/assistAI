@@ -35,8 +35,17 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert jacob is not None and spouse is not None
     assert jacob.name == "jacob"
     assert spouse.name == "spouse"
-    prompt = system_prompt_for(jacob)
+    prompt = system_prompt_for(jacob, timezone="America/Chicago")
     assert "call mail_inbox" in prompt
+    assert "start_at" in prompt
+    assert "America/Chicago" in prompt
+    assert "saved immediately" in prompt
+    assert "Nothing is sent before" in prompt
+    assert "creates another job" in prompt
+    assert "in_seconds" in prompt
+    assert "Local time now is" in prompt
+    assert "in_seconds 120" in prompt
+    assert "it was wrong" in prompt
     assert "inbox_unread" in prompt
     assert household.agent_for_signal_dm("+15555550199") is None
     assert jacob.tools == (

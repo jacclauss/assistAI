@@ -1,6 +1,85 @@
 # Release notes
 
-First production release. 16 October 2026.
+## 0.1.7 — 22 October 2026
+
+A reminder that starts on a later day does not text on the nights before it.
+The first text is that day. The repeat starts after it. A job cannot be a
+request to create another job.
+
+A mail check that answers without opening the inbox is a failed check. It
+is not reported as an empty inbox. The run looks once more before it says
+the check failed.
+
+## 0.1.6 — 18 October 2026
+
+A later message that already reached the other phone still leaves a record
+for her assistant. The sender is told it went out only after that record
+is stored. A retry writes the record again and does not send the text twice.
+
+A reminder texts the stored sentence on its own.
+
+## 0.1.5 — 18 October 2026
+
+Review of the reminder and later-message work.
+
+- The confirmation includes the name, so the reminder can be cancelled.
+- A second message to the other person is stored when the usual name is taken.
+- A clock time with a timezone suffix, or a start time that is not text, is refused. It is not sent immediately.
+- A reminder saved during a turn that then fails is cancelled.
+- A later message that already reached the other phone is not sent again.
+
+## 0.1.4 — 18 October 2026
+
+"Remind Blair in 2 minutes" is a message to her, not a reminder for you.
+The assistant calls relay with that delay. An earlier refusal in the chat
+was wrong, and the assistant is told so.
+
+## 0.1.3 — 18 October 2026
+
+A message to the other person can go out later.
+
+- Ask to text them at a time, or in a number of minutes or days. Reply yes
+  once. That stored text is what they receive, labelled as from you.
+- A delay is counted by the server. A named clock time still requires the
+  assistant to read the clock in that turn.
+- It can be one send, or a repeat until you cancel it.
+
+## 0.1.2 — 18 October 2026
+
+A reminder time comes from the server clock. The assistant cannot save a
+clock time it guessed.
+
+- "In two minutes" is a number of seconds. The server adds it to the current
+  time. The message you get states that time.
+- A named time, such as tomorrow at 8am, is refused until the assistant has
+  read the clock in that same turn.
+- The 8:53pm check that was stored for 12:44pm the next day is still there
+  until you reply yes to the cancel that is waiting.
+
+## 0.1.1 — 18 October 2026
+
+Saying "remind me" saves the reminder. There is no preview and no yes.
+
+- At the time you asked, Signal sends that sentence. "Remind me at 8am to
+  put the cleaner in the pool" texts you then: "Don't forget to put the
+  cleaner in the pool."
+- The first time can be any time in the future. The repeat can be any number
+  of days. A minute is the shortest gap.
+- A mail digest still waits for a yes, and still writes its own report.
+
+## 0.1.0 — 18 October 2026
+
+A reminder texts the sentence you asked for, at the time you asked.
+
+- One Signal message at a clock time, then the job ends. "Put the cleaner in
+  the pool tomorrow at 8am" is that case.
+- A daily reminder can start up to a year ahead, then repeat until you cancel.
+  The repeat interval is still at most 30 days. The first run is not limited
+  to 24 hours.
+- A mail digest is unchanged. The assistant still writes that report, and an
+  empty one still says there is nothing to report.
+
+## First production release — 16 October 2026
 
 AssistAI runs on a Raspberry Pi 5. Two people text one bot number. Each reaches
 their own assistant. An organizer process holds the household lists, and

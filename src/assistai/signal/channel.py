@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Literal
 
@@ -16,8 +17,17 @@ from assistai.conversation import apply_window, last_assistant_text, trusted_con
 from assistai.errors import AssistAIError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
+from assistai.inference.tools import bind_clock
 from assistai.inference.types import Message, ToolCall
-from assistai.jobs import Job, JobOutcome, bind_jobs, is_nothing, job_user_prompt
+from assistai.jobs import (
+    Job,
+    JobOutcome,
+    bind_jobs,
+    empty_report_is_real,
+    is_nothing,
+    job_user_prompt,
+    look_again_prompt,
+)
 from assistai.manifest import Manifest
 from assistai.relay import RELAY_TOOL, RelayError, bind_relay
 from assistai.scheduler import NotifyStatus
@@ -88,10 +98,13 @@ class SignalChannel:
                 household=household,
                 signal=signal,
                 inject=self._inject_relay,
+                store=store,
+                timezone=self._settings.timezone,
             ),
         )
-        for name, handler in bind_jobs(store).items():
+        for name, handler in bind_jobs(store, timezone=self._settings.timezone).items():
             broker.bind(name, handler)
+        broker.bind("get_time", bind_clock(self._settings.timezone))
         self._histories: dict[str, list[Message]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._history_locks: dict[str, asyncio.Lock] = {}
@@ -203,7 +216,9 @@ class SignalChannel:
             async with self._slots:
                 async with self._history_lock(agent.name):
                     try:
-                        messages = self._history(agent.name, system_prompt_for(agent))
+                        messages = self._history(
+                            agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                        )
                     except StoreError:
                         log.exception("store.history_unreadable", agent=agent.name)
                         raise
@@ -218,6 +233,7 @@ class SignalChannel:
                             created_at=time.time(),
                         ),
                     ]
+                    start = len(scratch)
                     await run_turn(
                         self._fireworks,
                         self._manifest.primary,
@@ -226,13 +242,33 @@ class SignalChannel:
                         max_tool_rounds=self._settings.max_tool_rounds,
                     )
                     text = last_assistant_text(scratch) or ""
+                    # One more turn. The mail job said NONE without calling
+                    # the inbox, and that became "Nothing to report."
+                    if is_nothing(text) and not empty_report_is_real(scratch, start=start):
+                        scratch.append(
+                            Message(
+                                role="user",
+                                content=look_again_prompt(scratch, start=start),
+                                created_at=time.time(),
+                            )
+                        )
+                        await run_turn(
+                            self._fireworks,
+                            self._manifest.primary,
+                            scratch,
+                            surface,
+                            max_tool_rounds=self._settings.max_tool_rounds,
+                        )
+                        text = last_assistant_text(scratch) or ""
+                    nothing = is_nothing(text)
                     # Label this report for what this run fetched. Inherited
                     # taint stays on the messages that carry it, so it can
                     # still age out of the window on schedule.
                     return JobOutcome(
                         text=text,
-                        found=not is_nothing(text),
+                        found=not nothing,
                         untrusted=surface.fetched_untrusted,
+                        checked=not nothing or empty_report_is_real(scratch, start=start),
                     )
 
     def can_notify_job(self, agent: AgentSpec) -> bool:
@@ -251,12 +287,47 @@ class SignalChannel:
         self._job_sends.record(agent.name)
         return "sent"
 
+    async def deliver_relay(
+        self,
+        agent: AgentSpec,
+        body: str,
+        *,
+        on_sent: Callable[[], None] | None = None,
+    ) -> None:
+        """Send a stored future relay. The body is the text they confirmed."""
+        from assistai.relay import deliver_stored_relay
+
+        await deliver_stored_relay(
+            household=self._household,
+            signal=self._signal,
+            inject=self._inject_relay,
+            sender=agent,
+            body=body,
+            on_sent=on_sent,
+            record=False,
+        )
+
+    async def record_relay(self, agent: AgentSpec, body: str) -> None:
+        """Write the untrusted relay record. Retried when the phone already has it."""
+        from assistai.relay import deliver_stored_relay
+
+        await deliver_stored_relay(
+            household=self._household,
+            signal=self._signal,
+            inject=self._inject_relay,
+            sender=agent,
+            body=body,
+            send=False,
+        )
+
     async def persist_job_report(self, agent: AgentSpec, text: str, *, untrusted: bool) -> bool:
         """Append a job report that already went out over Signal."""
         async with self._history_lock(agent.name):
             self._histories.pop(agent.name, None)
             try:
-                messages = self._history(agent.name, system_prompt_for(agent))
+                messages = self._history(
+                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
                 return False
@@ -282,7 +353,9 @@ class SignalChannel:
             return
         async with self._history_lock(agent.name):
             try:
-                messages = self._history(agent.name, system_prompt_for(agent))
+                messages = self._history(
+                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
                 await self._safe_send(inbound.sender, _UNAVAILABLE)
@@ -305,16 +378,27 @@ class SignalChannel:
             except AssistAIError:
                 log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
                 del messages[baseline:]
+                self._cancel_turn_jobs(surface)
                 await self._safe_send(inbound.sender, _UNAVAILABLE)
                 return
             reply = last_assistant_text(messages)
             if not reply:
                 reply = _UNAVAILABLE
+            if surface.saved_reminders:
+                # The model announced 12:44pm after saving that guess. The
+                # sentence here is the time the server stored.
+                reply = "\n".join(surface.saved_reminders)
+                for message in reversed(messages):
+                    if message.role == "assistant":
+                        message.content = reply
+                        break
             staged = surface.take_staged()
             proposal: Proposal | Literal["keep"] = "keep"
             if staged:
                 now = time.time()
                 preview = format_proposal(staged, tainted=surface.tainted)
+                if surface.saved_reminders:
+                    preview = reply + "\n\n" + preview
                 messages.append(Message(role="assistant", content=preview, created_at=now))
                 reply = preview
                 proposal = Proposal(
@@ -326,6 +410,7 @@ class SignalChannel:
                 )
             if not self._window_and_persist(agent.name, messages, proposal=proposal):
                 del messages[baseline:]
+                self._cancel_turn_jobs(surface)
                 if staged:
                     self._abandon_live_proposal(agent.name)
                 await self._safe_send(inbound.sender, _SAVE_FAILED)
@@ -364,7 +449,9 @@ class SignalChannel:
         # without deadlocking two confirms against each other.
         async with self._history_lock(agent.name):
             try:
-                messages = self._history(agent.name, system_prompt_for(agent))
+                messages = self._history(
+                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
                 await self._safe_send(inbound.sender, _UNAVAILABLE)
@@ -390,7 +477,9 @@ class SignalChannel:
             # ran must not be overwritten by a stale in-memory copy.
             self._histories.pop(agent.name, None)
             try:
-                messages = self._history(agent.name, system_prompt_for(agent))
+                messages = self._history(
+                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                )
             except StoreError:
                 log.error("store.save_failed_after_commit", agent=agent.name)
                 await self._safe_send(inbound.sender, summary)
@@ -405,7 +494,9 @@ class SignalChannel:
     async def _reject_proposal(self, inbound: InboundText, agent: AgentSpec) -> None:
         async with self._history_lock(agent.name):
             try:
-                messages = self._history(agent.name, system_prompt_for(agent))
+                messages = self._history(
+                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
                 await self._safe_send(inbound.sender, _UNAVAILABLE)
@@ -418,6 +509,19 @@ class SignalChannel:
                 return
         log.info("staging.discarded", agent=agent.name)
         await self._safe_send(inbound.sender, _DISCARDED)
+
+    def _cancel_turn_jobs(self, surface: BoundSurface) -> None:
+        """Drop reminders saved during a turn the person will be told failed.
+
+        The row is written inside the tool call. Leaving it armed after
+        "try again" sends a message they were told was not saved.
+        """
+        for job_id in surface.saved_job_ids:
+            try:
+                self._store.cancel_job(job_id, at=time.time())
+            except StoreError:
+                log.exception("jobs.reminder_rollback_failed", job=job_id)
+        surface.saved_job_ids.clear()
 
     def _abandon_live_proposal(self, agent_name: str) -> None:
         """A failed staging save must not leave an older proposal confirmable."""
@@ -466,7 +570,12 @@ class SignalChannel:
                     return messages
                 messages = windowed
             self._histories[agent_name] = messages
-        return self._histories[agent_name]
+        messages = self._histories[agent_name]
+        if messages and messages[0].role == "system":
+            messages[0].content = prompt
+        else:
+            messages.insert(0, Message(role="system", content=prompt))
+        return messages
 
     async def _handle_approve(self, inbound: InboundText, code: str) -> None:
         try:
@@ -520,7 +629,9 @@ class SignalChannel:
         agent = self._agent_named(agent_name)
         loaded = self._store.load_history(agent_name)
         messages = [
-            Message(role="system", content=system_prompt_for(agent)),
+            Message(
+                role="system", content=system_prompt_for(agent, timezone=self._settings.timezone)
+            ),
             *loaded,
             Message(role="user", content=content, untrusted=True, created_at=time.time()),
         ]

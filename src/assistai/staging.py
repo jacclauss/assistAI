@@ -79,10 +79,26 @@ def format_executed(results: Sequence[tuple[ToolCall, str]]) -> str:
     """What ran, in the same order as the stored proposal."""
     if not results:
         return "Nothing to run."
+    said = [_saved_line(body) for _, body in results]
+    if all(line is not None for line in said):
+        return "\n".join(line for line in said if line is not None)
     heading = "Ran 1 action:" if len(results) == 1 else f"Ran {len(results)} actions:"
     lines = [heading]
     lines.extend(f"- `{call.name}`: {body}" for call, body in results)
     return "\n".join(lines)
+
+
+def _saved_line(body: str) -> str | None:
+    try:
+        parsed: object = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    say = parsed.get("say")
+    if isinstance(say, str) and say:
+        return say
+    return None
 
 
 def _heading(count: int) -> str:
@@ -92,23 +108,38 @@ def _heading(count: int) -> str:
 
 
 def _format_relay(call: ToolCall, *, tainted: bool) -> str:
-    from assistai.relay import parse_body
+    from assistai.relay import parse_body, parse_relay_when
 
     try:
         parsed: object = json.loads(call.arguments) if call.arguments else {}
-        body = parse_body(parsed) if isinstance(parsed, dict) else call.arguments
+        body = parse_body(parsed, from_name="you") if isinstance(parsed, dict) else call.arguments
+        when = parse_relay_when(parsed) if isinstance(parsed, dict) else None
     except Exception:
         body = call.arguments
+        when = None
+    if when is None:
+        lead = "I will send this to the other phone when you confirm:\n"
+        later = ""
+    else:
+        from assistai.relay import when_phrase
+
+        lead = f"I will send this to the other phone {when_phrase(when)} when you confirm:\n"
+        later = (
+            ""
+            if when.once
+            else f"It repeats every {when.every_seconds} seconds until you cancel it.\n"
+        )
     lines = [
-        "I will send this to the other phone when you confirm:\n",
+        lead,
         f"From you:\n{body}",
         "",
         "They will see it as a relay from you, not as their assistant.",
+        later,
         "Reply yes to send this, no to discard, or say what to change.",
     ]
     if tainted:
         lines.append(_TAINT_NOTE)
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line != "")
 
 
 def _format_job_create(call: ToolCall, *, tainted: bool) -> str:
@@ -122,17 +153,24 @@ def _format_job_create(call: ToolCall, *, tainted: bool) -> str:
     if spec is None:
         return _generic_preview(call, tainted=tainted)
     kind = "schedule" if spec.kind == "schedule" else "watch"
-    chatter = (
-        "I will text you each time it runs, even if there is nothing to say."
-        if spec.kind == "schedule"
-        else "I will stay quiet unless it finds something, fails, or expires."
-    )
+    if spec.once:
+        chatter = "I will text you once, then this job ends."
+    elif spec.kind == "schedule":
+        chatter = "I will text you each time it runs, even if there is nothing to say."
+    else:
+        chatter = "I will stay quiet unless it finds something, fails, or expires."
     lines = [
         f"I will create this {kind} when you confirm:\n",
         f"Name: {spec.name}",
         f"Every: {spec.every_seconds} seconds",
         f"Check: {spec.prompt}",
     ]
+    if spec.start_at is not None:
+        lines.append(f"First run: {spec.start_at}")
+    if spec.once:
+        lines.append("Once: yes")
+    if spec.verbatim:
+        lines.append("The text above is what you will receive.")
     if spec.ttl_seconds is not None:
         lines.append(f"Ends after: {spec.ttl_seconds} seconds")
     lines.extend(["", chatter, _CONFIRM_HINT_ONE])

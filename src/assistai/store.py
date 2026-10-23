@@ -24,7 +24,7 @@ from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -71,7 +71,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     pending_text TEXT,
     pending_untrusted INTEGER NOT NULL DEFAULT 0,
     pending_after TEXT,
-    pending_delivered INTEGER NOT NULL DEFAULT 0
+    pending_delivered INTEGER NOT NULL DEFAULT 0,
+    once INTEGER NOT NULL DEFAULT 0,
+    verbatim INTEGER NOT NULL DEFAULT 0,
+    relay INTEGER NOT NULL DEFAULT 0,
+    relay_sent INTEGER NOT NULL DEFAULT 0,
+    relay_recorded INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
 CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
@@ -303,7 +308,8 @@ class Store:
                     "INSERT INTO jobs (id, agent, kind, name, prompt, every_seconds, "
                     "ttl_seconds, created_at, expires_at, next_run_at, last_run_at, "
                     "cancelled_at, pending_text, pending_untrusted, pending_after, "
-                    "pending_delivered) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "pending_delivered, once, verbatim, relay, relay_sent, relay_recorded) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job.id,
                         job.agent,
@@ -321,6 +327,11 @@ class Store:
                         1 if job.pending_untrusted else 0,
                         job.pending_after,
                         1 if job.pending_delivered else 0,
+                        1 if job.once else 0,
+                        1 if job.verbatim else 0,
+                        1 if job.relay else 0,
+                        1 if job.relay_sent else 0,
+                        1 if job.relay_recorded else 0,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -417,7 +428,8 @@ class Store:
         return self._touch_job(
             "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
             "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
-            "pending_delivered = 0 WHERE id = ? AND cancelled_at IS NULL",
+            "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
+            "WHERE id = ? AND cancelled_at IS NULL",
             (now, now),
             job_id,
         )
@@ -433,6 +445,22 @@ class Store:
             "UPDATE jobs SET every_seconds = ?, next_run_at = ? "
             "WHERE id = ? AND cancelled_at IS NULL",
             (every_seconds, next_run_at),
+            job_id,
+        )
+
+    def mark_relay_sent(self, job_id: str) -> bool:
+        """The other phone already has this send. A retry must not deliver it again."""
+        return self._touch_job(
+            "UPDATE jobs SET relay_sent = 1 WHERE id = ? AND cancelled_at IS NULL",
+            (),
+            job_id,
+        )
+
+    def mark_relay_recorded(self, job_id: str) -> bool:
+        """The recipient's assistant has the relay record. A retry must not write it again."""
+        return self._touch_job(
+            "UPDATE jobs SET relay_recorded = 1 WHERE id = ? AND cancelled_at IS NULL",
+            (),
             job_id,
         )
 
@@ -636,6 +664,10 @@ class Store:
         with self._conn:
             self._conn.executescript(_SCHEMA)
             self._ensure_job_pending_columns()
+            self._ensure_job_reminder_columns()
+            self._ensure_job_relay_column()
+            self._ensure_job_relay_sent_column()
+            self._ensure_job_relay_recorded_column()
             self._ensure_shared_list_owner()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -652,6 +684,36 @@ class Store:
         for name, decl in additions:
             if name not in cols:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
+
+    def _ensure_job_reminder_columns(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols:
+            return
+        additions = (
+            ("once", "INTEGER NOT NULL DEFAULT 0"),
+            ("verbatim", "INTEGER NOT NULL DEFAULT 0"),
+        )
+        for name, decl in additions:
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
+
+    def _ensure_job_relay_column(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols or "relay" in cols:
+            return
+        self._conn.execute("ALTER TABLE jobs ADD COLUMN relay INTEGER NOT NULL DEFAULT 0")
+
+    def _ensure_job_relay_sent_column(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols or "relay_sent" in cols:
+            return
+        self._conn.execute("ALTER TABLE jobs ADD COLUMN relay_sent INTEGER NOT NULL DEFAULT 0")
+
+    def _ensure_job_relay_recorded_column(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols or "relay_recorded" in cols:
+            return
+        self._conn.execute("ALTER TABLE jobs ADD COLUMN relay_recorded INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_shared_list_owner(self) -> None:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(shared_lists)")}
@@ -847,6 +909,13 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         pending_untrusted=_flag(row["pending_untrusted"], job_id),
         pending_after=_pending_after(row["pending_after"], job_id),
         pending_delivered=_flag(row["pending_delivered"], job_id),
+        once=_flag(row["once"], job_id) if "once" in row.keys() else False,
+        verbatim=_flag(row["verbatim"], job_id) if "verbatim" in row.keys() else False,
+        relay=_flag(row["relay"], job_id) if "relay" in row.keys() else False,
+        relay_sent=_flag(row["relay_sent"], job_id) if "relay_sent" in row.keys() else False,
+        relay_recorded=(
+            _flag(row["relay_recorded"], job_id) if "relay_recorded" in row.keys() else False
+        ),
     )
 
 

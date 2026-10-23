@@ -573,6 +573,136 @@ def test_schema_v4_gains_pending_notify_columns(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.pending_text is not None
     assert "held" in loaded.pending_text
+    assert loaded.once is False
+    assert loaded.verbatim is False
+    assert loaded.relay_sent is False
+    store.close()
+
+
+def test_schema_v11_gains_relay_sent(tmp_path: Path) -> None:
+    """The Pi is already on the relay column. The sent flag has to be added."""
+    from assistai.jobs import Job
+
+    path = tmp_path / "assistai.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            every_seconds INTEGER NOT NULL,
+            ttl_seconds INTEGER,
+            created_at REAL NOT NULL,
+            expires_at REAL,
+            next_run_at REAL NOT NULL,
+            last_run_at REAL,
+            cancelled_at REAL,
+            pending_text TEXT,
+            pending_untrusted INTEGER NOT NULL DEFAULT 0,
+            pending_after TEXT,
+            pending_delivered INTEGER NOT NULL DEFAULT 0,
+            once INTEGER NOT NULL DEFAULT 0,
+            verbatim INTEGER NOT NULL DEFAULT 0,
+            relay INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute("PRAGMA user_version = 11")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="message to spouse",
+            prompt="pick up milk",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+            relay=True,
+        )
+    )
+    loaded = store.find_job("jacob", name="message to spouse")
+    assert loaded is not None
+    assert loaded.relay is True
+    assert loaded.relay_sent is False
+    assert loaded.relay_recorded is False
+    assert store.mark_relay_sent(loaded.id) is True
+    marked = store.find_job("jacob", name="message to spouse")
+    assert marked is not None
+    assert marked.relay_sent is True
+    store.close()
+
+
+def test_schema_v12_gains_relay_recorded(tmp_path: Path) -> None:
+    """A phone that already has the message still needs the history record."""
+    from assistai.jobs import Job
+
+    path = tmp_path / "assistai.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            every_seconds INTEGER NOT NULL,
+            ttl_seconds INTEGER,
+            created_at REAL NOT NULL,
+            expires_at REAL,
+            next_run_at REAL NOT NULL,
+            last_run_at REAL,
+            cancelled_at REAL,
+            pending_text TEXT,
+            pending_untrusted INTEGER NOT NULL DEFAULT 0,
+            pending_after TEXT,
+            pending_delivered INTEGER NOT NULL DEFAULT 0,
+            once INTEGER NOT NULL DEFAULT 0,
+            verbatim INTEGER NOT NULL DEFAULT 0,
+            relay INTEGER NOT NULL DEFAULT 0,
+            relay_sent INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute("PRAGMA user_version = 12")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="message to spouse",
+            prompt="pick up milk",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=10.0,
+            last_run_at=None,
+            cancelled_at=None,
+            relay=True,
+            relay_sent=True,
+        )
+    )
+    loaded = store.find_job("jacob", name="message to spouse")
+    assert loaded is not None
+    assert loaded.relay_sent is True
+    assert loaded.relay_recorded is False
     store.close()
 
 
