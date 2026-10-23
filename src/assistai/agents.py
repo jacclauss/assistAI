@@ -11,7 +11,9 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from assistai.config import Settings
 from assistai.errors import HouseholdConfigError
@@ -91,11 +93,24 @@ def local_agent(name: str, *, tools: tuple[str, ...] = ("get_time",)) -> AgentSp
     )
 
 
-def system_prompt_for(agent: AgentSpec) -> str:
+def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
     """Identity the model sees. Distinct per agent so routing is observable."""
     return (
         f"You are AssistAI agent '{agent.name}', a concise household assistant. "
-        "Use only the tools listed in this request. Do not invent tool results. "
+        + _local_clock(timezone)
+        + (
+            "If they ask to remind, text, or tell the other person, now or later, "
+            "call relay before you answer. "
+            "'Remind them in 2 minutes that the reminders are working' is relay with "
+            "body 'Reminders are now working.' and in_seconds 120. "
+            "A named time uses start_at after get_time in this turn. "
+            "job_create only texts the person in this chat. "
+            "Do not say reminders only work for you. "
+            "If an earlier reply said that, it was wrong. "
+            if "relay" in agent.tools
+            else ""
+        )
+        + "Use only the tools listed in this request. Do not invent tool results. "
         "When you use the web, cite the URLs you relied on. "
         "When you answer about the calendar, list only events the calendar tool returned."
         + (
@@ -105,10 +120,11 @@ def system_prompt_for(agent: AgentSpec) -> str:
             else ""
         )
         + (
-            " When they want to tell the other person something, draft it and "
-            "call relay. Do not ask them to write the exact message. If they "
-            "critique the draft, call relay again with the revision. Nothing "
-            "is sent until they reply yes."
+            " When they want to tell the other person something, including later, "
+            "draft it and call relay with in_seconds or start_at. "
+            "Do not ask them to write the exact message. "
+            "Nothing is sent until they reply yes. Yes stores the text and it "
+            "goes out at that time. Omitting the time sends it as soon as they say yes."
             if "relay" in agent.tools
             else ""
         )
@@ -131,7 +147,40 @@ def system_prompt_for(agent: AgentSpec) -> str:
             if "mail_inbox" in agent.tools
             else ""
         )
+        + (
+            " When they say remind me, call job_create with verbatim true. "
+            "It is saved immediately. Do not ask them to reply yes, and do not "
+            "say it is only proposed. The prompt is the exact Signal text, such as "
+            "'Don't forget to put the cleaner in the pool.' "
+            "For a delay ('in two minutes', 'in 50 days'), set in_seconds and omit "
+            "start_at. Do not invent a clock time. "
+            "For a named clock time, call get_time in this turn, then set start_at "
+            "to local ISO-8601 with no timezone suffix, taken from get_time's local "
+            f"field, in {timezone or 'the household timezone'}. "
+            "A start_at without get_time is rejected. "
+            "For a repeating reminder, set once false, verbatim true, and "
+            "every_seconds to the gap after the first run. "
+            "Nothing is sent before that first text. "
+            "Do not create a job whose prompt creates another job. "
+            "The time you tell them is the tool's say field. Do not calculate one. "
+            "Leave verbatim false for a check that should write its own report. "
+            "That one still waits for a yes."
+            if "job_create" in agent.tools
+            else ""
+        )
     )
+
+
+def _local_clock(timezone: str) -> str:
+    """Fresh each turn. A cached prompt is how a guessed clock survives."""
+    if not timezone:
+        return ""
+    try:
+        zone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        return ""
+    local = datetime.now(zone).strftime("%Y-%m-%dT%H:%M:%S")
+    return f"Local time now is {local} in {timezone}. "
 
 
 def resolve_household_path(settings: Settings) -> Path:

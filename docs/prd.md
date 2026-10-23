@@ -138,7 +138,16 @@ Two kinds, both brokered, both inspectable in conversation:
 - "What is running?" and "stop the morning email check" must work in Signal.
 - A job failure (auth, network, tool error) messages the owner. No silent skip.
 - An empty successful digest still messages, because the schedule is
-  user-facing. A background watch that finds nothing stays quiet.
+  user-facing. A run that answers without looking is a failed check, not an
+  empty inbox. A background watch that finds nothing stays quiet.
+- A reminder texts the stored sentence, with no job label around it. Saying
+  "remind me" saves it. There is no yes. A delay is counted by the server. A named clock time is refused
+  until the assistant has read the clock in that turn, and it is a local
+  date and time with no timezone suffix. The reply names the reminder so it
+  can be cancelled. It can fire once, or repeat until cancelled. The first
+  run and the gap between repeats can be any future value the clock can
+  represent. The gap is at least one minute. Nothing is sent before that
+  first run. A job cannot be an instruction to create another job.
 - **Jobs report; they do not act.** A job may read mail, calendar, and the web,
   and it messages the owner with what it found. It never files, drafts, writes,
   or relays, because nobody is present at 7am to approve a staged action. If
@@ -162,14 +171,21 @@ agent loop.
 1. Sender's assistant drafts the Signal body (and any attachment). The sender
    can critique that draft; each revision is a new proposal.
 2. Sender confirms the draft on screen.
-3. Gateway sends those bytes and attachments to the recipient's number, labeled
+3. A message for later is stored at that yes. At the chosen time the gateway
+   sends those same bytes. There is no second yes. A start time that is not
+   a local date and time is refused, not sent now. A second later message
+   is stored under its own name. A send that already reached the phone is
+   not repeated when the gateway retries. Her assistant's record of that
+   message is retried on its own, and the sender is told it went out only
+   after that record is stored.
+4. Gateway sends those bytes and attachments to the recipient's number, labeled
    so it is obviously a relay (`From Jacob:`, not her assistant speaking).
-4. Recipient reads it on the phone immediately (no extra LLM rewrite).
-5. Gateway appends a structured record to the recipient agent's history:
+5. Recipient reads it on the phone immediately (no extra LLM rewrite).
+6. Gateway appends a structured record to the recipient agent's history:
    who sent it, the body, and enough about the attachment (type, name,
    extracted text or a short description) that her assistant can talk about it.
    Relaying must not require leaving the bot conversation.
-6. Reply-in-thread without "tell Jacob …" is a normal turn with **her**
+7. Reply-in-thread without "tell Jacob …" is a normal turn with **her**
    assistant. To send something back she uses the same relay.
 
 Taint: relay bodies are untrusted in the recipient's conversation (they may

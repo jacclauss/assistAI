@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -604,6 +606,99 @@ async def test_a_clean_conversation_still_reaches_a_sink(tmp_path: Path) -> None
     await fireworks.aclose()
 
 
+async def test_the_sent_reminder_time_is_the_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model announced 12:44pm. The phone must get the time that was stored."""
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    fireworks = client_for(
+        sequence(
+            completion_stream(
+                tool_event(
+                    call_id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "check", '
+                        '"prompt": "The new reminder system is working.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"in_seconds": 120}'
+                    ),
+                    finish="tool_calls",
+                )
+            ),
+            completion_stream(text_event("I will text you at 12:44 PM.", finish="stop")),
+        )
+    )
+    signal = FakeSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+
+    await channel.handle(inbound(text="Remind me in two minutes that it is working"))
+
+    assert signal.sent == [
+        (
+            "+15555550101",
+            'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check',
+        )
+    ]
+    await fireworks.aclose()
+
+
+async def test_a_failed_turn_cancels_the_reminder_it_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The person is told to try again, so the row must not stay armed."""
+    import sqlite3
+
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    fireworks = client_for(
+        sequence(
+            completion_stream(
+                tool_event(
+                    call_id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "check", '
+                        '"prompt": "The new reminder system is working.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"in_seconds": 120}'
+                    ),
+                    finish="tool_calls",
+                )
+            ),
+            httpx.Response(500, json={"error": "down"}),
+        )
+    )
+    store = _store(tmp_path)
+    signal = FakeSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        store=store,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+
+    await channel.handle(inbound(text="Remind me in two minutes that it is working"))
+
+    assert signal.sent[-1][1] == "I could not reach the model just now. Try again in a moment."
+    conn = sqlite3.connect(tmp_path / "assistai.sqlite")
+    row = conn.execute("SELECT cancelled_at FROM jobs WHERE name = 'check'").fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] is not None
+    await fireworks.aclose()
+    store.close()
+
+
 async def test_a_raising_tool_answers_the_sender(tmp_path: Path) -> None:
     """A broken handler is a tool error the model can talk about, not silence."""
     catalog = builtin_catalog()
@@ -628,6 +723,10 @@ async def test_a_raising_tool_answers_the_sender(tmp_path: Path) -> None:
         fireworks,
         home=home,
         broker=ToolBroker(catalog, home.broker),
+    )
+    channel._broker.bind(
+        "get_time",
+        lambda _arguments: (_ for _ in ()).throw(RuntimeError("clock chip died")),
     )
 
     await channel.handle(inbound(text="what time is it"))

@@ -42,6 +42,16 @@ class JobChannel(Protocol):
 
     async def persist_job_report(self, agent: AgentSpec, text: str, *, untrusted: bool) -> bool: ...
 
+    async def deliver_relay(
+        self,
+        agent: AgentSpec,
+        body: str,
+        *,
+        on_sent: Callable[[], None] | None = None,
+    ) -> None: ...
+
+    async def record_relay(self, agent: AgentSpec, body: str) -> None: ...
+
 
 class JobRunner:
     """Poll SQLite for due jobs and report to the owner over Signal."""
@@ -107,6 +117,49 @@ class JobRunner:
             await self._deliver(job, agent)
             return
 
+        if job.relay:
+            # The spouse gets the stored bytes even when the owner's job
+            # budget is spent. A failed send retries; it does not cancel.
+            # on_sent runs after the phone accepts the bytes. The recipient's
+            # assistant still needs the record. That write is retried on its
+            # own, and the sender is told only after it sticks.
+            if not job.relay_sent:
+                job_id = job.id
+
+                def _mark_sent() -> None:
+                    self._store.mark_relay_sent(job_id)
+
+                try:
+                    await self._channel.deliver_relay(
+                        agent,
+                        job.prompt,
+                        on_sent=_mark_sent,
+                    )
+                except Exception:
+                    log.exception("jobs.relay_failed", job=job.id, name=job.name)
+                    if not self._relay_was_sent(agent.name, job.id):
+                        self._defer(job.id)
+                        return
+            if not job.relay_recorded:
+                try:
+                    await self._channel.record_relay(agent, job.prompt)
+                except Exception:
+                    log.exception("jobs.relay_record_failed", job=job.id, name=job.name)
+                    self._defer(job.id)
+                    return
+                if not self._store.mark_relay_recorded(job.id):
+                    log.info("jobs.cancelled_before_send", job=job.id, name=job.name)
+                    return
+            relay_after: _AfterNotify = "cancel" if job.once else "advance"
+            await self._queue(
+                job,
+                agent,
+                f"Sent to the other phone:\n{job.prompt}",
+                untrusted=False,
+                after=relay_after,
+            )
+            return
+
         expired = job.kind == "watch" and job.expires_at is not None and job.expires_at <= now
         due = job.next_run_at <= now
         # Only the runs that always talk are worth paying a model call for when
@@ -125,7 +178,17 @@ class JobRunner:
             )
             return
 
-        after: _AfterNotify = "cancel" if expired else "advance"
+        after: _AfterNotify = "cancel" if expired or job.once else "advance"
+        if job.verbatim:
+            # The person asked for this sentence, not a job label around it.
+            await self._queue(
+                job,
+                agent,
+                job.prompt,
+                untrusted=False,
+                after=after,
+            )
+            return
         try:
             outcome = await self._channel.run_job(agent, job)
         except Exception:
@@ -142,6 +205,18 @@ class JobRunner:
             )
             return
 
+        if not outcome.found and not outcome.checked:
+            # NONE without a look is not an empty inbox. The mail job answered
+            # in two tokens and the phone was told there was nothing.
+            log.info("jobs.not_checked", job=job.id, name=job.name)
+            await self._queue(
+                job,
+                agent,
+                format_fail_message(job.name),
+                untrusted=False,
+                after=after,
+            )
+            return
         if job.kind == "schedule" or outcome.found:
             body = outcome.text.strip() if outcome.found else "Nothing to report."
             await self._queue(
@@ -222,6 +297,10 @@ class JobRunner:
             self._store.clear_job_outbox(job.id)
             return
         log.info("jobs.ran", job=job.id, name=job.name, kind=job.kind)
+
+    def _relay_was_sent(self, agent_name: str, job_id: str) -> bool:
+        current = self._store.find_job(agent_name, job_id=job_id)
+        return current is not None and current.relay_sent
 
     def _defer(self, job_id: str) -> None:
         """Hold off the next attempt, doubling each time it fails."""

@@ -1,6 +1,6 @@
 [project]
 name = "assistai"
-version = "0.0.0"
+version = "0.1.7"
 description = "Self-hosted multi-agent assistant over Signal, backed by Fireworks AI"
 requires-python = ">=3.12"
 

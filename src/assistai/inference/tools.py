@@ -12,10 +12,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 import structlog
 
-from assistai.errors import CalendarError, JobError, MailError, ResearchError, SharedError
+from assistai.errors import (
+    CalendarError,
+    JobError,
+    MailError,
+    RelayError,
+    ResearchError,
+    SharedError,
+)
 from assistai.inference.types import ToolCall, ToolSpec
 
 log = structlog.get_logger(__name__)
@@ -42,8 +50,9 @@ class ToolSurface(Protocol):
 GET_TIME_SPEC = ToolSpec(
     name="get_time",
     description=(
-        "Return the current UTC time as an ISO-8601 timestamp. "
-        "Use this when the user asks what time it is."
+        "Return the current household local time and UTC. "
+        "Call this in the same turn before job_create or relay start_at. "
+        "local has no timezone suffix; copy that form into start_at."
     ),
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
 )
@@ -85,7 +94,7 @@ class ToolRegistry:
         try:
             result = handler(arguments)
             content = result if isinstance(result, str) else await result
-        except (JobError, ResearchError, CalendarError, MailError, SharedError) as exc:
+        except (JobError, RelayError, ResearchError, CalendarError, MailError, SharedError) as exc:
             log.exception("tool.failed", name=call.name)
             return ToolResult(
                 json.dumps(
@@ -108,3 +117,20 @@ def default_registry() -> ToolRegistry:
 
 def get_time(_arguments: dict[str, Any]) -> str:
     return json.dumps({"utc": datetime.now(UTC).isoformat()})
+
+
+def bind_clock(timezone: str) -> Callable[[dict[str, Any]], str]:
+    """Clock the model must read before it names a start_at. Local matches that field."""
+
+    def handler(_arguments: dict[str, Any]) -> str:
+        zone = ZoneInfo(timezone)
+        now = datetime.now(zone)
+        return json.dumps(
+            {
+                "timezone": timezone,
+                "local": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                "utc": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    return handler

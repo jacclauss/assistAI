@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
 
 from assistai.agents import AgentSpec
 from assistai.broker import AUDIT_LIMIT, AuditEvent, Scope, ToolBroker, builtin_catalog
@@ -288,6 +292,47 @@ async def test_relay_is_a_staging_sink() -> None:
     assert surface.take_staged() == (call,)
 
 
+async def test_a_delayed_relay_is_not_saved_until_yes(tmp_path: Path) -> None:
+    """Running the delayed handler inside execute would text the other phone before yes."""
+    from assistai.relay import bind_relay
+    from tests.signal_fakes import FakeSignal
+
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    spouse = agent("spouse", "+15555550102", tools=("relay",))
+    home = household(jacob, spouse)
+
+    async def inject(_recipient: AgentSpec, _record: str) -> None:
+        raise AssertionError("a staged relay must not be recorded yet")
+
+    catalog = builtin_catalog()
+    catalog.bind(
+        "relay",
+        bind_relay(
+            household=home,
+            signal=signal,
+            inject=inject,
+            store=store,
+            timezone="America/Chicago",
+        ),
+    )
+    surface = ToolBroker(catalog, home.broker, store=store).for_agent(jacob)
+    staged = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="relay",
+            arguments='{"body": "pick up milk", "in_seconds": 120}',
+        ),
+    )
+
+    assert staged["status"] == "staged"
+    assert signal.sent == []
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
 async def test_an_empty_relay_body_is_not_staged() -> None:
     jacob = agent("jacob", "+15555550101", tools=("relay",))
     surface = ToolBroker(
@@ -298,6 +343,117 @@ async def test_an_empty_relay_body_is_not_staged() -> None:
 
     assert staged["error"] == "invalid_arguments"
     assert surface.take_staged() == ()
+
+
+async def test_a_verbatim_reminder_is_saved_without_a_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    broker = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    )
+    surface = broker.for_agent(jacob, Scope(tainted=True))
+    start = datetime(2026, 10, 19, 8, 0, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: start.timestamp() - 3600)
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+    call = ToolCall(
+        id="c1",
+        name="job_create",
+        arguments=(
+            '{"kind": "schedule", "name": "pool", '
+            '"prompt": "Don\'t forget to put the cleaner in the pool.", '
+            '"every_seconds": 86400, "once": true, "verbatim": true, '
+            '"start_at": "2026-10-19T08:00:00"}'
+        ),
+    )
+
+    saved = await body(surface, call)
+
+    assert saved["ok"] is True
+    assert surface.take_staged() == ()
+    created = store.find_job("jacob", name="pool")
+    assert created is not None
+    assert created.once
+    assert created.verbatim
+    assert created.prompt == "Don't forget to put the cleaner in the pool."
+    assert created.next_run_at == pytest.approx(start.timestamp())
+    assert surface.saved_reminders
+    assert "8:00 AM today" in surface.saved_reminders[0]
+    store.close()
+
+
+async def test_a_guessed_start_at_is_not_saved(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    broker = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    )
+    surface = broker.for_agent(jacob)
+    refused = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=(
+                '{"kind": "schedule", "name": "pool", '
+                '"prompt": "working", "every_seconds": 120, "once": true, '
+                '"verbatim": true, "start_at": "2026-10-19T12:44:00"}'
+            ),
+        ),
+    )
+
+    assert refused["error"] == "invalid_arguments"
+    assert "in_seconds" in refused["message"]
+    assert surface.take_staged() == ()
+    assert store.find_job("jacob", name="pool") is None
+    assert surface.saved_reminders == []
+    store.close()
+
+
+async def test_in_seconds_is_counted_by_the_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    broker = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    )
+    surface = broker.for_agent(jacob)
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    saved = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=(
+                '{"kind": "schedule", "name": "check", '
+                '"prompt": "The new reminder system is working.", '
+                '"every_seconds": 86400, "once": true, "verbatim": true, '
+                '"in_seconds": 120}'
+            ),
+        ),
+    )
+
+    assert saved["ok"] is True
+    assert saved["fires_at_local"] == "2026-10-18T20:55:00"
+    created = store.find_job("jacob", name="check")
+    assert created is not None
+    assert created.next_run_at == pytest.approx(now.timestamp() + 120)
+    assert surface.saved_reminders == [
+        'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check'
+    ]
+    store.close()
 
 
 async def test_job_create_is_staged() -> None:

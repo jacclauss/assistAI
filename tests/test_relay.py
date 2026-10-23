@@ -14,6 +14,7 @@ from assistai.relay import (
     format_outbound,
     format_record,
     parse_body,
+    parse_relay_when,
     using_agent,
 )
 from assistai.signal.client import MAX_SEND_CHARS
@@ -74,6 +75,85 @@ async def test_handler_sends_then_injects(tmp_path: Path) -> None:
     assert loaded[-1].untrusted is True
     assert "pick up milk" in (loaded[-1].content or "")
     store.close()
+
+
+async def test_a_future_relay_waits_instead_of_sending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    spouse = agent("spouse", "+15555550102", tools=("relay",))
+    home = household(jacob, spouse)
+
+    async def inject(_recipient: AgentSpec, _record: str) -> None:
+        raise AssertionError("a future relay must not inject yet")
+
+    handler = bind_relay(
+        household=home,
+        signal=signal,
+        inject=inject,
+        store=store,
+        timezone="America/Chicago",
+    )
+    with using_agent(jacob):
+        result = json.loads(await handler({"body": "pick up milk", "in_seconds": 120}))
+
+    assert signal.sent == []
+    assert result["scheduled"] is True
+    assert result["say"] == (
+        'I will text the other phone at 8:55 PM today: "pick up milk"\nName: message to spouse'
+    )
+    saved = store.find_job("jacob", name="message to spouse")
+    assert saved is not None
+    assert saved.relay is True
+    assert saved.once is True
+    assert saved.prompt == "pick up milk"
+    assert saved.next_run_at == pytest.approx(now.timestamp() + 120)
+    store.close()
+
+
+async def test_a_second_future_relay_gets_its_own_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    store = Store(tmp_path / "assistai.sqlite")
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    home = household(jacob, agent("spouse", "+15555550102", tools=("relay",)))
+
+    async def inject(_recipient: AgentSpec, _record: str) -> None:
+        raise AssertionError("a future relay must not inject yet")
+
+    handler = bind_relay(
+        household=home,
+        signal=FakeSignal(),
+        inject=inject,
+        store=store,
+        timezone="America/Chicago",
+    )
+    with using_agent(jacob):
+        await handler({"body": "pick up milk", "in_seconds": 120})
+        second = json.loads(await handler({"body": "and bread", "in_seconds": 180}))
+
+    saved = store.find_job("jacob", name="message to spouse 2")
+    assert saved is not None
+    assert saved.prompt == "and bread"
+    assert "message to spouse 2" in second["say"]
+    store.close()
+
+
+def test_a_non_text_start_at_is_not_an_immediate_relay() -> None:
+    with pytest.raises(RelayError, match="start_at"):
+        parse_relay_when({"body": "pick up milk", "start_at": 120})
 
 
 async def test_failed_inject_still_delivered(

@@ -204,8 +204,31 @@ see the list.
 A job runs as one agent, with that agent's ACL and that person's credentials.
 Failures (auth, network, tool error) message the owner; there is no silent
 skip. An empty schedule run still messages, because the person asked for a
-check at that time. An empty watch stays quiet. A watch without a TTL is
+check at that time. A run that answers without looking is a failed check,
+not an empty inbox; it is asked to look once more, and then the owner is
+told the check failed. An empty watch stays quiet. A watch without a TTL is
 rejected at creation.
+
+A reminder sets `verbatim`. The stored prompt is the Signal text, and the
+model is not called. It is saved when asked. A yes is not required, including
+when the conversation is already tainted, because that yes is what dropped
+the reminder. A delay is `in_seconds`, added to the server clock. A named
+`start_at` is refused unless `get_time` ran in that same turn, and it has
+no timezone suffix. The Signal reply states the time the server stored and
+the name to cancel. A turn that fails after the save cancels that reminder.
+`once` cancels the job after that send. `every_seconds` is the gap after
+the first run, at least 60 seconds, with no maximum. Nothing is sent before
+that first run. A reminder has to name it, with `in_seconds` or `start_at`.
+A job cannot be an instruction to create another job. A watch cannot be a
+reminder. A digest, which writes its own report, still waits for a yes. A
+message to the other person is a relay, not a reminder. Yes stores the text.
+A later time sends those bytes and records them for the recipient. The
+sender is told when it has gone out, and only after her assistant's
+record of the message is stored. A failed record is retried without
+sending the text again. The row records that the phone already has the
+message, and that the record was written. A second message whose name is
+the default gets the next free name. A reminder's Signal text is the
+stored sentence alone.
 
 Job output is appended to the owner's conversation history, so "what was in the
 digest?" works without re-fetching.

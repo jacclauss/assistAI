@@ -51,6 +51,10 @@ class JobError(AssistAIError):
     """A job could not be created, changed, or run."""
 
 
+class RelayError(AssistAIError):
+    """The stored relay could not be delivered. The message must not include a number."""
+
+
 class ResearchError(AssistAIError):
     """Search or fetch could not complete. Messages must not include secrets."""
 

@@ -30,7 +30,7 @@ wheels = [
 
 [[package]]
 name = "assistai"
-version = "0.0.0"
+version = "0.1.7"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },

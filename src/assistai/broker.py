@@ -52,7 +52,14 @@ from assistai.mail.tools import (
     MAIL_INBOX_SPEC,
     MAIL_READ_SPEC,
 )
-from assistai.relay import RELAY_SPEC, RELAY_TOOL, RelayError, parse_body, using_agent
+from assistai.relay import (
+    RELAY_SPEC,
+    RELAY_TOOL,
+    RelayError,
+    parse_body,
+    parse_relay_when,
+    using_agent,
+)
 from assistai.research.tools import WEB_FETCH_SPEC, WEB_SEARCH_SPEC
 from assistai.shared.records import parse_change
 from assistai.shared.tools import SHARED_CHANGE, SHARED_CHANGE_SPEC, SHARED_LISTS_SPEC
@@ -237,6 +244,9 @@ class BoundSurface:
         self._store = store
         self._staged: list[ToolCall] = []
         self._fetched_untrusted = False
+        self._read_clock = False
+        self.saved_reminders: list[str] = []
+        self.saved_job_ids: list[str] = []
 
     @property
     def tainted(self) -> bool:
@@ -287,7 +297,23 @@ class BoundSurface:
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
         meta = self._catalog.meta(call.name)
-        if meta.staging:
+        if call.name in (JOB_CREATE, RELAY_TOOL) and _has_start_at(call) and not self._read_clock:
+            # The 12:44pm reminder was a guessed clock. A named time has to come
+            # after get_time in this turn. A delay uses in_seconds instead.
+            body = json.dumps(
+                {
+                    "error": "invalid_arguments",
+                    "name": call.name,
+                    "message": (
+                        "start_at needs get_time in this turn. "
+                        "For a delay, set in_seconds and omit start_at."
+                    ),
+                }
+            )
+            return ToolResult(body)
+        # A reminder texts this person the sentence they asked for. Waiting for
+        # yes is what dropped it. Digests still stage.
+        if meta.staging and not _reminder_saves_now(call):
             reason = _staging_error(call, self._agent, self._store, self._staged)
             if reason is not None:
                 # Say why. The model has to tell the person whether to pick a
@@ -309,7 +335,12 @@ class BoundSurface:
             )
             body = json.dumps({"status": "staged", "name": call.name, "arguments": call.arguments})
             return ToolResult(body)
-        return await self._run(call, meta)
+        result = await self._run(call, meta)
+        if call.name == "get_time" and _tool_ok(result.content):
+            self._read_clock = True
+        if call.name == JOB_CREATE:
+            _note_saved_reminder(self.saved_reminders, self.saved_job_ids, result.content)
+        return result
 
     async def commit(self, call: ToolCall) -> ToolResult:
         """Run a previously staged call. The handler runs; it is not re-staged."""
@@ -367,6 +398,56 @@ class BoundSurface:
         return None
 
 
+def _has_start_at(call: ToolCall) -> bool:
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    raw = parsed.get("start_at")
+    return isinstance(raw, str) and bool(raw.strip())
+
+
+def _tool_ok(content: str) -> bool:
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and "error" not in parsed
+
+
+def _note_saved_reminder(notes: list[str], job_ids: list[str], content: str) -> None:
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(parsed, dict):
+        return
+    say = parsed.get("say")
+    if isinstance(say, str) and say:
+        notes.append(say)
+        job_id = parsed.get("id")
+        if isinstance(job_id, str) and job_id:
+            job_ids.append(job_id)
+
+
+def _reminder_saves_now(call: ToolCall) -> bool:
+    """True when this call is a verbatim reminder and should be stored now."""
+    if call.name != JOB_CREATE:
+        return False
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    try:
+        return parse_create(parsed).verbatim
+    except JobError:
+        return False
+
+
 def _not_report_tool(name: str, meta: ToolMeta) -> bool:
     """Jobs never file, draft, write, relay, or spawn more jobs."""
     if meta.staging or meta.sink is not None:
@@ -387,6 +468,7 @@ def _staging_error(
             return "arguments must be a JSON object"
         if call.name == RELAY_TOOL:
             parse_body(parsed, from_name=agent.name)
+            parse_relay_when(parsed)
             return None
         if call.name == CALENDAR_ADD:
             parse_add(parsed)
