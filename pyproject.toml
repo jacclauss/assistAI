@@ -51,13 +51,16 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "S", "ASYNC", "RUF"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["assistai", "evals", "tests"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "evals"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]

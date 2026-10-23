@@ -135,7 +135,7 @@ async def test_a_failed_lookup_does_not_clear_a_stale_notice(tmp_path: Path) -> 
     async def tags(_repository: str) -> TagPage:
         raise UpdateError("Docker Hub is unreachable")
 
-    hub.tags = tags  # type: ignore[method-assign]
+    hub.tags = tags  # type: ignore[method-assign, assignment]
     watcher = UpdateWatcher(
         settings(
             manifest_path=_write_manifest(tmp_path),

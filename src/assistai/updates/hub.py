@@ -86,12 +86,7 @@ def _next_page(url: str, repository: str) -> str:
     expected = f"/v2/repositories/{repository}/tags"
     if parts.scheme != "https" or parts.hostname != "hub.docker.com":
         raise UpdateError("Docker Hub returned a tag page on another host")
-    if (
-        parts.port not in (None, 443)
-        or parts.username
-        or parts.password
-        or parts.path != expected
-    ):
+    if parts.port not in (None, 443) or parts.username or parts.password or parts.path != expected:
         raise UpdateError("Docker Hub returned an unexpected tag page")
     return url
 

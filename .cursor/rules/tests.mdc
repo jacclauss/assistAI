@@ -1,0 +1,21 @@
+---
+description: Test conventions for the AssistAI suite
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Tests
+
+- No network. Use the fakes: `tests/fakes.py` (Fireworks, tool calls),
+  `tests/agent_fakes.py` (agents, households), `tests/signal_fakes.py`,
+  `tests/channel_fakes.py`. A test that must hit Fireworks is
+  `@pytest.mark.live` and runs only under `make live`.
+- Async tests are plain `async def`; `asyncio_mode = "auto"` is set.
+- Name the behaviour, not the function: `test_a_staging_tool_does_not_run_until_commit`.
+- A docstring on a test states the attack or failure it prevents when that is
+  not obvious from the name.
+- Security tests assert the handler did **not** run, not only that a refusal
+  came back.
+- Store tests that change the schema open a database at the previous
+  `user_version` and assert the migration preserves rows.
+- mypy is strict on tests too. Annotate fixtures and return types.

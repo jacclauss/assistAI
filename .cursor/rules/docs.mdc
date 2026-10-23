@@ -1,0 +1,22 @@
+---
+description: How product, architecture, spec, and decision docs relate and are written
+globs: docs/**/*.md
+alwaysApply: false
+---
+
+# Docs
+
+- `docs/prd.md` is what the product must do. `docs/architecture.md` is how.
+  When they disagree, the PRD wins and architecture is corrected in the same
+  change.
+- A spec in `docs/specs/` is one build phase with acceptance criteria. It does
+  not restate the PRD; it links to the section it implements.
+- A decision in `docs/decisions/` records a choice that closed an open
+  question or loosened an invariant. Decisions are append-only. Supersede one
+  with a new file; do not rewrite history.
+- Voice: short declarative sentences, present tense, no marketing. Say what
+  holds and what is refused. Tables for enumerable facts only.
+- Relative links must resolve; `tests/test_invariants.py` checks them.
+- When code changes behaviour a doc describes, update the doc in the same
+  commit. The README status table and `release-notes.md` are the ones that
+  drift most.

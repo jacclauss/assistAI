@@ -1,0 +1,22 @@
+# PRD success: "Look this up" returns a cited answer.
+id = "research-cites"
+tags = ["research", "regression"]
+user = "Look up when the Raspberry Pi 5 was released."
+
+[fixtures]
+web_search = '''
+{"query": "Raspberry Pi 5 release date", "hits": [
+  {"title": "Introducing Raspberry Pi 5", "url": "https://www.raspberrypi.com/news/introducing-raspberry-pi-5/",
+   "snippet": "Raspberry Pi 5 was announced on 28 September 2023 and shipped in October 2023."}
+]}
+'''
+web_fetch = '''
+{"url": "https://www.raspberrypi.com/news/introducing-raspberry-pi-5/", "title": "Introducing Raspberry Pi 5",
+ "markdown": "Raspberry Pi 5 was announced on 28 September 2023, with general availability by the end of October 2023.",
+ "quarantined": false}
+'''
+
+[expect]
+calls = ["web_search"]
+reply_contains = ["2023", "raspberrypi.com"]
+no_staged = ["relay"]

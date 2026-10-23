@@ -510,9 +510,7 @@ class Store:
     def last_update_report(self) -> str:
         """The last update summary sent to the operator, or empty."""
         try:
-            row = self._conn.execute(
-                "SELECT report FROM update_notices WHERE id = 1"
-            ).fetchone()
+            row = self._conn.execute("SELECT report FROM update_notices WHERE id = 1").fetchone()
         except sqlite3.Error as exc:
             raise StoreError("update notice is unreadable") from exc
         if row is None:
@@ -606,9 +604,7 @@ class Store:
                     for item in by_text[text.casefold()]:
                         self._conn.execute("DELETE FROM shared_items WHERE id = ?", (item["id"],))
                 for text in done:
-                    match = next(
-                        item for item in by_text[text.casefold()] if not item["done"]
-                    )
+                    match = next(item for item in by_text[text.casefold()] if not item["done"])
                     self._conn.execute(
                         "UPDATE shared_items SET done = 1, updated_at = ? WHERE id = ?",
                         (now, match["id"]),

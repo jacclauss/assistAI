@@ -1,0 +1,20 @@
+# PRD success: "a faithful agenda" from the shared calendar.
+id = "calendar-today"
+tags = ["calendar", "regression"]
+user = "What's on the docket today?"
+
+[fixtures]
+calendar_today = '''
+{"calendar": "Household", "timezone": "America/Chicago", "date": "2026-10-16",
+ "events": [
+  {"summary": "Dentist - Jacob", "all_day": false, "start": "09:30", "end": "10:15"},
+  {"summary": "Trash pickup", "all_day": true, "start": "2026-10-16", "end": "2026-10-16"}
+ ]}
+'''
+
+[expect]
+calls = ["calendar_today"]
+no_staged = ["calendar_add"]
+reply_contains = ["Dentist", "Trash"]
+reply_excludes = ["meeting", "lunch"]
+max_tool_calls = 3
