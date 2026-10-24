@@ -204,10 +204,13 @@ see the list.
 A job runs as one agent, with that agent's ACL and that person's credentials.
 Failures (auth, network, tool error) message the owner; there is no silent
 skip. An empty schedule run still messages, because the person asked for a
-check at that time. A run that answers without looking is a failed check,
-not an empty inbox; it is asked to look once more, and then the owner is
-told the check failed. An empty watch stays quiet. A watch without a TTL is
-rejected at creation.
+check at that time. A run that answers without looking, or whose only look
+returned a tool error, is a failed check, not an empty inbox; it is asked to
+look once more, and then the owner is told the check failed. A schedule
+whose inbox listed mail and still answered nothing gets the same second
+look. A watch that looked and found nothing it was waiting for stays quiet,
+even when the inbox held other mail. A watch without a TTL is rejected at
+creation.
 
 A reminder sets `verbatim`. The stored prompt is the Signal text, and the
 model is not called. In a clean conversation it is saved when asked, with no

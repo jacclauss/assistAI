@@ -143,8 +143,8 @@ JOB_CREATE_SPEC = ToolSpec(
             "once": {
                 "type": "boolean",
                 "description": (
-                "Send one message at the first run, then cancel the job. Set verbatim too."
-            ),
+                    "Send one message at the first run, then cancel the job. Set verbatim too."
+                ),
             },
             "verbatim": {
                 "type": "boolean",
@@ -236,9 +236,10 @@ class JobOutcome:
     """One report-only run.
 
     ``found`` is false when the model had nothing to say. ``checked`` is false
-    when that empty answer is not a real empty result: no report tool ran, or
-    the inbox tool listed mail and the model still said nothing. A caller that
-    already knows the run looked leaves ``checked`` at its default.
+    when that empty answer is not a real empty result: no report tool
+    returned without an error, or a schedule's inbox listed mail and the
+    model still said nothing. A caller that already knows the run looked
+    leaves ``checked`` at its default.
     """
 
     text: str
@@ -351,40 +352,79 @@ def is_nothing(text: str) -> bool:
     return text.strip().rstrip(".!").strip().lower() in _NOTHING
 
 
-def empty_report_is_real(messages: Sequence[Message], *, start: int) -> bool:
+def empty_report_is_real(
+    messages: Sequence[Message], *, start: int, kind: JobKind = "schedule"
+) -> bool:
     """True when NONE follows a look that found nothing.
 
     The morning mail job answered NONE in two tokens. That is not an empty
-    inbox. An inbox tool that listed mail and still got NONE is the same miss.
+    inbox, and neither is an inbox call that came back as an error. For a
+    schedule, an inbox that listed mail and still got NONE is the same miss.
+    A watch is different: one waiting for a single sender sees other mail
+    and is right to say NONE.
     """
-    looked = False
-    had_mail = False
-    for message in messages[start:]:
-        if message.role == "assistant":
-            looked = looked or any(call.name in REPORT_TOOLS for call in message.tool_calls)
-        elif message.role == "tool" and _tool_listed_mail(message.content):
-            had_mail = True
-    return looked and not had_mail
+    looks = _report_looks(messages, start=start)
+    if not looks.succeeded:
+        return False
+    return kind == "watch" or not looks.listed_mail
 
 
-def look_again_prompt(messages: Sequence[Message], *, start: int) -> str:
+def look_again_prompt(
+    messages: Sequence[Message], *, start: int, kind: JobKind = "schedule"
+) -> str:
     """One nudge when the run answered before it had a real result."""
-    looked = False
-    for message in messages[start:]:
-        if message.role == "assistant" and any(
-            call.name in REPORT_TOOLS for call in message.tool_calls
-        ):
-            looked = True
-            break
-    if looked:
+    looks = _report_looks(messages, start=start)
+    if looks.succeeded and looks.listed_mail and kind == "schedule":
         return (
             "A tool already returned something to report. "
             "Summarize that result. Do not answer NONE."
+        )
+    if looks.attempted and not looks.succeeded:
+        return (
+            "The tool returned an error, so nothing was checked. Call it once more. "
+            "If it fails again, say what failed. Do not answer NONE."
         )
     return (
         "You answered without looking. Call a tool now, then report what it returned. "
         "NONE is only valid after a tool result shows there is nothing."
     )
+
+
+@dataclass(frozen=True)
+class _Looks:
+    attempted: bool
+    succeeded: bool
+    listed_mail: bool
+
+
+def _report_looks(messages: Sequence[Message], *, start: int) -> _Looks:
+    """What the report tools in this run actually returned."""
+    report_calls: set[str] = set()
+    attempted = False
+    succeeded = False
+    listed_mail = False
+    for message in messages[start:]:
+        if message.role == "assistant":
+            for call in message.tool_calls:
+                if call.name in REPORT_TOOLS:
+                    report_calls.add(call.id)
+                    attempted = True
+        elif message.role == "tool" and message.tool_call_id in report_calls:
+            if _tool_errored(message.content):
+                continue
+            succeeded = True
+            listed_mail = listed_mail or _tool_listed_mail(message.content)
+    return _Looks(attempted=attempted, succeeded=succeeded, listed_mail=listed_mail)
+
+
+def _tool_errored(content: str | None) -> bool:
+    if not content:
+        return False
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
 
 
 def _asks_for_another_job(prompt: str) -> bool:

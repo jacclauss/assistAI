@@ -1725,6 +1725,94 @@ async def test_a_digest_that_ignores_listed_mail_is_not_an_empty_report(tmp_path
     store.close()
 
 
+async def test_a_watch_that_sees_other_mail_stays_quiet(tmp_path: Path) -> None:
+    """Waiting for one sender, the inbox holds other mail. That is a quiet run, not a failure."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    catalog.bind(
+        "mail_inbox",
+        lambda _arguments: json.dumps(
+            {"inbox_unread": 4, "messages": [{"id": "m1", "subject": "Amazon"}]}
+        ),
+    )
+    handler, seen = recorded(
+        sequence(
+            completion_stream(
+                tool_event(call_id="c1", name="mail_inbox", arguments="{}", finish="tool_calls")
+            ),
+            completion_stream(text_event("NONE", finish="stop")),
+        )
+    )
+    fireworks = client_for(handler)
+    jacob = agent("jacob", "+15555550101", tools=("mail_inbox",))
+    home = household(jacob, agent("spouse", "+15555550102"))
+    channel = channel_for(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+    watch = _job(
+        kind="watch",
+        ttl_seconds=86400,
+        expires_at=90000.0,
+        next_run_at=1.0,
+        prompt="Tell me if mail from the IRS arrives.",
+    )
+
+    outcome = await channel.run_job(jacob, watch)
+
+    assert not outcome.found
+    assert outcome.checked
+    assert len(seen) == 2
+    await fireworks.aclose()
+    store.close()
+
+
+async def test_a_failed_inbox_is_not_an_empty_report(tmp_path: Path) -> None:
+    """An expired token is a failure the owner hears about, not "Nothing to report."."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    catalog.bind(
+        "mail_inbox",
+        lambda _arguments: json.dumps(
+            {"error": "tool_failed", "name": "mail_inbox", "message": "gmail down"}
+        ),
+    )
+
+    def _none(_request: httpx.Request) -> httpx.Response:
+        return completion_stream(text_event("NONE", finish="stop"))
+
+    fireworks = client_for(
+        sequence(
+            completion_stream(
+                tool_event(call_id="c1", name="mail_inbox", arguments="{}", finish="tool_calls")
+            ),
+            _none,
+            _none,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("mail_inbox",))
+    home = household(jacob, agent("spouse", "+15555550102"))
+    channel = channel_for(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+
+    outcome = await channel.run_job(jacob, _job(next_run_at=1.0, prompt="Summarize unread mail."))
+
+    assert not outcome.found
+    assert not outcome.checked
+    await fireworks.aclose()
+    store.close()
+
+
 async def test_persist_job_report_appends_matching_text(tmp_path: Path) -> None:
     store = Store(tmp_path / "assistai.sqlite")
     fireworks = client_for(lambda _req: completion_stream(text_event("unused", finish="stop")))

@@ -244,11 +244,13 @@ class SignalChannel:
                     text = last_assistant_text(scratch) or ""
                     # One more turn. The mail job said NONE without calling
                     # the inbox, and that became "Nothing to report."
-                    if is_nothing(text) and not empty_report_is_real(scratch, start=start):
+                    if is_nothing(text) and not empty_report_is_real(
+                        scratch, start=start, kind=job.kind
+                    ):
                         scratch.append(
                             Message(
                                 role="user",
-                                content=look_again_prompt(scratch, start=start),
+                                content=look_again_prompt(scratch, start=start, kind=job.kind),
                                 created_at=time.time(),
                             )
                         )
@@ -268,7 +270,8 @@ class SignalChannel:
                         text=text,
                         found=not nothing,
                         untrusted=surface.fetched_untrusted,
-                        checked=not nothing or empty_report_is_real(scratch, start=start),
+                        checked=not nothing
+                        or empty_report_is_real(scratch, start=start, kind=job.kind),
                     )
 
     def can_notify_job(self, agent: AgentSpec) -> bool:
