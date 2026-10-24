@@ -718,6 +718,9 @@ class _FakeJobChannel:
     def can_notify_job(self, _agent: AgentSpec) -> bool:
         return self.can_notify
 
+    def holds_job(self, _job_id: str) -> bool:
+        return False
+
     async def run_job(self, agent: AgentSpec, job: Job) -> JobOutcome:
         self.runs += 1
         if self.during_run is not None:

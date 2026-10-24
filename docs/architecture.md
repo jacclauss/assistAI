@@ -227,7 +227,8 @@ delay is `in_seconds`, added to the server clock. A named
 no timezone suffix. The Signal reply starts with the time the server stored
 and the name to cancel, then the rest of the model's answer; the tool result
 tells the model not to restate the time. A turn that fails after the save
-cancels that reminder.
+cancels that reminder, and the runner skips a reminder until the turn that
+saved it has ended, so it cannot reach the phone before that reply.
 `once` cancels the job after that send, and it has to say `verbatim` true
 or false; a default would turn a one-time digest into a text that skips the
 yes. `every_seconds` is the gap after

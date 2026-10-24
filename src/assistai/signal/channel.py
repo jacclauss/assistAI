@@ -106,6 +106,7 @@ class SignalChannel:
             broker.bind(name, handler)
         broker.bind("get_time", bind_clock(self._settings.timezone))
         self._histories: dict[str, list[Message]] = {}
+        self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}
         self._history_locks: dict[str, asyncio.Lock] = {}
         self._uuid_numbers: dict[str, str] = {}
@@ -277,6 +278,14 @@ class SignalChannel:
     def can_notify_job(self, agent: AgentSpec) -> bool:
         return self._job_sends.would_allow(agent.name)
 
+    def holds_job(self, job_id: str) -> bool:
+        """A reminder saved by a turn still running waits for that turn.
+
+        Otherwise it can reach the phone before the reply that confirms it,
+        or before a failed turn cancels it.
+        """
+        return any(job_id in surface.saved_job_ids for surface in self._open_turns)
+
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
         """Send a job report. History is persisted separately after delivery is recorded."""
         _ = untrusted
@@ -354,73 +363,79 @@ class SignalChannel:
         if self._fireworks is None or self._manifest is None:
             await self._safe_send(inbound.sender, _NOT_CONFIGURED)
             return
-        async with self._history_lock(agent.name):
-            try:
-                messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
-                )
-            except StoreError:
-                log.exception("store.history_unreadable", agent=agent.name)
-                await self._safe_send(inbound.sender, _UNAVAILABLE)
-                return
-            # Taint carries across turns: untrusted text fetched last message is
-            # still in this history, so a privileged sink must stay refused.
-            surface: BoundSurface = self._broker.for_agent(agent, Scope.from_history(messages))
-            # A failed turn can leave an assistant tool-call with no result, which
-            # the provider rejects forever after. Roll the whole turn back instead.
-            baseline = len(messages)
-            messages.append(Message(role="user", content=inbound.text, created_at=time.time()))
-            try:
-                await run_turn(
-                    self._fireworks,
-                    self._manifest.primary,
-                    messages,
-                    surface,
-                    max_tool_rounds=self._settings.max_tool_rounds,
-                )
-            except AssistAIError:
-                log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
-                del messages[baseline:]
-                self._cancel_turn_jobs(surface)
-                await self._safe_send(inbound.sender, _UNAVAILABLE)
-                return
-            reply = last_assistant_text(messages)
-            if surface.saved_reminders:
-                # The model announced 12:44pm after saving that guess, so the
-                # time comes from the server's sentence. The rest of the answer
-                # may cover other things the person asked in the same message.
-                said = "\n".join(surface.saved_reminders)
-                reply = f"{said}\n\n{reply}" if reply else said
-                for message in reversed(messages):
-                    if message.role == "assistant":
-                        message.content = reply
-                        break
-            if not reply:
-                reply = _UNAVAILABLE
-            staged = surface.take_staged()
-            proposal: Proposal | Literal["keep"] = "keep"
-            if staged:
-                now = time.time()
-                preview = format_proposal(staged, tainted=surface.tainted)
+        surface: BoundSurface | None = None
+        try:
+            async with self._history_lock(agent.name):
+                try:
+                    messages = self._history(
+                        agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    )
+                except StoreError:
+                    log.exception("store.history_unreadable", agent=agent.name)
+                    await self._safe_send(inbound.sender, _UNAVAILABLE)
+                    return
+                # Taint carries across turns: untrusted text fetched last message is
+                # still in this history, so a privileged sink must stay refused.
+                surface = self._broker.for_agent(agent, Scope.from_history(messages))
+                self._open_turns.append(surface)
+                # A failed turn can leave an assistant tool-call with no result, which
+                # the provider rejects forever after. Roll the whole turn back instead.
+                baseline = len(messages)
+                messages.append(Message(role="user", content=inbound.text, created_at=time.time()))
+                try:
+                    await run_turn(
+                        self._fireworks,
+                        self._manifest.primary,
+                        messages,
+                        surface,
+                        max_tool_rounds=self._settings.max_tool_rounds,
+                    )
+                except AssistAIError:
+                    log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
+                    del messages[baseline:]
+                    self._cancel_turn_jobs(surface)
+                    await self._safe_send(inbound.sender, _UNAVAILABLE)
+                    return
+                reply = last_assistant_text(messages)
                 if surface.saved_reminders:
-                    preview = reply + "\n\n" + preview
-                messages.append(Message(role="assistant", content=preview, created_at=now))
-                reply = preview
-                proposal = Proposal(
-                    agent=agent.name,
-                    calls=staged,
-                    tainted=surface.tainted,
-                    created_at=now,
-                    expires_at=now + self._settings.staging_ttl_seconds,
-                )
-            if not self._window_and_persist(agent.name, messages, proposal=proposal):
-                del messages[baseline:]
-                self._cancel_turn_jobs(surface)
+                    # The model announced 12:44pm after saving that guess, so the
+                    # time comes from the server's sentence. The rest of the answer
+                    # may cover other things the person asked in the same message.
+                    said = "\n".join(surface.saved_reminders)
+                    reply = f"{said}\n\n{reply}" if reply else said
+                    for message in reversed(messages):
+                        if message.role == "assistant":
+                            message.content = reply
+                            break
+                if not reply:
+                    reply = _UNAVAILABLE
+                staged = surface.take_staged()
+                proposal: Proposal | Literal["keep"] = "keep"
                 if staged:
-                    self._abandon_live_proposal(agent.name)
-                await self._safe_send(inbound.sender, _SAVE_FAILED)
-                return
-        await self._safe_send(inbound.sender, reply)
+                    now = time.time()
+                    preview = format_proposal(staged, tainted=surface.tainted)
+                    if surface.saved_reminders:
+                        preview = reply + "\n\n" + preview
+                    messages.append(Message(role="assistant", content=preview, created_at=now))
+                    reply = preview
+                    proposal = Proposal(
+                        agent=agent.name,
+                        calls=staged,
+                        tainted=surface.tainted,
+                        created_at=now,
+                        expires_at=now + self._settings.staging_ttl_seconds,
+                    )
+                if not self._window_and_persist(agent.name, messages, proposal=proposal):
+                    del messages[baseline:]
+                    self._cancel_turn_jobs(surface)
+                    if staged:
+                        self._abandon_live_proposal(agent.name)
+                    await self._safe_send(inbound.sender, _SAVE_FAILED)
+                    return
+            await self._safe_send(inbound.sender, reply)
+        finally:
+            if surface is not None:
+                self._open_turns.remove(surface)
 
     async def _handle_decision(self, inbound: InboundText, agent: AgentSpec) -> bool:
         """Confirm or discard a live proposal. False means this is a normal turn."""

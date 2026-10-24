@@ -698,6 +698,79 @@ async def test_a_reminder_keeps_the_rest_of_the_answer(
     await fireworks.aclose()
 
 
+async def test_a_reminder_does_not_fire_before_its_turn_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll mid-turn would text the reminder ahead of the reply, or before a rollback."""
+    from assistai.scheduler import JobRunner
+
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    clock = {"now": now.timestamp() + 600}
+    store = _store(tmp_path)
+    signal = FakeSignal()
+    mid_turn: list[list[tuple[str, str]]] = []
+
+    def _second_round(_request: httpx.Request) -> httpx.Response:
+        # The fake transport is synchronous, so step the poll by hand while
+        # the turn is suspended on this request.
+        tick = runner._tick()
+        try:
+            tick.send(None)
+        except StopIteration:
+            pass
+        else:
+            tick.close()
+            raise AssertionError("the poll waited on something mid-turn")
+        mid_turn.append(list(signal.sent))
+        return completion_stream(text_event("Done.", finish="stop"))
+
+    fireworks = client_for(
+        sequence(
+            completion_stream(
+                tool_event(
+                    call_id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "check", '
+                        '"prompt": "It is working.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"in_seconds": 60}'
+                    ),
+                    finish="tool_calls",
+                )
+            ),
+            _second_round,
+        )
+    )
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        store=store,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+    runner = JobRunner(
+        store,
+        household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102")),
+        channel,
+        signal_settings(state_dir=tmp_path),
+        clock=lambda: clock["now"],
+    )
+
+    await channel.handle(inbound(text="Remind me in a minute that it is working"))
+
+    assert mid_turn == [[]]
+    assert [text for _number, text in signal.sent] == [
+        'I will text you at 8:54 PM today: "It is working."\nName: check\n\nDone.'
+    ]
+    await runner._tick()
+    assert signal.sent[-1][1] == "It is working."
+    await fireworks.aclose()
+    store.close()
+
+
 async def test_a_failed_turn_cancels_the_reminder_it_saved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

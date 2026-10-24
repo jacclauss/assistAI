@@ -36,6 +36,8 @@ _MAX_RETRY_SECONDS = 600.0
 class JobChannel(Protocol):
     def can_notify_job(self, agent: AgentSpec) -> bool: ...
 
+    def holds_job(self, job_id: str) -> bool: ...
+
     async def run_job(self, agent: AgentSpec, job: Job) -> JobOutcome: ...
 
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus: ...
@@ -98,6 +100,8 @@ class JobRunner:
         due = self._store.due_jobs(now)
         for job in due:
             if job.id in self._running or now < self._retry_at.get(job.id, 0.0):
+                continue
+            if self._channel.holds_job(job.id):
                 continue
             agent = self._agent(job.agent)
             if agent is None:
