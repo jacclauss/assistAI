@@ -385,16 +385,18 @@ class SignalChannel:
                 await self._safe_send(inbound.sender, _UNAVAILABLE)
                 return
             reply = last_assistant_text(messages)
-            if not reply:
-                reply = _UNAVAILABLE
             if surface.saved_reminders:
-                # The model announced 12:44pm after saving that guess. The
-                # sentence here is the time the server stored.
-                reply = "\n".join(surface.saved_reminders)
+                # The model announced 12:44pm after saving that guess, so the
+                # time comes from the server's sentence. The rest of the answer
+                # may cover other things the person asked in the same message.
+                said = "\n".join(surface.saved_reminders)
+                reply = f"{said}\n\n{reply}" if reply else said
                 for message in reversed(messages):
                     if message.role == "assistant":
                         message.content = reply
                         break
+            if not reply:
+                reply = _UNAVAILABLE
             staged = surface.take_staged()
             proposal: Proposal | Literal["keep"] = "keep"
             if staged:

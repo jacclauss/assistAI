@@ -224,8 +224,10 @@ and the digest report of a tainted job are stored untrusted, so they
 cannot outlive the page that shaped them as the assistant's own words. A
 delay is `in_seconds`, added to the server clock. A named
 `start_at` is refused unless `get_time` ran in that same turn, and it has
-no timezone suffix. The Signal reply states the time the server stored and
-the name to cancel. A turn that fails after the save cancels that reminder.
+no timezone suffix. The Signal reply starts with the time the server stored
+and the name to cancel, then the rest of the model's answer; the tool result
+tells the model not to restate the time. A turn that fails after the save
+cancels that reminder.
 `once` cancels the job after that send, and it has to say `verbatim` true
 or false; a default would turn a one-time digest into a text that skips the
 yes. `every_seconds` is the gap after

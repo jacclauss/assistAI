@@ -569,6 +569,10 @@ def bind_jobs(
                 timezone=timezone,
                 name=job.name,
             )
+            payload["note"] = (
+                "The person is sent the say sentence ahead of your reply. "
+                "Do not restate the reminder or its time; answer anything else they asked."
+            )
         return json.dumps(payload, ensure_ascii=False)
 
     async def list_jobs(_arguments: dict[str, Any]) -> str:

@@ -627,7 +627,7 @@ async def test_the_sent_reminder_time_is_the_servers(
                     finish="tool_calls",
                 )
             ),
-            completion_stream(text_event("I will text you at 12:44 PM.", finish="stop")),
+            completion_stream(text_event("Done.", finish="stop")),
         )
     )
     signal = FakeSignal()
@@ -644,9 +644,57 @@ async def test_the_sent_reminder_time_is_the_servers(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check',
+            'I will text you at 8:55 PM today: "The new reminder system is working."\n'
+            "Name: check\n\nDone.",
         )
     ]
+    await fireworks.aclose()
+
+
+async def test_a_reminder_keeps_the_rest_of_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One message asked for a reminder and a question; the phone gets both."""
+    now = datetime(2026, 10, 18, 20, 53, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    handler, seen = recorded(
+        sequence(
+            completion_stream(
+                tool_event(
+                    call_id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "trash", '
+                        '"prompt": "Take the trash out.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"in_seconds": 120}'
+                    ),
+                    finish="tool_calls",
+                )
+            ),
+            completion_stream(text_event("Pickup is Tuesday.", finish="stop")),
+        )
+    )
+    fireworks = client_for(handler)
+    signal = FakeSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+
+    await channel.handle(inbound(text="Remind me about the trash, and which day is pickup?"))
+
+    assert signal.sent == [
+        (
+            "+15555550101",
+            'I will text you at 8:55 PM today: "Take the trash out."\n'
+            "Name: trash\n\nPickup is Tuesday.",
+        )
+    ]
+    assert "Do not restate the reminder" in seen[1].content.decode()
     await fireworks.aclose()
 
 
