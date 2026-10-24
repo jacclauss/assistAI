@@ -29,14 +29,17 @@ with no requirement can only check style.
 
 ## 2. Size the review to the risk
 
-| Diff touches | Lenses |
+| Diff touches | Local lenses |
 | --- | --- |
-| Only `docs/`, comments, or tests | correctness |
-| `src/` outside the high-risk paths | correctness, spec |
-| `broker.py`, `staging.py`, `agents.py`, `gateway.py`, `scheduler.py`, `jobs.py`, `relay.py`, `secrets.py`, `store.py`, `signal/`, `inference/`, `config/`, `.github/`, a tool, a prompt, or a dependency | correctness, spec, security |
+| Only `docs/`, `.cursor/`, comments, or tests | none; Bugbot alone |
+| `src/` outside the high-risk paths | spec |
+| `broker.py`, `staging.py`, `agents.py`, `gateway.py`, `scheduler.py`, `jobs.py`, `relay.py`, `secrets.py`, `store.py`, `signal/`, `inference/`, `config/`, `.github/`, a tool, a prompt, or a dependency | spec, security |
 
-Two or three independent reviewers find most of what more would find. Do not
-add lenses to feel thorough.
+Bugbot is the correctness reviewer. It runs on GitHub once the PR is ready,
+so a local correctness lens only repeats it. Bugbot does not read the spec
+or the PRD; that is what the local lenses are for. Two or three independent
+reviewers find most of what more would find. Do not add lenses to feel
+thorough.
 
 ## 3. Run the lenses in parallel
 
@@ -50,20 +53,21 @@ format below, and these lines verbatim:
 > sequence, what happens, and who is affected. If you cannot name one, it
 > is not a finding. Report nothing about formatting or naming; CI covers it.
 
-Lenses:
+Lenses, all `subagent_type: generalPurpose`:
 
-- **Correctness.** `subagent_type: bugbot`, `Diff: branch changes`. Logic
-  errors, async and cancellation bugs, SQLite transactions, error paths,
-  regressions in callers of changed functions.
-- **Security.** `subagent_type: generalPurpose`, on a model family
-  different from the author's (for example `gpt-5.6-sol-medium` when the
-  author is Claude). The prompt is the question list from
-  [review-invariants](../review-invariants/SKILL.md), each answered with a
-  finding or "clean".
-- **Spec.** `subagent_type: generalPurpose`. For each acceptance criterion:
-  is it met, and does a named test fail if it regresses? Anything the diff
+- **Spec**, on `claude-opus-5-5-medium`. For each acceptance criterion: is
+  it met, and does a named test fail if it regresses? Anything the diff
   does that the spec puts out of scope? Any doc that now describes the old
   behaviour?
+- **Security**, on `gpt-5.6-sol-medium`. The prompt is the question list
+  from [review-invariants](../review-invariants/SKILL.md), each answered
+  with a finding or "clean".
+
+The models were picked by rerunning each candidate on PR #2, whose findings
+were already verified. Opus found the most spec findings. Sol was the only
+security reviewer to catch the job prompt that runs as trusted after a yes.
+Composer missed most findings and confirmed one that was false, so it does
+not review here. Rerun that comparison before changing a model.
 
 Report format for every lens:
 
@@ -77,10 +81,10 @@ Report format for every lens:
 ## 4. Verify before reporting
 
 Merge the lens reports and drop exact duplicates. Then launch one verifier:
-`subagent_type: generalPurpose`, on a model family different from the
-author's and, where possible, from the security lens (for example
-`gemini-4-argon-medium`). Give it the packet and the merged findings, not
-which lens raised each one.
+`subagent_type: generalPurpose` on `grok-4.7-high`, a family different from
+both lenses. In the comparison it reproduced findings with throwaway tests,
+refuted the false one, and ranked severity closest to the evidence. Give it
+the packet and the merged findings, not which lens raised each one.
 
 > For each finding, try to prove it wrong against the code on this branch.
 > Trace the path; run `uv run pytest` on a narrow test, or write a
@@ -94,8 +98,8 @@ Drop `refuted`. Keep `unproven` only at `concern` or above, labelled as such.
 
 ## 5. Dispose of every finding
 
-The author answers each surviving finding, in a table in the PR body under
-`## Review`:
+The author answers each surviving finding, and each Bugbot comment once the
+PR is ready, in a table in the PR body under `## Review`:
 
 | Finding | Severity | Disposition |
 | --- | --- | --- |
