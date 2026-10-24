@@ -333,6 +333,27 @@ async def test_a_delayed_relay_is_not_saved_until_yes(tmp_path: Path) -> None:
     store.close()
 
 
+async def test_a_guessed_relay_start_at_is_not_staged() -> None:
+    """A yes would send at a clock time the model never read."""
+    jacob = agent("jacob", "+15555550101", tools=("relay", "get_time"))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    refused = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="relay",
+            arguments='{"body": "pick up milk", "start_at": "2026-10-19T17:00:00"}',
+        ),
+    )
+
+    assert refused["error"] == "invalid_arguments"
+    assert "get_time" in refused["message"]
+    assert surface.take_staged() == ()
+
+
 async def test_an_empty_relay_body_is_not_staged() -> None:
     jacob = agent("jacob", "+15555550101", tools=("relay",))
     surface = ToolBroker(

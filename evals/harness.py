@@ -131,6 +131,9 @@ def load_cases(
 async def run_case(
     client: FireworksClient, pin: ModelPin, case: Case, *, trials: int, max_tool_rounds: int
 ) -> CaseResult:
+    if trials < 1:
+        # Zero trials passes every case with nothing run.
+        raise CaseError(f"trials must be at least 1, not {trials}")
     results = [
         await _trial(client, pin, case, max_tool_rounds=max_tool_rounds) for _ in range(trials)
     ]

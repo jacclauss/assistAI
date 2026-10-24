@@ -288,6 +288,7 @@ async def test_a_daily_reminder_can_start_fifty_days_out(
     created = store.find_job("jacob", name="pool cleaner")
     assert created is not None
     assert created.next_run_at == pytest.approx(start.timestamp())
+    assert created.every_seconds == 86400
     assert created.verbatim
     assert not created.once
     store.close()
