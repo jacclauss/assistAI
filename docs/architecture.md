@@ -197,7 +197,9 @@ stored in SQLite and inspectable in conversation.
 
 Jobs are **report-only**. A job may read — mail, calendar, the web — and it
 messages the owner with what it found. It never files, drafts, writes, or
-relays, because nobody is present to approve a staged action at 7am. If a
+writes a relay, because nobody is present to approve a staged action at 7am.
+A relay confirmed for later is a job row too, but the runner only sends the
+stored bytes; no model runs for it. If a
 digest suggests filing, the user stages that from their reply, where they can
 see the list.
 
@@ -345,9 +347,10 @@ would quietly move the parser back in-process.
 
 Relay is not a free `message:other_peer` sink. The sender's assistant drafts
 the message. A critique replaces that draft. Delivery is: confirm the draft
-on screen → Signal sends those bytes → append a record to the recipient's
-history so their assistant knows who sent it and what it said. Nothing is
-rewritten between confirm and send. The injected record is untrusted on her side:
+on screen, then Signal sends those bytes, at the yes or at the stored time,
+then a record goes into the recipient's history so their assistant knows
+who sent it and what it said. Nothing is rewritten between confirm and
+send. The injected record is untrusted on her side:
 confirmation authorized the delivery to her phone, not her assistant's later
 tool use.
 

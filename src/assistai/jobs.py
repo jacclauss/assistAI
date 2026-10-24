@@ -3,7 +3,8 @@
 The model does not get cron. It gets named job objects stored in SQLite.
 A schedule messages the owner on every run, even when the report is empty.
 A watch stays quiet unless it finds something, fails, or hits its TTL.
-Jobs report; they never file, draft, write, or relay.
+Jobs report; they never file, draft, write, or compose a relay. A relay
+confirmed for later rides on a job row, and the runner sends its stored text.
 """
 
 from __future__ import annotations
