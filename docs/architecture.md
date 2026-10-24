@@ -223,11 +223,14 @@ delay is `in_seconds`, added to the server clock. A named
 `start_at` is refused unless `get_time` ran in that same turn, and it has
 no timezone suffix. The Signal reply states the time the server stored and
 the name to cancel. A turn that fails after the save cancels that reminder.
-`once` cancels the job after that send. `every_seconds` is the gap after
+`once` cancels the job after that send, and it has to say `verbatim` true
+or false; a default would turn a one-time digest into a text that skips the
+yes. `every_seconds` is the gap after
 the first run, at least 60 seconds, with no maximum. Nothing is sent before
 that first run. A reminder has to name it, with `in_seconds` or `start_at`.
-A job cannot be an instruction to create another job. A watch cannot be a
-reminder. A digest, which writes its own report, still waits for a yes. A
+A job cannot be an instruction to create another job; that check applies to
+digests, because a reminder's sentence is texted and never run. A watch
+cannot be a reminder. A digest, which writes its own report, still waits for a yes. A
 message to the other person is a relay, not a reminder. Yes stores the text.
 A later time sends those bytes and records them for the recipient. The
 sender is told when it has gone out, and only after her assistant's

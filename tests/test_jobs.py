@@ -58,21 +58,24 @@ def test_sub_minute_intervals_are_rejected() -> None:
         )
 
 
-def test_a_one_time_reminder_is_verbatim_by_default() -> None:
-    spec = parse_create(
-        {
-            "kind": "schedule",
-            "name": "pool",
-            "prompt": "Put the cleaner in the pool.",
-            "every_seconds": 86400,
-            "once": True,
-            "start_at": "2026-12-07T08:00:00",
-        }
-    )
+def test_a_one_time_job_must_say_whether_it_is_verbatim() -> None:
+    """A default of verbatim saved a one-time digest with no yes and texted its prompt."""
+    arguments: dict[str, object] = {
+        "kind": "schedule",
+        "name": "mail once",
+        "prompt": "Summarize unread mail.",
+        "every_seconds": 86400,
+        "once": True,
+        "start_at": "2026-12-07T08:00:00",
+    }
+    with pytest.raises(JobError, match="verbatim"):
+        parse_create(arguments)
 
-    assert spec.once
-    assert spec.verbatim
-    assert spec.start_at == "2026-12-07T08:00:00"
+    digest = parse_create({**arguments, "verbatim": False})
+    reminder = parse_create({**arguments, "verbatim": True})
+
+    assert digest.once and not digest.verbatim
+    assert reminder.once and reminder.verbatim
 
 
 def test_a_zoned_start_at_is_rejected() -> None:
@@ -114,6 +117,7 @@ async def test_a_delay_past_the_clock_is_rejected(tmp_path: Path) -> None:
                 "prompt": "look",
                 "every_seconds": 86400,
                 "once": True,
+                "verbatim": True,
                 "in_seconds": 10**18,
             }
         )
@@ -132,6 +136,35 @@ def test_a_job_cannot_be_an_instruction_to_create_another_job() -> None:
                     'Create the daily "mgm plus rate increase reminder" job so the '
                     "first reminder goes out on December 9, 2026."
                 ),
+                "every_seconds": 86400,
+            }
+        )
+
+
+def test_a_reminder_may_mention_scheduling_a_job() -> None:
+    """The sentence is texted, never run, so it cannot create anything."""
+    spec = parse_create(
+        {
+            "kind": "schedule",
+            "name": "interview",
+            "prompt": "Don't forget to schedule the job interview.",
+            "every_seconds": 86400,
+            "once": True,
+            "verbatim": True,
+            "in_seconds": 3600,
+        }
+    )
+
+    assert spec.verbatim
+
+
+def test_a_digest_that_asks_to_make_a_job_is_refused() -> None:
+    with pytest.raises(JobError, match="cannot create another job"):
+        parse_create(
+            {
+                "kind": "schedule",
+                "name": "december",
+                "prompt": "Make a job so the first reminder goes out on December 9, 2026.",
                 "every_seconds": 86400,
             }
         )

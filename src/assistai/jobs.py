@@ -40,7 +40,7 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
 # A run cannot schedule. "Create the … job" is how a December reminder became
 # a text every night from October: the date never reached start_at.
 _ANOTHER_JOB = re.compile(
-    r"\b(?:create|schedule|set up)\b.{0,400}\bjob\b",
+    r"\b(?:create|make|add|schedule|set up)\b.{0,400}\bjob\b",
     re.IGNORECASE | re.DOTALL,
 )
 # get_time is not a check. The mail job answered NONE without opening the inbox.
@@ -142,7 +142,9 @@ JOB_CREATE_SPEC = ToolSpec(
             },
             "once": {
                 "type": "boolean",
-                "description": "Send one message at start_at, then cancel the job.",
+                "description": (
+                "Send one message at the first run, then cancel the job. Set verbatim too."
+            ),
             },
             "verbatim": {
                 "type": "boolean",
@@ -279,16 +281,22 @@ def parse_create(arguments: dict[str, Any]) -> JobCreate:
     ttl_seconds = _parse_ttl(arguments.get("ttl_seconds"), kind=kind, every_seconds=every_seconds)
     once = _parse_bool(arguments.get("once"), default=False, field="once")
     verbatim_raw = arguments.get("verbatim")
-    verbatim = (
-        once if verbatim_raw is None else _parse_bool(verbatim_raw, default=False, field="verbatim")
-    )
+    verbatim = _parse_bool(verbatim_raw, default=False, field="verbatim")
     if kind == "watch" and (once or verbatim):
         raise JobError("a watch cannot be a reminder")
     start_at = _parse_start_text(arguments.get("start_at"))
     in_seconds = _parse_delay(arguments.get("in_seconds"))
     if start_at is not None and in_seconds is not None:
         raise JobError("set in_seconds or start_at, not both")
-    if _asks_for_another_job(prompt):
+    if once and verbatim_raw is None:
+        # Guessing either way is wrong: a reminder taken for a digest texts a
+        # report, and a digest taken for a reminder skips the yes.
+        raise JobError(
+            "a one-time job must set verbatim: true to text this sentence, "
+            "or false for a one-time report"
+        )
+    # A verbatim prompt is texted, never run, so it cannot schedule anything.
+    if not verbatim and _asks_for_another_job(prompt):
         raise JobError(
             "a job cannot create another job. Schedule the reminder itself: "
             "verbatim true, the Signal sentence as the prompt, and in_seconds "
