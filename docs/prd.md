@@ -141,7 +141,11 @@ Two kinds, both brokered, both inspectable in conversation:
   user-facing. A run that answers without looking is a failed check, not an
   empty inbox. A background watch that finds nothing stays quiet.
 - A reminder texts the stored sentence, with no job label around it. Saying
-  "remind me" saves it. There is no yes. A delay is counted by the server. A named clock time is refused
+  "remind me" saves it with no yes, unless the conversation already holds
+  mail, web, calendar, list, or relay text. Then it waits for a yes like any
+  other job, and whatever the job later writes into history keeps that
+  untrusted label ([decision 0001](decisions/0001-reminders-stage-when-tainted.md)).
+  A delay is counted by the server. A named clock time is refused
   until the assistant has read the clock in that turn, and it is a local
   date and time with no timezone suffix. The reply names the reminder so it
   can be cancelled. It can fire once, or repeat until cancelled. The first

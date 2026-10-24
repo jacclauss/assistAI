@@ -465,6 +465,9 @@ class SignalChannel:
                 await self._safe_send(inbound.sender, _SAVE_FAILED)
                 return
             scope = Scope.from_history(messages)
+            # The page that shaped this proposal may have aged out of the
+            # window since. A job stored now still has to remember it.
+            scope.tainted = scope.tainted or pending.tainted
         surface: BoundSurface = self._broker.for_agent(agent, scope)
         results: list[tuple[ToolCall, str]] = []
         for call in pending.calls:

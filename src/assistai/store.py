@@ -24,7 +24,7 @@ from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _DB_NAME = "assistai.sqlite"
 
 _SCHEMA = """
@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     verbatim INTEGER NOT NULL DEFAULT 0,
     relay INTEGER NOT NULL DEFAULT 0,
     relay_sent INTEGER NOT NULL DEFAULT 0,
-    relay_recorded INTEGER NOT NULL DEFAULT 0
+    relay_recorded INTEGER NOT NULL DEFAULT 0,
+    tainted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
 CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
@@ -308,8 +309,9 @@ class Store:
                     "INSERT INTO jobs (id, agent, kind, name, prompt, every_seconds, "
                     "ttl_seconds, created_at, expires_at, next_run_at, last_run_at, "
                     "cancelled_at, pending_text, pending_untrusted, pending_after, "
-                    "pending_delivered, once, verbatim, relay, relay_sent, relay_recorded) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "pending_delivered, once, verbatim, relay, relay_sent, relay_recorded, "
+                    "tainted) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job.id,
                         job.agent,
@@ -332,6 +334,7 @@ class Store:
                         1 if job.relay else 0,
                         1 if job.relay_sent else 0,
                         1 if job.relay_recorded else 0,
+                        1 if job.tainted else 0,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -668,6 +671,7 @@ class Store:
             self._ensure_job_relay_column()
             self._ensure_job_relay_sent_column()
             self._ensure_job_relay_recorded_column()
+            self._ensure_job_tainted_column()
             self._ensure_shared_list_owner()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -714,6 +718,13 @@ class Store:
         if not cols or "relay_recorded" in cols:
             return
         self._conn.execute("ALTER TABLE jobs ADD COLUMN relay_recorded INTEGER NOT NULL DEFAULT 0")
+
+    def _ensure_job_tainted_column(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols or "tainted" in cols:
+            return
+        # Rows saved before this column were treated as trusted; keep that.
+        self._conn.execute("ALTER TABLE jobs ADD COLUMN tainted INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_shared_list_owner(self) -> None:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(shared_lists)")}
@@ -916,6 +927,7 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         relay_recorded=(
             _flag(row["relay_recorded"], job_id) if "relay_recorded" in row.keys() else False
         ),
+        tainted=_flag(row["tainted"], job_id) if "tainted" in row.keys() else False,
     )
 
 

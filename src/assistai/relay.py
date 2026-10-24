@@ -85,15 +85,22 @@ RELAY_SPEC = ToolSpec(
 InjectFn = Callable[[AgentSpec, str], Awaitable[None]]
 
 _ACTIVE_AGENT: ContextVar[AgentSpec | None] = ContextVar("assistai_relay_agent", default=None)
+_ACTIVE_TAINT: ContextVar[bool] = ContextVar("assistai_relay_tainted", default=False)
 
 
 @contextmanager
-def using_agent(agent: AgentSpec) -> Iterator[None]:
-    """Bind the confirming agent for the duration of a handler call."""
+def using_agent(agent: AgentSpec, *, tainted: bool = False) -> Iterator[None]:
+    """Bind the confirming agent, and whether its conversation is tainted, for one handler call.
+
+    A handler that stores text for later reads the taint here. The model's
+    arguments cannot clear it.
+    """
     token = activate_agent(agent)
+    taint_token = _ACTIVE_TAINT.set(tainted)
     try:
         yield
     finally:
+        _ACTIVE_TAINT.reset(taint_token)
         reset_agent(token)
 
 
@@ -110,6 +117,11 @@ def active_agent() -> AgentSpec:
     if agent is None:
         raise RelayError("relay has no active agent")
     return agent
+
+
+def active_taint() -> bool:
+    """True when the conversation running this handler holds untrusted text."""
+    return _ACTIVE_TAINT.get()
 
 
 def format_outbound(from_name: str, body: str) -> str:
@@ -344,6 +356,7 @@ def bind_relay(
             once=when.once,
             verbatim=True,
             relay=True,
+            tainted=active_taint(),
         )
         try:
             store.save_job(job)

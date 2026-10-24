@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
-from assistai.relay import active_agent
+from assistai.relay import active_agent, active_taint
 
 JobKind = Literal["schedule", "watch"]
 
@@ -88,8 +88,10 @@ JOB_CREATE_SPEC = ToolSpec(
         "A reminder that begins in 50 days and then repeats every 10 days is "
         "in_seconds 4320000 and every_seconds 864000. "
         "once true sends a single message and then the job ends. "
-        "verbatim true texts the prompt itself and is saved immediately. Use it for a reminder. "
-        "Do not ask the person to reply yes. "
+        "verbatim true texts the prompt itself. Use it for a reminder. "
+        "It is saved immediately unless this conversation already holds mail, web, "
+        "calendar, list, or relay text; then it waits for a yes like any other job. "
+        "Do not ask the person to reply yes yourself. "
         "Leave verbatim false when the run should write its own report, such as a mail digest. "
         "That kind still waits for a yes."
     ),
@@ -145,8 +147,8 @@ JOB_CREATE_SPEC = ToolSpec(
             "verbatim": {
                 "type": "boolean",
                 "description": (
-                    "Text the prompt itself and save now, with no yes. Required for a reminder. "
-                    "False lets the run write a report and waits for a yes."
+                    "True texts the prompt itself. Required for a reminder, and required "
+                    "whenever once is set. False lets the run write a report and waits for a yes."
                 ),
             },
         },
@@ -220,6 +222,7 @@ class Job:
     relay: bool = False
     relay_sent: bool = False
     relay_recorded: bool = False
+    tainted: bool = False
     pending_text: str | None = None
     pending_untrusted: bool = False
     pending_after: Literal["advance", "cancel"] | None = None
@@ -484,6 +487,7 @@ def bind_jobs(
                 cancelled_at=None,
                 once=spec.once,
                 verbatim=spec.verbatim,
+                tainted=active_taint(),
             )
             try:
                 store.save_job(job)

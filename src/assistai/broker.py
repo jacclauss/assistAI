@@ -312,8 +312,10 @@ class BoundSurface:
             )
             return ToolResult(body)
         # A reminder texts this person the sentence they asked for. Waiting for
-        # yes is what dropped it. Digests still stage.
-        if meta.staging and not _reminder_saves_now(call):
+        # yes is what dropped it. Digests still stage, and so does a reminder
+        # once outside text is in the conversation: that text could have
+        # written the sentence (decision 0001).
+        if meta.staging and (self._scope.tainted or not _reminder_saves_now(call)):
             reason = _staging_error(call, self._agent, self._store, self._staged)
             if reason is not None:
                 # Say why. The model has to tell the person whether to pick a
@@ -360,7 +362,7 @@ class BoundSurface:
         return await self._run(call, self._catalog.meta(call.name))
 
     async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
-        with using_agent(self._agent):
+        with using_agent(self._agent, tainted=self._scope.tainted):
             result = await self._catalog.execute(call)
         # Read before this call's own result taints the scope: the question the
         # log answers is what was already in context when the tool ran.

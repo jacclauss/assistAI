@@ -356,11 +356,56 @@ async def test_a_verbatim_reminder_is_saved_without_a_yes(
     broker = ToolBroker(
         catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
     )
+    surface = broker.for_agent(jacob, Scope())
+    start = datetime(2026, 10, 19, 8, 0, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: start.timestamp() - 3600)
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+
+    saved = await body(surface, _pool_reminder())
+
+    assert saved["ok"] is True
+    assert surface.take_staged() == ()
+    created = store.find_job("jacob", name="pool")
+    assert created is not None
+    assert created.once
+    assert created.verbatim
+    assert not created.tainted
+    assert created.prompt == "Don't forget to put the cleaner in the pool."
+    assert created.next_run_at == pytest.approx(start.timestamp())
+    assert surface.saved_reminders
+    assert "8:00 AM today" in surface.saved_reminders[0]
+    store.close()
+
+
+async def test_a_reminder_in_a_tainted_conversation_waits_for_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page read earlier could have written the sentence. It must not arm itself."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    broker = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    )
     surface = broker.for_agent(jacob, Scope(tainted=True))
     start = datetime(2026, 10, 19, 8, 0, tzinfo=ZoneInfo("America/Chicago"))
     monkeypatch.setattr("assistai.jobs._now", lambda: start.timestamp() - 3600)
     await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
-    call = ToolCall(
+
+    staged = await body(surface, _pool_reminder())
+
+    assert staged["status"] == "staged"
+    assert [call.name for call in surface.take_staged()] == ["job_create"]
+    assert store.find_job("jacob", name="pool") is None
+    assert surface.saved_reminders == []
+    assert surface.saved_job_ids == []
+    store.close()
+
+
+def _pool_reminder() -> ToolCall:
+    return ToolCall(
         id="c1",
         name="job_create",
         arguments=(
@@ -370,20 +415,6 @@ async def test_a_verbatim_reminder_is_saved_without_a_yes(
             '"start_at": "2026-10-19T08:00:00"}'
         ),
     )
-
-    saved = await body(surface, call)
-
-    assert saved["ok"] is True
-    assert surface.take_staged() == ()
-    created = store.find_job("jacob", name="pool")
-    assert created is not None
-    assert created.once
-    assert created.verbatim
-    assert created.prompt == "Don't forget to put the cleaner in the pool."
-    assert created.next_run_at == pytest.approx(start.timestamp())
-    assert surface.saved_reminders
-    assert "8:00 AM today" in surface.saved_reminders[0]
-    store.close()
 
 
 async def test_a_guessed_start_at_is_not_saved(tmp_path: Path) -> None:

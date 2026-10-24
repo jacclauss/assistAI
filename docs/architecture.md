@@ -210,9 +210,16 @@ told the check failed. An empty watch stays quiet. A watch without a TTL is
 rejected at creation.
 
 A reminder sets `verbatim`. The stored prompt is the Signal text, and the
-model is not called. It is saved when asked. A yes is not required, including
-when the conversation is already tainted, because that yes is what dropped
-the reminder. A delay is `in_seconds`, added to the server clock. A named
+model is not called. In a clean conversation it is saved when asked, with no
+yes, because that yes is what dropped the reminder. In a tainted one it
+stages like any other job: the outside text could have written the
+sentence ([decision 0001](decisions/0001-reminders-stage-when-tainted.md)).
+The broker binds the conversation's taint next to the acting agent while a
+handler runs, and a confirm runs with the proposal's taint too. Each job
+row stores that as `tainted`. The reminder text, the relay confirmation,
+and the digest report of a tainted job are stored untrusted, so they
+cannot outlive the page that shaped them as the assistant's own words. A
+delay is `in_seconds`, added to the server clock. A named
 `start_at` is refused unless `get_time` ran in that same turn, and it has
 no timezone suffix. The Signal reply states the time the server stored and
 the name to cancel. A turn that fails after the save cancels that reminder.

@@ -155,7 +155,7 @@ class JobRunner:
                 job,
                 agent,
                 f"Sent to the other phone:\n{job.prompt}",
-                untrusted=False,
+                untrusted=job.tainted,
                 after=relay_after,
             )
             return
@@ -185,7 +185,7 @@ class JobRunner:
                 job,
                 agent,
                 job.prompt,
-                untrusted=False,
+                untrusted=job.tainted,
                 after=after,
             )
             return
@@ -223,7 +223,9 @@ class JobRunner:
                 job,
                 agent,
                 format_job_message(job.name, body),
-                untrusted=outcome.untrusted,
+                # A digest confirmed while untrusted text was in context
+                # follows a prompt that text may have shaped.
+                untrusted=outcome.untrusted or job.tainted,
                 after=after,
             )
             return
