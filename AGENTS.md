@@ -84,6 +84,18 @@ them. The rest are on you.
 - Comments say why a constraint exists. They do not narrate the next line.
 - When behaviour changes, update the doc that describes it in the same commit.
 
+## Review
+
+- The author never reviews its own change. Before a PR leaves draft, run
+  `review-pr`: fresh subagents review the spec and the diff, a verifier on
+  another model tries to refute each finding, and every survivor gets a
+  disposition in the PR body.
+- Bugbot reviews the PR on GitHub once it is ready, using
+  [.cursor/BUGBOT.md](.cursor/BUGBOT.md). `.cursor/rules` do not reach it;
+  a rule Bugbot must enforce goes in that file too.
+- No open blocking finding at hand-off. The person merges; agents do not
+  approve or merge their own PRs.
+
 ## Commits
 
 One sentence, present tense, saying what now holds and why it matters:
@@ -97,4 +109,4 @@ No prefixes, no ticket numbers. A dependency addition says why in the body.
 ## Skills in this repo
 
 `.cursor/skills/` holds the repeatable workflows: `write-spec`, `add-tool`,
-`review-invariants`, and `doc-garden`. Use them by name.
+`review-pr`, `review-invariants`, and `doc-garden`. Use them by name.
