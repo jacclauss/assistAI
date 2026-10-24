@@ -74,6 +74,11 @@ class JobRunner:
         self._unknown_warned: set[str] = set()
         self._retry_at: dict[str, float] = {}
         self._retry_delay: dict[str, float] = {}
+        # Side effects that happened but whose row mark may not have stuck.
+        # A failed mark retries the write, never the send to a phone.
+        self._relay_sent: set[str] = set()
+        self._relay_recorded: set[str] = set()
+        self._notified: set[str] = set()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -123,10 +128,17 @@ class JobRunner:
             # on_sent runs after the phone accepts the bytes. The recipient's
             # assistant still needs the record. That write is retried on its
             # own, and the sender is told only after it sticks.
-            if not job.relay_sent:
+            if not job.relay_sent and job.id in self._relay_sent:
+                try:
+                    self._store.mark_relay_sent(job.id)
+                except StoreError:
+                    # The set already stops a second send; the record can go on.
+                    log.exception("jobs.relay_mark_failed", job=job.id, name=job.name)
+            elif not job.relay_sent:
                 job_id = job.id
 
                 def _mark_sent() -> None:
+                    self._relay_sent.add(job_id)
                     self._store.mark_relay_sent(job_id)
 
                 try:
@@ -137,18 +149,29 @@ class JobRunner:
                     )
                 except Exception:
                     log.exception("jobs.relay_failed", job=job.id, name=job.name)
-                    if not self._relay_was_sent(agent.name, job.id):
+                    if job.id not in self._relay_sent and not self._relay_was_sent(
+                        agent.name, job.id
+                    ):
                         self._defer(job.id)
                         return
             if not job.relay_recorded:
+                if job.id not in self._relay_recorded:
+                    try:
+                        await self._channel.record_relay(agent, job.prompt)
+                    except Exception:
+                        log.exception("jobs.relay_record_failed", job=job.id, name=job.name)
+                        self._defer(job.id)
+                        return
+                    self._relay_recorded.add(job.id)
                 try:
-                    await self._channel.record_relay(agent, job.prompt)
-                except Exception:
-                    log.exception("jobs.relay_record_failed", job=job.id, name=job.name)
+                    marked = self._store.mark_relay_recorded(job.id)
+                except StoreError:
+                    log.exception("jobs.relay_mark_failed", job=job.id, name=job.name)
                     self._defer(job.id)
                     return
-                if not self._store.mark_relay_recorded(job.id):
+                if not marked:
                     log.info("jobs.cancelled_before_send", job=job.id, name=job.name)
+                    self._forget(job.id)
                     return
             relay_after: _AfterNotify = "cancel" if job.once else "advance"
             await self._queue(
@@ -259,6 +282,7 @@ class JobRunner:
         )
         if not self._store.queue_job_report(queued):
             log.info("jobs.cancelled_before_send", job=job.id, name=job.name)
+            self._forget(job.id)
             return
         await self._deliver(queued, agent)
 
@@ -268,20 +292,31 @@ class JobRunner:
         if text is None or after is None:
             return
         if not job.pending_delivered:
-            status = await self._channel.notify_job(agent, text, untrusted=job.pending_untrusted)
-            if status != "sent":
-                if status == "rate_limited":
-                    log.warning("jobs.rate_limited", job=job.id, name=job.name)
-                else:
-                    log.warning("jobs.notify_failed", job=job.id, name=job.name)
+            if job.id not in self._notified:
+                status = await self._channel.notify_job(
+                    agent, text, untrusted=job.pending_untrusted
+                )
+                if status != "sent":
+                    if status == "rate_limited":
+                        log.warning("jobs.rate_limited", job=job.id, name=job.name)
+                    else:
+                        log.warning("jobs.notify_failed", job=job.id, name=job.name)
+                    self._defer(job.id)
+                    return
+                self._notified.add(job.id)
+            try:
+                marked = self._store.mark_job_delivered(job.id)
+            except StoreError:
+                log.exception("jobs.delivered_mark_failed", job=job.id, name=job.name)
                 self._defer(job.id)
                 return
-            if not self._store.mark_job_delivered(job.id):
+            if not marked:
                 # Outbox vanished while Signal was sending. Persist once so
                 # history matches the text that went out; there is nothing left
                 # to retry.
                 log.info("jobs.cancelled_mid_send", job=job.id, name=job.name)
                 self._clear_backoff(job.id)
+                self._forget(job.id)
                 await self._channel.persist_job_report(agent, text, untrusted=job.pending_untrusted)
                 return
         if not await self._channel.persist_job_report(agent, text, untrusted=job.pending_untrusted):
@@ -293,9 +328,12 @@ class JobRunner:
         if after == "cancel":
             self._store.cancel_job(job.id, at=finished)
             self._store.clear_job_outbox(job.id)
+            self._forget(job.id)
             log.info("jobs.expired", job=job.id, name=job.name)
             return
-        if not self._store.advance_job(job.id, now=finished):
+        advanced = self._store.advance_job(job.id, now=finished)
+        self._forget(job.id)
+        if not advanced:
             self._store.clear_job_outbox(job.id)
             return
         log.info("jobs.ran", job=job.id, name=job.name, kind=job.kind)
@@ -309,6 +347,12 @@ class JobRunner:
         delay = self._retry_delay.get(job_id, _FIRST_RETRY_SECONDS)
         self._retry_at[job_id] = self._clock() + delay
         self._retry_delay[job_id] = min(delay * 2, _MAX_RETRY_SECONDS)
+
+    def _forget(self, job_id: str) -> None:
+        """The run is over; the next one sends again."""
+        self._relay_sent.discard(job_id)
+        self._relay_recorded.discard(job_id)
+        self._notified.discard(job_id)
 
     def _clear_backoff(self, job_id: str) -> None:
         self._retry_at.pop(job_id, None)

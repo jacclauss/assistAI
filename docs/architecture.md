@@ -241,7 +241,10 @@ A later time sends those bytes and records them for the recipient. The
 sender is told when it has gone out, and only after her assistant's
 record of the message is stored. A failed record is retried without
 sending the text again. The row records that the phone already has the
-message, and that the record was written. A second message whose name is
+message, and that the record was written. The runner also remembers each
+relay send, relay record, and report send in memory until its row write
+sticks, so a failed write is retried instead of the message; only a
+restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
 

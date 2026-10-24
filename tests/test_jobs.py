@@ -432,6 +432,109 @@ async def test_a_relay_record_is_retried_without_sending_again(tmp_path: Path) -
     store.close()
 
 
+def _fail_once(store: Store, method: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row write raises the first time, as a locked or full disk would."""
+    real = getattr(store, method)
+    calls = {"n": 0}
+
+    def flaky(job_id: str) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreError("database is locked")
+        result: bool = real(job_id)
+        return result
+
+    monkeypatch.setattr(store, method, flaky)
+
+
+async def test_a_relay_whose_sent_mark_fails_is_not_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="message to spouse",
+            prompt="pick up milk",
+            once=True,
+            verbatim=True,
+            relay=True,
+            next_run_at=1.0,
+        )
+    )
+    _fail_once(store, "mark_relay_sent", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.relays == [("jacob", "pick up milk")]
+    assert channel.records == [("jacob", "pick up milk")]
+    assert len(channel.notified) == 1
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_relay_record_whose_mark_fails_is_not_written_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Her assistant would see the same message twice."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="message to spouse",
+            prompt="pick up milk",
+            once=True,
+            verbatim=True,
+            relay=True,
+            next_run_at=1.0,
+        )
+    )
+    _fail_once(store, "mark_relay_recorded", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    assert channel.notified == []
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.relays == [("jacob", "pick up milk")]
+    assert channel.records == [("jacob", "pick up milk")]
+    assert len(channel.notified) == 1
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_report_whose_delivered_mark_fails_is_not_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", next_run_at=1.0))
+    _fail_once(store, "mark_job_delivered", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="two new invoices", found=True, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.sends == 1
+    assert channel.runs == 1
+    assert len(channel.persisted) == 1
+    kept = store.find_job("jacob", name="morning email")
+    assert kept is not None
+    assert kept.pending_text is None
+    store.close()
+
+
 async def test_a_relay_that_fails_before_send_retries(tmp_path: Path) -> None:
     store = Store(tmp_path / "assistai.sqlite")
     store.save_job(
