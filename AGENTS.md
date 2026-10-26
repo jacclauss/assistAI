@@ -87,9 +87,9 @@ them. The rest are on you.
 ## Review
 
 - The author never reviews its own change. Before a PR leaves draft, run
-  `review-pr`: fresh subagents review the spec and the diff, a verifier on
-  another model tries to refute each finding, and every survivor gets a
-  disposition in the PR body.
+  `review-pr`: fresh subagents review the spec and the diff, a verifier
+  tries to refute each finding, and every survivor gets a disposition in
+  the PR body.
 - Bugbot reviews the PR on GitHub once it is ready, using
   [.cursor/BUGBOT.md](.cursor/BUGBOT.md). `.cursor/rules` do not reach it;
   a rule Bugbot must enforce goes in that file too.

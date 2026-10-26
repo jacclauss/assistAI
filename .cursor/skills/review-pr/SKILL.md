@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Runs an independent review of an AssistAI branch with fresh-context subagent reviewers, a cross-model verifier that tries to refute each finding, and an author disposition for every survivor. Use before marking a PR ready, when the user asks for a code review, or after pushing fixes to review findings.
+description: Runs an independent review of an AssistAI branch with fresh-context subagent reviewers, a verifier that tries to refute each finding, and an author disposition for every survivor. Use before marking a PR ready, when the user asks for a code review, or after pushing fixes to review findings.
 ---
 
 # Review a PR
@@ -34,12 +34,16 @@ with no requirement can only check style.
 | Only `docs/`, `.cursor/`, comments, or tests | none; Bugbot alone |
 | `src/` outside the high-risk paths | spec |
 | `broker.py`, `staging.py`, `agents.py`, `gateway.py`, `scheduler.py`, `jobs.py`, `relay.py`, `secrets.py`, `store.py`, `signal/`, `inference/`, `config/`, `.github/`, a tool, a prompt, or a dependency | spec, security |
+| `docker/` | security |
 
 Bugbot is the correctness reviewer. It runs on GitHub once the PR is ready,
 so a local correctness lens only repeats it. Bugbot does not read the spec
-or the PRD; that is what the local lenses are for. Two or three independent
-reviewers find most of what more would find. Do not add lenses to feel
-thorough.
+or the PRD; that is what the local lenses are for. A `docker/` diff gets the
+security lens on its own: a compose change can publish a port or mount the
+state volume onto a sidecar, and that question is not in the spec lens.
+When the diff matches more than one row, run every lens those rows name.
+Two or three independent reviewers find most of what more would find. Do not
+add lenses to feel thorough.
 
 ## 3. Run the lenses in parallel
 
@@ -68,7 +72,9 @@ were already verified. Opus found the behaviour bugs on the spec lens that
 Grok missed. As the security lens, Grok found three real issues to Sol's
 two, including the relay confirmation stored as trusted. Composer missed
 most findings and confirmed one that was false, so it does not review here.
-Rerun that comparison before changing a model.
+Grok is also the verifier: in that comparison it reproduced findings with
+throwaway tests and refuted the false one. A security finding is therefore
+checked by the same model. Rerun that comparison before changing a model.
 
 Report format for every lens:
 
@@ -82,10 +88,7 @@ Report format for every lens:
 ## 4. Verify before reporting
 
 Merge the lens reports and drop exact duplicates. Then launch one verifier:
-`subagent_type: generalPurpose` on `gpt-5.6-sol-medium`, a family different
-from both lenses, so no model checks its own findings. Sol was not tried
-as a verifier in the comparison; replace it if it confirms a finding the
-code refutes. Give it
+`subagent_type: generalPurpose` on `grok-4.7-high`. Give it
 the packet and the merged findings, not which lens raised each one.
 
 > For each finding, try to prove it wrong against the code on this branch.
