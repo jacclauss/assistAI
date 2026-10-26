@@ -59,15 +59,16 @@ Lenses, all `subagent_type: generalPurpose`:
   it met, and does a named test fail if it regresses? Anything the diff
   does that the spec puts out of scope? Any doc that now describes the old
   behaviour?
-- **Security**, on `gpt-5.6-sol-medium`. The prompt is the question list
+- **Security**, on `grok-4.7-high`. The prompt is the question list
   from [review-invariants](../review-invariants/SKILL.md), each answered
   with a finding or "clean".
 
 The models were picked by rerunning each candidate on PR #2, whose findings
-were already verified. Opus found the most spec findings. Sol was the only
-security reviewer to catch the job prompt that runs as trusted after a yes.
-Composer missed most findings and confirmed one that was false, so it does
-not review here. Rerun that comparison before changing a model.
+were already verified. Opus found the behaviour bugs on the spec lens that
+Grok missed. As the security lens, Grok found three real issues to Sol's
+two, including the relay confirmation stored as trusted. Composer missed
+most findings and confirmed one that was false, so it does not review here.
+Rerun that comparison before changing a model.
 
 Report format for every lens:
 
@@ -81,9 +82,10 @@ Report format for every lens:
 ## 4. Verify before reporting
 
 Merge the lens reports and drop exact duplicates. Then launch one verifier:
-`subagent_type: generalPurpose` on `grok-4.7-high`, a family different from
-both lenses. In the comparison it reproduced findings with throwaway tests,
-refuted the false one, and ranked severity closest to the evidence. Give it
+`subagent_type: generalPurpose` on `gpt-5.6-sol-medium`, a family different
+from both lenses, so no model checks its own findings. Sol was not tried
+as a verifier in the comparison; replace it if it confirms a finding the
+code refutes. Give it
 the packet and the merged findings, not which lens raised each one.
 
 > For each finding, try to prove it wrong against the code on this branch.
