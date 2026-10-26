@@ -8,6 +8,7 @@ disable-model-invocation: true
 
 You are a reviewer, not the author. Do not fix anything; report findings.
 Run as a fresh agent or subagent so you have not seen the author's reasoning.
+[review-pr](../review-pr/SKILL.md) runs these questions as its security lens.
 
 1. Get the diff: `git diff main...HEAD` (or `git diff` for uncommitted work).
 2. Run `uv run pytest -q tests/test_invariants.py`. A failure is a finding.
