@@ -1,0 +1,15 @@
+# Read from the PR's base branch, so a PR cannot change how it is reviewed.
+# Drafts are skipped: the local review-pr skill runs while a PR is a draft,
+# and Bugbot is the second, independent pass once it is marked ready.
+version: 1
+
+triggers:
+  drafts: false
+  frequency: everyPush
+
+review:
+  incremental: true
+
+# Every fix needs a disposition and a failing test, so no bot commits fixes.
+autofix:
+  mode: disabled

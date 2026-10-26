@@ -13,6 +13,17 @@
 - [ ] A loosened invariant or closed open question has a file in `docs/decisions/`
 - [ ] Prompt or model change: `make eval` run, results below
 
+- [ ] `review-pr` ran with fresh reviewers; no blocking finding is open
+
 ## Evidence
 
 <!-- Test names, eval output, or what you texted the bot and what came back. -->
+
+## Review
+
+<!-- From review-pr: every verified finding and what was done about it.
+
+| Finding | Severity | Disposition |
+| --- | --- | --- |
+| path:line, one line | blocking / concern | fixed in <sha>, test <name> / declined: reason |
+-->
