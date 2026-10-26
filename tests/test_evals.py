@@ -50,6 +50,17 @@ def test_grade_reports_every_miss(repo_root: Path) -> None:
     assert "reply contains 'bank login'" in failures
 
 
+async def test_zero_trials_is_refused(repo_root: Path) -> None:
+    """Zero runs would report every case as passing."""
+    case = load_cases(CASES_DIR, roster=_roster(repo_root))[0]
+    client = client_for(sequence())
+    try:
+        with pytest.raises(CaseError, match="at least 1"):
+            await run_case(client, pin(), case, trials=0, max_tool_rounds=4)
+    finally:
+        await client.aclose()
+
+
 async def test_a_staged_relay_passes_the_relay_case(repo_root: Path) -> None:
     """The handler is faked, but staging goes through the real broker."""
     case = next(

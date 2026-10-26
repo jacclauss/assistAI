@@ -3,7 +3,8 @@
 The model does not get cron. It gets named job objects stored in SQLite.
 A schedule messages the owner on every run, even when the report is empty.
 A watch stays quiet unless it finds something, fails, or hits its TTL.
-Jobs report; they never file, draft, write, or relay.
+Jobs report; they never file, draft, write, or compose a relay. A relay
+confirmed for later rides on a job row, and the runner sends its stored text.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
-from assistai.relay import active_agent
+from assistai.relay import active_agent, active_taint
 
 JobKind = Literal["schedule", "watch"]
 
@@ -40,7 +41,7 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
 # A run cannot schedule. "Create the … job" is how a December reminder became
 # a text every night from October: the date never reached start_at.
 _ANOTHER_JOB = re.compile(
-    r"\b(?:create|schedule|set up)\b.{0,400}\bjob\b",
+    r"\b(?:create|make|add|schedule|set up)\b.{0,400}\bjob\b",
     re.IGNORECASE | re.DOTALL,
 )
 # get_time is not a check. The mail job answered NONE without opening the inbox.
@@ -85,11 +86,15 @@ JOB_CREATE_SPEC = ToolSpec(
         "start_at is a named local time, ISO-8601 without a timezone suffix "
         "(2026-12-07T08:00:00). Call get_time in this same turn before using it. "
         "A start_at without that call is rejected. "
+        "A daily check with no named hour omits start_at and does not ask what time. "
+        "If this call is rejected, call get_time if you have not, then call job_create again. "
         "A reminder that begins in 50 days and then repeats every 10 days is "
         "in_seconds 4320000 and every_seconds 864000. "
         "once true sends a single message and then the job ends. "
-        "verbatim true texts the prompt itself and is saved immediately. Use it for a reminder. "
-        "Do not ask the person to reply yes. "
+        "verbatim true texts the prompt itself. Use it for a reminder. "
+        "It is saved immediately unless this conversation already holds mail, web, "
+        "calendar, list, or relay text; then it waits for a yes like any other job. "
+        "Do not ask the person to reply yes yourself. "
         "Leave verbatim false when the run should write its own report, such as a mail digest. "
         "That kind still waits for a yes."
     ),
@@ -140,13 +145,15 @@ JOB_CREATE_SPEC = ToolSpec(
             },
             "once": {
                 "type": "boolean",
-                "description": "Send one message at start_at, then cancel the job.",
+                "description": (
+                    "Send one message at the first run, then cancel the job. Set verbatim too."
+                ),
             },
             "verbatim": {
                 "type": "boolean",
                 "description": (
-                    "Text the prompt itself and save now, with no yes. Required for a reminder. "
-                    "False lets the run write a report and waits for a yes."
+                    "True texts the prompt itself. Required for a reminder, and required "
+                    "whenever once is set. False lets the run write a report and waits for a yes."
                 ),
             },
         },
@@ -220,6 +227,7 @@ class Job:
     relay: bool = False
     relay_sent: bool = False
     relay_recorded: bool = False
+    tainted: bool = False
     pending_text: str | None = None
     pending_untrusted: bool = False
     pending_after: Literal["advance", "cancel"] | None = None
@@ -231,9 +239,10 @@ class JobOutcome:
     """One report-only run.
 
     ``found`` is false when the model had nothing to say. ``checked`` is false
-    when that empty answer is not a real empty result: no report tool ran, or
-    the inbox tool listed mail and the model still said nothing. A caller that
-    already knows the run looked leaves ``checked`` at its default.
+    when that empty answer is not a real empty result: no report tool
+    returned without an error, or a schedule's inbox listed mail and the
+    model still said nothing. A caller that already knows the run looked
+    leaves ``checked`` at its default.
     """
 
     text: str
@@ -276,16 +285,22 @@ def parse_create(arguments: dict[str, Any]) -> JobCreate:
     ttl_seconds = _parse_ttl(arguments.get("ttl_seconds"), kind=kind, every_seconds=every_seconds)
     once = _parse_bool(arguments.get("once"), default=False, field="once")
     verbatim_raw = arguments.get("verbatim")
-    verbatim = (
-        once if verbatim_raw is None else _parse_bool(verbatim_raw, default=False, field="verbatim")
-    )
+    verbatim = _parse_bool(verbatim_raw, default=False, field="verbatim")
     if kind == "watch" and (once or verbatim):
         raise JobError("a watch cannot be a reminder")
     start_at = _parse_start_text(arguments.get("start_at"))
     in_seconds = _parse_delay(arguments.get("in_seconds"))
     if start_at is not None and in_seconds is not None:
         raise JobError("set in_seconds or start_at, not both")
-    if _asks_for_another_job(prompt):
+    if once and verbatim_raw is None:
+        # Guessing either way is wrong: a reminder taken for a digest texts a
+        # report, and a digest taken for a reminder skips the yes.
+        raise JobError(
+            "a one-time job must set verbatim: true to text this sentence, "
+            "or false for a one-time report"
+        )
+    # A verbatim prompt is texted, never run, so it cannot schedule anything.
+    if not verbatim and _asks_for_another_job(prompt):
         raise JobError(
             "a job cannot create another job. Schedule the reminder itself: "
             "verbatim true, the Signal sentence as the prompt, and in_seconds "
@@ -340,40 +355,79 @@ def is_nothing(text: str) -> bool:
     return text.strip().rstrip(".!").strip().lower() in _NOTHING
 
 
-def empty_report_is_real(messages: Sequence[Message], *, start: int) -> bool:
+def empty_report_is_real(
+    messages: Sequence[Message], *, start: int, kind: JobKind = "schedule"
+) -> bool:
     """True when NONE follows a look that found nothing.
 
     The morning mail job answered NONE in two tokens. That is not an empty
-    inbox. An inbox tool that listed mail and still got NONE is the same miss.
+    inbox, and neither is an inbox call that came back as an error. For a
+    schedule, an inbox that listed mail and still got NONE is the same miss.
+    A watch is different: one waiting for a single sender sees other mail
+    and is right to say NONE.
     """
-    looked = False
-    had_mail = False
-    for message in messages[start:]:
-        if message.role == "assistant":
-            looked = looked or any(call.name in REPORT_TOOLS for call in message.tool_calls)
-        elif message.role == "tool" and _tool_listed_mail(message.content):
-            had_mail = True
-    return looked and not had_mail
+    looks = _report_looks(messages, start=start)
+    if not looks.succeeded:
+        return False
+    return kind == "watch" or not looks.listed_mail
 
 
-def look_again_prompt(messages: Sequence[Message], *, start: int) -> str:
+def look_again_prompt(
+    messages: Sequence[Message], *, start: int, kind: JobKind = "schedule"
+) -> str:
     """One nudge when the run answered before it had a real result."""
-    looked = False
-    for message in messages[start:]:
-        if message.role == "assistant" and any(
-            call.name in REPORT_TOOLS for call in message.tool_calls
-        ):
-            looked = True
-            break
-    if looked:
+    looks = _report_looks(messages, start=start)
+    if looks.succeeded and looks.listed_mail and kind == "schedule":
         return (
             "A tool already returned something to report. "
             "Summarize that result. Do not answer NONE."
+        )
+    if looks.attempted and not looks.succeeded:
+        return (
+            "The tool returned an error, so nothing was checked. Call it once more. "
+            "If it fails again, say what failed. Do not answer NONE."
         )
     return (
         "You answered without looking. Call a tool now, then report what it returned. "
         "NONE is only valid after a tool result shows there is nothing."
     )
+
+
+@dataclass(frozen=True)
+class _Looks:
+    attempted: bool
+    succeeded: bool
+    listed_mail: bool
+
+
+def _report_looks(messages: Sequence[Message], *, start: int) -> _Looks:
+    """What the report tools in this run actually returned."""
+    report_calls: set[str] = set()
+    attempted = False
+    succeeded = False
+    listed_mail = False
+    for message in messages[start:]:
+        if message.role == "assistant":
+            for call in message.tool_calls:
+                if call.name in REPORT_TOOLS:
+                    report_calls.add(call.id)
+                    attempted = True
+        elif message.role == "tool" and message.tool_call_id in report_calls:
+            if _tool_errored(message.content):
+                continue
+            succeeded = True
+            listed_mail = listed_mail or _tool_listed_mail(message.content)
+    return _Looks(attempted=attempted, succeeded=succeeded, listed_mail=listed_mail)
+
+
+def _tool_errored(content: str | None) -> bool:
+    if not content:
+        return False
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
 
 
 def _asks_for_another_job(prompt: str) -> bool:
@@ -484,6 +538,7 @@ def bind_jobs(
                 cancelled_at=None,
                 once=spec.once,
                 verbatim=spec.verbatim,
+                tainted=active_taint(),
             )
             try:
                 store.save_job(job)
@@ -516,6 +571,10 @@ def bind_jobs(
                 now=now,
                 timezone=timezone,
                 name=job.name,
+            )
+            payload["note"] = (
+                "The person is sent the say sentence ahead of your reply. "
+                "Do not restate the reminder or its time; answer anything else they asked."
             )
         return json.dumps(payload, ensure_ascii=False)
 

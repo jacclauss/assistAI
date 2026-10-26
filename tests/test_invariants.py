@@ -138,16 +138,46 @@ def test_relative_doc_links_resolve(repo_root: Path) -> None:
     assert not broken, "broken relative links:\n  " + "\n  ".join(broken)
 
 
+def test_the_import_walker_sees_every_import_form() -> None:
+    """A form the walker skips is a layering violation nobody is told about."""
+    source = "\n".join(
+        [
+            "import assistai.store",
+            "from assistai.broker import ToolMeta",
+            "from assistai import gateway",
+            "from .. import scheduler",
+            "from ..signal.channel import SignalChannel",
+            "from .types import Message",
+        ]
+    )
+
+    found = _imports_in(source, package=("assistai", "inference"))
+
+    assert found == {"store", "broker", "gateway", "scheduler", "signal", "inference"}
+
+
 def _assistai_imports(path: Path) -> set[str]:
+    package = ("assistai", *path.relative_to(_SRC).parent.parts)
+    return _imports_in(path.read_text(encoding="utf-8"), package=package)
+
+
+def _imports_in(source: str, *, package: tuple[str, ...]) -> set[str]:
+    """Top-level assistai subpackages a module imports, in any import form."""
     found: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-        names: list[str] = []
-        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            names = [node.module]
-        elif isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        for name in names:
-            parts = name.split(".")
+    for node in ast.walk(ast.parse(source)):
+        targets: list[list[str]] = []
+        if isinstance(node, ast.Import):
+            targets = [alias.name.split(".") for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = list(package[: len(package) - node.level + 1]) if node.level else []
+            module = [*base, *(node.module.split(".") if node.module else [])]
+            if len(module) == 1:
+                # `from assistai import broker` and `from .. import store` name
+                # the subpackage in the alias, not the module.
+                targets = [[*module, alias.name] for alias in node.names]
+            else:
+                targets = [module]
+        for parts in targets:
             if len(parts) > 1 and parts[0] == "assistai":
                 found.add(parts[1])
     return found

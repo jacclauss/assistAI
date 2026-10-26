@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -57,21 +58,24 @@ def test_sub_minute_intervals_are_rejected() -> None:
         )
 
 
-def test_a_one_time_reminder_is_verbatim_by_default() -> None:
-    spec = parse_create(
-        {
-            "kind": "schedule",
-            "name": "pool",
-            "prompt": "Put the cleaner in the pool.",
-            "every_seconds": 86400,
-            "once": True,
-            "start_at": "2026-12-07T08:00:00",
-        }
-    )
+def test_a_one_time_job_must_say_whether_it_is_verbatim() -> None:
+    """A default of verbatim saved a one-time digest with no yes and texted its prompt."""
+    arguments: dict[str, object] = {
+        "kind": "schedule",
+        "name": "mail once",
+        "prompt": "Summarize unread mail.",
+        "every_seconds": 86400,
+        "once": True,
+        "start_at": "2026-12-07T08:00:00",
+    }
+    with pytest.raises(JobError, match="verbatim"):
+        parse_create(arguments)
 
-    assert spec.once
-    assert spec.verbatim
-    assert spec.start_at == "2026-12-07T08:00:00"
+    digest = parse_create({**arguments, "verbatim": False})
+    reminder = parse_create({**arguments, "verbatim": True})
+
+    assert digest.once and not digest.verbatim
+    assert reminder.once and reminder.verbatim
 
 
 def test_a_zoned_start_at_is_rejected() -> None:
@@ -113,6 +117,7 @@ async def test_a_delay_past_the_clock_is_rejected(tmp_path: Path) -> None:
                 "prompt": "look",
                 "every_seconds": 86400,
                 "once": True,
+                "verbatim": True,
                 "in_seconds": 10**18,
             }
         )
@@ -131,6 +136,35 @@ def test_a_job_cannot_be_an_instruction_to_create_another_job() -> None:
                     'Create the daily "mgm plus rate increase reminder" job so the '
                     "first reminder goes out on December 9, 2026."
                 ),
+                "every_seconds": 86400,
+            }
+        )
+
+
+def test_a_reminder_may_mention_scheduling_a_job() -> None:
+    """The sentence is texted, never run, so it cannot create anything."""
+    spec = parse_create(
+        {
+            "kind": "schedule",
+            "name": "interview",
+            "prompt": "Don't forget to schedule the job interview.",
+            "every_seconds": 86400,
+            "once": True,
+            "verbatim": True,
+            "in_seconds": 3600,
+        }
+    )
+
+    assert spec.verbatim
+
+
+def test_a_digest_that_asks_to_make_a_job_is_refused() -> None:
+    with pytest.raises(JobError, match="cannot create another job"):
+        parse_create(
+            {
+                "kind": "schedule",
+                "name": "december",
+                "prompt": "Make a job so the first reminder goes out on December 9, 2026.",
                 "every_seconds": 86400,
             }
         )
@@ -254,6 +288,7 @@ async def test_a_daily_reminder_can_start_fifty_days_out(
     created = store.find_job("jacob", name="pool cleaner")
     assert created is not None
     assert created.next_run_at == pytest.approx(start.timestamp())
+    assert created.every_seconds == 86400
     assert created.verbatim
     assert not created.once
     store.close()
@@ -398,6 +433,109 @@ async def test_a_relay_record_is_retried_without_sending_again(tmp_path: Path) -
     store.close()
 
 
+def _fail_once(store: Store, method: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row write raises the first time, as a locked or full disk would."""
+    real = getattr(store, method)
+    calls = {"n": 0}
+
+    def flaky(job_id: str) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreError("database is locked")
+        result: bool = real(job_id)
+        return result
+
+    monkeypatch.setattr(store, method, flaky)
+
+
+async def test_a_relay_whose_sent_mark_fails_is_not_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="message to spouse",
+            prompt="pick up milk",
+            once=True,
+            verbatim=True,
+            relay=True,
+            next_run_at=1.0,
+        )
+    )
+    _fail_once(store, "mark_relay_sent", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.relays == [("jacob", "pick up milk")]
+    assert channel.records == [("jacob", "pick up milk")]
+    assert len(channel.notified) == 1
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_relay_record_whose_mark_fails_is_not_written_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Her assistant would see the same message twice."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="message to spouse",
+            prompt="pick up milk",
+            once=True,
+            verbatim=True,
+            relay=True,
+            next_run_at=1.0,
+        )
+    )
+    _fail_once(store, "mark_relay_recorded", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    assert channel.notified == []
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.relays == [("jacob", "pick up milk")]
+    assert channel.records == [("jacob", "pick up milk")]
+    assert len(channel.notified) == 1
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_report_whose_delivered_mark_fails_is_not_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", next_run_at=1.0))
+    _fail_once(store, "mark_job_delivered", monkeypatch)
+    channel = _FakeJobChannel(JobOutcome(text="two new invoices", found=True, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    clock = {"now": 10.0}
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock["now"])
+
+    await runner._tick()
+    clock["now"] = 50.0
+    await runner._tick()
+
+    assert channel.sends == 1
+    assert channel.runs == 1
+    assert len(channel.persisted) == 1
+    kept = store.find_job("jacob", name="morning email")
+    assert kept is not None
+    assert kept.pending_text is None
+    store.close()
+
+
 async def test_a_relay_that_fails_before_send_retries(tmp_path: Path) -> None:
     store = Store(tmp_path / "assistai.sqlite")
     store.save_job(
@@ -475,6 +613,119 @@ async def test_a_repeating_reminder_texts_the_prompt_and_stays(tmp_path: Path) -
     store.close()
 
 
+async def test_a_tainted_reminder_is_stored_as_untrusted(tmp_path: Path) -> None:
+    """Otherwise the sentence outlives the page that wrote it as the assistant's own words."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="pool",
+            prompt="Call the bank at 555-0100.",
+            once=True,
+            verbatim=True,
+            tainted=True,
+            next_run_at=1.0,
+        )
+    )
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified == [("jacob", "Call the bank at 555-0100.", True)]
+    assert channel.persisted == [("Call the bank at 555-0100.", True)]
+    store.close()
+
+
+async def test_a_tainted_relay_confirmation_is_untrusted(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            name="message to spouse",
+            prompt="pick up milk",
+            once=True,
+            verbatim=True,
+            relay=True,
+            tainted=True,
+            next_run_at=1.0,
+        )
+    )
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified[0][2] is True
+    assert channel.persisted[0][1] is True
+    store.close()
+
+
+async def test_a_tainted_digest_report_is_untrusted(tmp_path: Path) -> None:
+    """The run fetched nothing new, but its prompt came from a tainted conversation."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", tainted=True, next_run_at=1.0))
+    channel = _FakeJobChannel(JobOutcome(text="two new invoices", found=True, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified[0][2] is True
+    assert channel.persisted[0][1] is True
+    store.close()
+
+
+async def test_a_tainted_job_failure_notice_is_untrusted(tmp_path: Path) -> None:
+    """The notice quotes the job name, which the tainted conversation chose."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", name="call 555 0100 now", tainted=True, next_run_at=1.0))
+    channel = _FakeJobChannel(RuntimeError("gmail down"))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert "call 555 0100 now" in channel.notified[0][1]
+    assert channel.notified[0][2] is True
+    assert channel.persisted[0][1] is True
+    store.close()
+
+
+async def test_a_tainted_watch_expiry_notice_is_untrusted(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            kind="watch",
+            ttl_seconds=60,
+            expires_at=5.0,
+            next_run_at=100.0,
+            tainted=True,
+        )
+    )
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified[0][2] is True
+    store.close()
+
+
+async def test_a_clean_digest_report_stays_trusted(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", next_run_at=1.0))
+    channel = _FakeJobChannel(JobOutcome(text="two new invoices", found=True, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified[0][2] is False
+    store.close()
+
+
 class _FakeJobChannel:
     def __init__(
         self,
@@ -493,6 +744,7 @@ class _FakeJobChannel:
         self.during_run = during_run
         self.during_send = during_send
         self.notified: list[tuple[str, str, bool]] = []
+        self.persisted: list[tuple[str, bool]] = []
         self.relays: list[tuple[str, str]] = []
         self.records: list[tuple[str, str]] = []
         self.runs = 0
@@ -504,6 +756,9 @@ class _FakeJobChannel:
     def can_notify_job(self, _agent: AgentSpec) -> bool:
         return self.can_notify
 
+    def holds_job(self, _job_id: str) -> bool:
+        return False
+
     async def run_job(self, agent: AgentSpec, job: Job) -> JobOutcome:
         self.runs += 1
         if self.during_run is not None:
@@ -512,9 +767,10 @@ class _FakeJobChannel:
             raise self.outcome
         return self.outcome
 
-    async def persist_job_report(self, _agent: AgentSpec, _text: str, *, untrusted: bool) -> bool:
-        _ = untrusted
+    async def persist_job_report(self, _agent: AgentSpec, text: str, *, untrusted: bool) -> bool:
         self.persists += 1
+        if self.persist_ok:
+            self.persisted.append((text, untrusted))
         return self.persist_ok
 
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
@@ -1199,6 +1455,99 @@ async def test_confirm_creates_a_job_that_survives_reopen(tmp_path: Path) -> Non
     reopened.close()
 
 
+async def test_a_job_confirmed_in_a_tainted_conversation_remembers_it(tmp_path: Path) -> None:
+    """The mail that shaped the prompt may age out before yes. The row must still say so."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_history(
+        "jacob",
+        [Message(role="user", content="[relay] read this", untrusted=True, created_at=time.time())],
+    )
+    first = client_for(
+        _job_then_text(
+            {
+                "kind": "schedule",
+                "name": "morning email",
+                "prompt": "summarize important mail",
+                "every_seconds": 86400,
+            }
+        )
+    )
+    channel = channel_for(
+        tmp_path,
+        FakeSignal(),
+        first,
+        jacob_tools=("job_create",),
+        store=store,
+    )
+    await channel.handle(inbound(text="check email every morning"))
+    await first.aclose()
+    preview = store.load_history("jacob")[-1]
+    store.save_history("jacob", [])
+    channel._histories.pop("jacob", None)
+
+    await channel.handle(inbound(text="yes"))
+
+    found = store.find_job("jacob", name="morning email")
+    assert found is not None
+    assert found.tainted
+    # Both quote the stored prompt, which the outside text may have written.
+    assert "summarize important mail" in (preview.content or "")
+    assert preview.untrusted
+    summary = store.load_history("jacob")[-1]
+    assert summary.role == "assistant"
+    assert summary.untrusted
+    store.close()
+
+
+async def test_a_reminder_confirmed_by_yes_waits_for_the_summary(tmp_path: Path) -> None:
+    """A due reminder saved at yes must not reach the phone ahead of the confirmation."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_history(
+        "jacob",
+        [Message(role="user", content="[relay] read this", untrusted=True, created_at=time.time())],
+    )
+    first = client_for(
+        _job_then_text(
+            {
+                "kind": "schedule",
+                "name": "pool",
+                "prompt": "Put the cleaner in the pool.",
+                "every_seconds": 86400,
+                "once": True,
+                "verbatim": True,
+                "in_seconds": 60,
+            }
+        )
+    )
+    held: list[bool] = []
+
+    class _WatchingSignal(FakeSignal):
+        async def send(self, recipient: str, text: str) -> None:
+            saved = store.find_job("jacob", name="pool")
+            if saved is not None:
+                held.append(channel.holds_job(saved.id))
+            await super().send(recipient, text)
+
+    channel = channel_for(
+        tmp_path,
+        _WatchingSignal(),
+        first,
+        jacob_tools=("job_create",),
+        store=store,
+    )
+    await channel.handle(inbound(text="remind me about the pool"))
+    await first.aclose()
+    assert store.find_job("jacob", name="pool") is None
+
+    await channel.handle(inbound(text="yes"))
+
+    saved = store.find_job("jacob", name="pool")
+    assert saved is not None
+    assert held == [True]
+    assert not channel.holds_job(saved.id)
+    store.close()
+
+
 async def test_cancel_stops_the_job(tmp_path: Path) -> None:
     store = Store(tmp_path / "assistai.sqlite")
     store.save_job(_job(next_run_at=9_999_999))
@@ -1555,6 +1904,94 @@ async def test_a_digest_that_ignores_listed_mail_is_not_an_empty_report(tmp_path
             ),
             _none_after_mail,
             _none_after_mail,
+        )
+    )
+    jacob = agent("jacob", "+15555550101", tools=("mail_inbox",))
+    home = household(jacob, agent("spouse", "+15555550102"))
+    channel = channel_for(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+
+    outcome = await channel.run_job(jacob, _job(next_run_at=1.0, prompt="Summarize unread mail."))
+
+    assert not outcome.found
+    assert not outcome.checked
+    await fireworks.aclose()
+    store.close()
+
+
+async def test_a_watch_that_sees_other_mail_stays_quiet(tmp_path: Path) -> None:
+    """Waiting for one sender, the inbox holds other mail. That is a quiet run, not a failure."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    catalog.bind(
+        "mail_inbox",
+        lambda _arguments: json.dumps(
+            {"inbox_unread": 4, "messages": [{"id": "m1", "subject": "Amazon"}]}
+        ),
+    )
+    handler, seen = recorded(
+        sequence(
+            completion_stream(
+                tool_event(call_id="c1", name="mail_inbox", arguments="{}", finish="tool_calls")
+            ),
+            completion_stream(text_event("NONE", finish="stop")),
+        )
+    )
+    fireworks = client_for(handler)
+    jacob = agent("jacob", "+15555550101", tools=("mail_inbox",))
+    home = household(jacob, agent("spouse", "+15555550102"))
+    channel = channel_for(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+    watch = _job(
+        kind="watch",
+        ttl_seconds=86400,
+        expires_at=90000.0,
+        next_run_at=1.0,
+        prompt="Tell me if mail from the IRS arrives.",
+    )
+
+    outcome = await channel.run_job(jacob, watch)
+
+    assert not outcome.found
+    assert outcome.checked
+    assert len(seen) == 2
+    await fireworks.aclose()
+    store.close()
+
+
+async def test_a_failed_inbox_is_not_an_empty_report(tmp_path: Path) -> None:
+    """An expired token is a failure the owner hears about, not "Nothing to report."."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    catalog.bind(
+        "mail_inbox",
+        lambda _arguments: json.dumps(
+            {"error": "tool_failed", "name": "mail_inbox", "message": "gmail down"}
+        ),
+    )
+
+    def _none(_request: httpx.Request) -> httpx.Response:
+        return completion_stream(text_event("NONE", finish="stop"))
+
+    fireworks = client_for(
+        sequence(
+            completion_stream(
+                tool_event(call_id="c1", name="mail_inbox", arguments="{}", finish="tool_calls")
+            ),
+            _none,
+            _none,
         )
     )
     jacob = agent("jacob", "+15555550101", tools=("mail_inbox",))

@@ -197,36 +197,60 @@ stored in SQLite and inspectable in conversation.
 
 Jobs are **report-only**. A job may read — mail, calendar, the web — and it
 messages the owner with what it found. It never files, drafts, writes, or
-relays, because nobody is present to approve a staged action at 7am. If a
+writes a relay, because nobody is present to approve a staged action at 7am.
+A relay confirmed for later is a job row too, but the runner only sends the
+stored bytes; no model runs for it. If a
 digest suggests filing, the user stages that from their reply, where they can
 see the list.
 
 A job runs as one agent, with that agent's ACL and that person's credentials.
 Failures (auth, network, tool error) message the owner; there is no silent
 skip. An empty schedule run still messages, because the person asked for a
-check at that time. A run that answers without looking is a failed check,
-not an empty inbox; it is asked to look once more, and then the owner is
-told the check failed. An empty watch stays quiet. A watch without a TTL is
-rejected at creation.
+check at that time. A run that answers without looking, or whose only look
+returned a tool error, is a failed check, not an empty inbox; it is asked to
+look once more, and then the owner is told the check failed. A schedule
+whose inbox listed mail and still answered nothing gets the same second
+look. A watch that looked and found nothing it was waiting for stays quiet,
+even when the inbox held other mail. A watch without a TTL is rejected at
+creation.
 
 A reminder sets `verbatim`. The stored prompt is the Signal text, and the
-model is not called. It is saved when asked. A yes is not required, including
-when the conversation is already tainted, because that yes is what dropped
-the reminder. A delay is `in_seconds`, added to the server clock. A named
+model is not called. In a clean conversation it is saved when asked, with no
+yes, because that yes is what dropped the reminder. In a tainted one it
+stages like any other job: the outside text could have written the
+sentence ([decision 0001](decisions/0001-reminders-stage-when-tainted.md)).
+The broker binds the conversation's taint next to the acting agent while a
+handler runs, and a confirm runs with the proposal's taint too. Each job
+row stores that as `tainted`. The reminder text, the relay confirmation,
+the digest report, and the failure and expiry notices of a tainted job are
+stored untrusted, and so are a tainted turn's proposal preview and the
+summary after its yes, so none of them can outlive the page that shaped
+them as the assistant's own words. A
+delay is `in_seconds`, added to the server clock. A named
 `start_at` is refused unless `get_time` ran in that same turn, and it has
-no timezone suffix. The Signal reply states the time the server stored and
-the name to cancel. A turn that fails after the save cancels that reminder.
-`once` cancels the job after that send. `every_seconds` is the gap after
+no timezone suffix. The Signal reply starts with the time the server stored
+and the name to cancel, then the rest of the model's answer; the tool result
+tells the model not to restate the time, and an answer that names any other
+clock time is dropped. A turn that fails after the save cancels that
+reminder, and the runner skips a reminder until the turn or the yes that
+saved it has ended, so it cannot reach the phone before that reply.
+`once` cancels the job after that send, and it has to say `verbatim` true
+or false; a default would turn a one-time digest into a text that skips the
+yes. `every_seconds` is the gap after
 the first run, at least 60 seconds, with no maximum. Nothing is sent before
 that first run. A reminder has to name it, with `in_seconds` or `start_at`.
-A job cannot be an instruction to create another job. A watch cannot be a
-reminder. A digest, which writes its own report, still waits for a yes. A
+A job cannot be an instruction to create another job; that check applies to
+digests, because a reminder's sentence is texted and never run. A watch
+cannot be a reminder. A digest, which writes its own report, still waits for a yes. A
 message to the other person is a relay, not a reminder. Yes stores the text.
 A later time sends those bytes and records them for the recipient. The
 sender is told when it has gone out, and only after her assistant's
 record of the message is stored. A failed record is retried without
 sending the text again. The row records that the phone already has the
-message, and that the record was written. A second message whose name is
+message, and that the record was written. The runner also remembers each
+relay send, relay record, and report send in memory until its row write
+sticks, so a failed write is retried instead of the message; only a
+restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
 
@@ -326,9 +350,10 @@ would quietly move the parser back in-process.
 
 Relay is not a free `message:other_peer` sink. The sender's assistant drafts
 the message. A critique replaces that draft. Delivery is: confirm the draft
-on screen → Signal sends those bytes → append a record to the recipient's
-history so their assistant knows who sent it and what it said. Nothing is
-rewritten between confirm and send. The injected record is untrusted on her side:
+on screen, then Signal sends those bytes, at the yes or at the stored time,
+then a record goes into the recipient's history so their assistant knows
+who sent it and what it said. Nothing is rewritten between confirm and
+send. The injected record is untrusted on her side:
 confirmation authorized the delivery to her phone, not her assistant's later
 tool use.
 

@@ -30,6 +30,8 @@ def main() -> None:
         help="roster whose first agent supplies the default tool list",
     )
     args = parser.parse_args()
+    if args.trials < 1:
+        parser.error("--trials must be at least 1")
     sys.exit(asyncio.run(_run(args)))
 
 

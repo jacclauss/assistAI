@@ -25,4 +25,4 @@ What gets easier, what gets harder, which docs and tests changed.
 
 | # | Decision |
 | --- | --- |
-| — | none yet |
+| [0001](0001-reminders-stage-when-tainted.md) | A reminder waits for a yes when the conversation is tainted |

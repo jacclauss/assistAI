@@ -1,5 +1,33 @@
 # Release notes
 
+## 0.1.8 — 24 October 2026
+
+Fixes from a review of the reminder and later-message work.
+
+- A reminder waits for a yes while the conversation holds outside text: a
+  web page, an email, a calendar entry, a list, or a message from the other
+  person. That text could have written the sentence. Otherwise a reminder
+  still saves with no yes.
+- A daily mail digest keeps outside text in the conversation, so with one
+  running, most reminders will wait for a yes.
+- A one-time job has to say whether it is a reminder or a one-time report.
+  A one-time mail check no longer skips the yes as if it were a reminder.
+- A watch that sees unrelated mail stays quiet. A mail check whose inbox
+  call failed says the check failed, not that there is nothing to report.
+- Asking for a reminder and a question in one message answers both. If the
+  assistant's answer names a different time from the one saved, only the
+  saved time is sent.
+- A reminder cannot arrive before the reply that confirms it, including one
+  saved by a yes.
+- A database hiccup after a send no longer sends, records, or reports the
+  same message twice.
+- A reminder may mention scheduling a job interview. A report that asks to
+  make another job is still refused.
+- Asking to archive mail calls the filing tool in that same turn. The yes
+  is the reply to that stored list, not a question the assistant asks first.
+- "Every morning" with no hour is a daily mail check. It does not ask what
+  time.
+
 ## 0.1.7 — 22 October 2026
 
 A reminder that starts on a later day does not text on the nights before it.
@@ -99,8 +127,8 @@ observation. It started with this release.
 - Keep shared lists and private lists. A private list stays with its owner
   until a separate yes publishes it. The other person gets the same answer as
   for a list that was never created.
-- Relay a message. A yes sends the stored draft. The recipient's assistant
-  sees who it was from.
+- Relay a message. A yes sends the stored draft, now or at the time you
+  chose. The recipient's assistant sees who it was from.
 - Schedule a job or a watch from Signal, and cancel it there. A schedule
   always texts. A watch stays quiet unless it finds something, fails, or
   expires.

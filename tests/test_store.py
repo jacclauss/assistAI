@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -704,6 +705,87 @@ def test_schema_v12_gains_relay_recorded(tmp_path: Path) -> None:
     assert loaded.relay_sent is True
     assert loaded.relay_recorded is False
     store.close()
+
+
+_V12_JOB_COLUMNS = """
+    id TEXT PRIMARY KEY NOT NULL,
+    agent TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    every_seconds INTEGER NOT NULL,
+    ttl_seconds INTEGER,
+    created_at REAL NOT NULL,
+    expires_at REAL,
+    next_run_at REAL NOT NULL,
+    last_run_at REAL,
+    cancelled_at REAL,
+    pending_text TEXT,
+    pending_untrusted INTEGER NOT NULL DEFAULT 0,
+    pending_after TEXT,
+    pending_delivered INTEGER NOT NULL DEFAULT 0,
+    once INTEGER NOT NULL DEFAULT 0,
+    verbatim INTEGER NOT NULL DEFAULT 0,
+    relay INTEGER NOT NULL DEFAULT 0,
+    relay_sent INTEGER NOT NULL DEFAULT 0
+"""
+
+
+def _old_jobs_db(path: Path, *, version: int, columns: str) -> None:
+    """A database at ``version`` holding one morning-email row written by that build."""
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE TABLE jobs ({columns})")
+    conn.execute(
+        "INSERT INTO jobs (id, agent, kind, name, prompt, every_seconds, created_at, "
+        "next_run_at) VALUES ('jabcd1234', 'jacob', 'schedule', 'morning email', "
+        "'summarize unread mail', 86400, 1.0, 10.0)"
+    )
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    conn.close()
+
+
+def test_schema_v12_keeps_an_existing_job_and_defaults_it_off(tmp_path: Path) -> None:
+    """A wrong default would turn last month's digest into a relay or a raw text."""
+    path = tmp_path / "assistai.sqlite"
+    _old_jobs_db(path, version=12, columns=_V12_JOB_COLUMNS)
+
+    store = Store(path)
+    loaded = store.find_job("jacob", name="morning email")
+
+    assert loaded is not None
+    assert loaded.prompt == "summarize unread mail"
+    assert loaded.next_run_at == 10.0
+    assert not loaded.once
+    assert not loaded.verbatim
+    assert not loaded.relay
+    assert not loaded.relay_sent
+    assert not loaded.relay_recorded
+    assert not loaded.tainted
+    store.close()
+
+
+def test_schema_v13_gains_job_taint_and_keeps_rows(tmp_path: Path) -> None:
+    """Rows from before decision 0001 were treated as trusted, and still are."""
+    path = tmp_path / "assistai.sqlite"
+    columns = _V12_JOB_COLUMNS + ",\n    relay_recorded INTEGER NOT NULL DEFAULT 0\n"
+    _old_jobs_db(path, version=13, columns=columns)
+
+    store = Store(path)
+    loaded = store.find_job("jacob", name="morning email")
+
+    assert loaded is not None
+    assert loaded.prompt == "summarize unread mail"
+    assert not loaded.tainted
+    # Reading falls back when the column is missing; a save does not.
+    store.save_job(replace(loaded, id="jnew00001", name="tainted one", tainted=True))
+    saved = store.find_job("jacob", name="tainted one")
+    assert saved is not None
+    assert saved.tainted
+    store.close()
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
+    conn.close()
 
 
 def test_active_job_names_are_unique(tmp_path: Path) -> None:

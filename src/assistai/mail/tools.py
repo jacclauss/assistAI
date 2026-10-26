@@ -65,7 +65,9 @@ MAIL_FILE_SPEC = ToolSpec(
     name=MAIL_FILE,
     description=(
         "Propose one batch change to this person's Gmail: archive, star, "
-        "unstar, trash, or move. Nothing changes until they reply yes. "
+        "unstar, trash, or move. Call this in the same turn you know which "
+        "messages. Do not ask them to confirm first. Nothing changes until "
+        "they reply yes to the stored proposal. "
         "Pass the id, subject, and from from mail_inbox for every message. "
         "move also needs the existing label name. One confirmation covers "
         "the whole batch. Do not send mail or delete it permanently."

@@ -69,7 +69,8 @@ without pasting.
   bot ("stop the morning email check").
 - Research: "look this up" via search + fetch, cited, in Signal. In MVP.
   Headless Chromium is not.
-- Relay: confirm → verbatim Signal send → record in the recipient's history.
+- Relay: confirm, then a verbatim Signal send now or at the stored time, then
+  a record in the recipient's history.
 - Update awareness: flag stale pins, apply nothing.
 - Raspberry Pi as the always-on host.
 
@@ -141,7 +142,11 @@ Two kinds, both brokered, both inspectable in conversation:
   user-facing. A run that answers without looking is a failed check, not an
   empty inbox. A background watch that finds nothing stays quiet.
 - A reminder texts the stored sentence, with no job label around it. Saying
-  "remind me" saves it. There is no yes. A delay is counted by the server. A named clock time is refused
+  "remind me" saves it with no yes, unless the conversation already holds
+  mail, web, calendar, list, or relay text. Then it waits for a yes like any
+  other job, and whatever the job later writes into history keeps that
+  untrusted label ([decision 0001](decisions/0001-reminders-stage-when-tainted.md)).
+  A delay is counted by the server. A named clock time is refused
   until the assistant has read the clock in that turn, and it is a local
   date and time with no timezone suffix. The reply names the reminder so it
   can be cancelled. It can fire once, or repeat until cancelled. The first
@@ -150,8 +155,10 @@ Two kinds, both brokered, both inspectable in conversation:
   first run. A job cannot be an instruction to create another job.
 - **Jobs report; they do not act.** A job may read mail, calendar, and the web,
   and it messages the owner with what it found. It never files, drafts, writes,
-  or relays, because nobody is present at 7am to approve a staged action. If
-  the digest suggests filing, the user stages that from their reply.
+  or writes a relay, because nobody is present at 7am to approve a staged
+  action. A relay the person confirmed for later is delivered by the job
+  runner with its stored text; nothing in it is chosen at send time. If the
+  digest suggests filing, the user stages that from their reply.
 - Jobs survive a restart. A schedule set last month still fires after a reboot.
 
 ### Memory
@@ -180,7 +187,8 @@ agent loop.
    after that record is stored.
 4. Gateway sends those bytes and attachments to the recipient's number, labeled
    so it is obviously a relay (`From Jacob:`, not her assistant speaking).
-5. Recipient reads it on the phone immediately (no extra LLM rewrite).
+5. Recipient reads it on the phone when it is sent, at the yes or at the
+   stored time (no extra LLM rewrite).
 6. Gateway appends a structured record to the recipient agent's history:
    who sent it, the body, and enough about the attachment (type, name,
    extracted text or a short description) that her assistant can talk about it.

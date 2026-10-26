@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -106,6 +107,7 @@ class SignalChannel:
             broker.bind(name, handler)
         broker.bind("get_time", bind_clock(self._settings.timezone))
         self._histories: dict[str, list[Message]] = {}
+        self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}
         self._history_locks: dict[str, asyncio.Lock] = {}
         self._uuid_numbers: dict[str, str] = {}
@@ -244,11 +246,13 @@ class SignalChannel:
                     text = last_assistant_text(scratch) or ""
                     # One more turn. The mail job said NONE without calling
                     # the inbox, and that became "Nothing to report."
-                    if is_nothing(text) and not empty_report_is_real(scratch, start=start):
+                    if is_nothing(text) and not empty_report_is_real(
+                        scratch, start=start, kind=job.kind
+                    ):
                         scratch.append(
                             Message(
                                 role="user",
-                                content=look_again_prompt(scratch, start=start),
+                                content=look_again_prompt(scratch, start=start, kind=job.kind),
                                 created_at=time.time(),
                             )
                         )
@@ -268,11 +272,20 @@ class SignalChannel:
                         text=text,
                         found=not nothing,
                         untrusted=surface.fetched_untrusted,
-                        checked=not nothing or empty_report_is_real(scratch, start=start),
+                        checked=not nothing
+                        or empty_report_is_real(scratch, start=start, kind=job.kind),
                     )
 
     def can_notify_job(self, agent: AgentSpec) -> bool:
         return self._job_sends.would_allow(agent.name)
+
+    def holds_job(self, job_id: str) -> bool:
+        """A reminder saved by a turn still running waits for that turn.
+
+        Otherwise it can reach the phone before the reply that confirms it,
+        or before a failed turn cancels it.
+        """
+        return any(job_id in surface.saved_job_ids for surface in self._open_turns)
 
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
         """Send a job report. History is persisted separately after delivery is recorded."""
@@ -351,71 +364,91 @@ class SignalChannel:
         if self._fireworks is None or self._manifest is None:
             await self._safe_send(inbound.sender, _NOT_CONFIGURED)
             return
-        async with self._history_lock(agent.name):
-            try:
-                messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
-                )
-            except StoreError:
-                log.exception("store.history_unreadable", agent=agent.name)
-                await self._safe_send(inbound.sender, _UNAVAILABLE)
-                return
-            # Taint carries across turns: untrusted text fetched last message is
-            # still in this history, so a privileged sink must stay refused.
-            surface: BoundSurface = self._broker.for_agent(agent, Scope.from_history(messages))
-            # A failed turn can leave an assistant tool-call with no result, which
-            # the provider rejects forever after. Roll the whole turn back instead.
-            baseline = len(messages)
-            messages.append(Message(role="user", content=inbound.text, created_at=time.time()))
-            try:
-                await run_turn(
-                    self._fireworks,
-                    self._manifest.primary,
-                    messages,
-                    surface,
-                    max_tool_rounds=self._settings.max_tool_rounds,
-                )
-            except AssistAIError:
-                log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
-                del messages[baseline:]
-                self._cancel_turn_jobs(surface)
-                await self._safe_send(inbound.sender, _UNAVAILABLE)
-                return
-            reply = last_assistant_text(messages)
-            if not reply:
-                reply = _UNAVAILABLE
-            if surface.saved_reminders:
-                # The model announced 12:44pm after saving that guess. The
-                # sentence here is the time the server stored.
-                reply = "\n".join(surface.saved_reminders)
-                for message in reversed(messages):
-                    if message.role == "assistant":
-                        message.content = reply
-                        break
-            staged = surface.take_staged()
-            proposal: Proposal | Literal["keep"] = "keep"
-            if staged:
-                now = time.time()
-                preview = format_proposal(staged, tainted=surface.tainted)
+        surface: BoundSurface | None = None
+        try:
+            async with self._history_lock(agent.name):
+                try:
+                    messages = self._history(
+                        agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    )
+                except StoreError:
+                    log.exception("store.history_unreadable", agent=agent.name)
+                    await self._safe_send(inbound.sender, _UNAVAILABLE)
+                    return
+                # Taint carries across turns: untrusted text fetched last message is
+                # still in this history, so a privileged sink must stay refused.
+                surface = self._broker.for_agent(agent, Scope.from_history(messages))
+                self._open_turns.append(surface)
+                # A failed turn can leave an assistant tool-call with no result, which
+                # the provider rejects forever after. Roll the whole turn back instead.
+                baseline = len(messages)
+                messages.append(Message(role="user", content=inbound.text, created_at=time.time()))
+                try:
+                    await run_turn(
+                        self._fireworks,
+                        self._manifest.primary,
+                        messages,
+                        surface,
+                        max_tool_rounds=self._settings.max_tool_rounds,
+                    )
+                except AssistAIError:
+                    log.exception("signal.turn_failed", sender=inbound.sender, agent=agent.name)
+                    del messages[baseline:]
+                    self._cancel_turn_jobs(surface)
+                    await self._safe_send(inbound.sender, _UNAVAILABLE)
+                    return
+                reply = last_assistant_text(messages)
                 if surface.saved_reminders:
-                    preview = reply + "\n\n" + preview
-                messages.append(Message(role="assistant", content=preview, created_at=now))
-                reply = preview
-                proposal = Proposal(
-                    agent=agent.name,
-                    calls=staged,
-                    tainted=surface.tainted,
-                    created_at=now,
-                    expires_at=now + self._settings.staging_ttl_seconds,
-                )
-            if not self._window_and_persist(agent.name, messages, proposal=proposal):
-                del messages[baseline:]
-                self._cancel_turn_jobs(surface)
+                    # The model announced 12:44pm after saving that guess, so the
+                    # time comes from the server's sentence. The rest of the answer
+                    # may cover other things the person asked in the same message.
+                    said = "\n".join(surface.saved_reminders)
+                    if reply and _names_another_time(reply, said):
+                        log.warning("signal.reminder_reply_dropped", agent=agent.name)
+                        reply = ""
+                    reply = f"{said}\n\n{reply}" if reply else said
+                    for message in reversed(messages):
+                        if message.role == "assistant":
+                            message.content = reply
+                            break
+                if not reply:
+                    reply = _UNAVAILABLE
+                staged = surface.take_staged()
+                proposal: Proposal | Literal["keep"] = "keep"
                 if staged:
-                    self._abandon_live_proposal(agent.name)
-                await self._safe_send(inbound.sender, _SAVE_FAILED)
-                return
-        await self._safe_send(inbound.sender, reply)
+                    now = time.time()
+                    preview = format_proposal(staged, tainted=surface.tainted)
+                    if surface.saved_reminders:
+                        preview = reply + "\n\n" + preview
+                    # The preview quotes staged prompts and relay bodies; in a
+                    # tainted turn the outside text may have written them.
+                    messages.append(
+                        Message(
+                            role="assistant",
+                            content=preview,
+                            untrusted=surface.tainted,
+                            created_at=now,
+                        )
+                    )
+                    reply = preview
+                    proposal = Proposal(
+                        agent=agent.name,
+                        calls=staged,
+                        tainted=surface.tainted,
+                        created_at=now,
+                        expires_at=now + self._settings.staging_ttl_seconds,
+                    )
+                if not self._window_and_persist(agent.name, messages, proposal=proposal):
+                    del messages[baseline:]
+                    self._cancel_turn_jobs(surface)
+                    if staged:
+                        self._abandon_live_proposal(agent.name)
+                    await self._safe_send(inbound.sender, _SAVE_FAILED)
+                    return
+            await self._safe_send(inbound.sender, reply)
+        finally:
+            if surface is not None:
+                self._open_turns.remove(surface)
 
     async def _handle_decision(self, inbound: InboundText, agent: AgentSpec) -> bool:
         """Confirm or discard a live proposal. False means this is a normal turn."""
@@ -465,31 +498,47 @@ class SignalChannel:
                 await self._safe_send(inbound.sender, _SAVE_FAILED)
                 return
             scope = Scope.from_history(messages)
+            # The page that shaped this proposal may have aged out of the
+            # window since. A job stored now still has to remember it.
+            scope.tainted = scope.tainted or pending.tainted
         surface: BoundSurface = self._broker.for_agent(agent, scope)
-        results: list[tuple[ToolCall, str]] = []
-        for call in pending.calls:
-            result = await surface.commit(call)
-            results.append((call, result.content))
-        now = time.time()
-        summary = format_executed(results)
-        async with self._history_lock(agent.name):
-            # Reload: a relay injected into this conversation while handlers
-            # ran must not be overwritten by a stale in-memory copy.
-            self._histories.pop(agent.name, None)
-            try:
-                messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+        self._open_turns.append(surface)
+        try:
+            results: list[tuple[ToolCall, str]] = []
+            for call in pending.calls:
+                result = await surface.commit(call)
+                results.append((call, result.content))
+            now = time.time()
+            summary = format_executed(results)
+            async with self._history_lock(agent.name):
+                # Reload: a relay injected into this conversation while handlers
+                # ran must not be overwritten by a stale in-memory copy.
+                self._histories.pop(agent.name, None)
+                try:
+                    messages = self._history(
+                        agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    )
+                except StoreError:
+                    log.error("store.save_failed_after_commit", agent=agent.name)
+                    await self._safe_send(inbound.sender, summary)
+                    return
+                messages.append(Message(role="user", content=inbound.text, created_at=now))
+                # The summary quotes the stored prompt or relay body, which
+                # the outside text may have written.
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=summary,
+                        untrusted=scope.tainted,
+                        created_at=now,
+                    )
                 )
-            except StoreError:
-                log.error("store.save_failed_after_commit", agent=agent.name)
-                await self._safe_send(inbound.sender, summary)
-                return
-            messages.append(Message(role="user", content=inbound.text, created_at=now))
-            messages.append(Message(role="assistant", content=summary, created_at=now))
-            if not self._window_and_persist(agent.name, messages):
-                log.error("store.save_failed_after_commit", agent=agent.name)
-        log.info("staging.committed", agent=agent.name, calls=len(pending.calls))
-        await self._safe_send(inbound.sender, summary)
+                if not self._window_and_persist(agent.name, messages):
+                    log.error("store.save_failed_after_commit", agent=agent.name)
+            log.info("staging.committed", agent=agent.name, calls=len(pending.calls))
+            await self._safe_send(inbound.sender, summary)
+        finally:
+            self._open_turns.remove(surface)
 
     async def _reject_proposal(self, inbound: InboundText, agent: AgentSpec) -> None:
         async with self._history_lock(agent.name):
@@ -682,3 +731,24 @@ def _frame_summary(payload: object) -> dict[str, object]:
         "has_receipt": "receiptMessage" in envelope,
         "has_typing": "typingMessage" in envelope,
     }
+
+
+_CLOCK_TIME = re.compile(
+    r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\b\.?|\b\d{1,2}:\d{2}\b"
+    r"|\b\d{1,2}\s*o'?clock\b|\bnoon\b|\bmidnight\b",
+    re.IGNORECASE,
+)
+
+
+def _names_another_time(reply: str, said: str) -> bool:
+    """True when the model's text states a clock time the server did not store.
+
+    The 12:44pm incident: the phone must never carry a time that disagrees
+    with the saved one, so a reply that names any other time is dropped.
+    """
+    stored = {_clock_key(match) for match in _CLOCK_TIME.findall(said)}
+    return any(_clock_key(match) not in stored for match in _CLOCK_TIME.findall(reply))
+
+
+def _clock_key(text: str) -> str:
+    return re.sub(r"[\s.]", "", text).lower()
