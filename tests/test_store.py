@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -776,6 +777,11 @@ def test_schema_v13_gains_job_taint_and_keeps_rows(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.prompt == "summarize unread mail"
     assert not loaded.tainted
+    # Reading falls back when the column is missing; a save does not.
+    store.save_job(replace(loaded, id="jnew00001", name="tainted one", tainted=True))
+    saved = store.find_job("jacob", name="tainted one")
+    assert saved is not None
+    assert saved.tainted
     store.close()
     conn = sqlite3.connect(path)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14

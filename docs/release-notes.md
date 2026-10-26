@@ -4,15 +4,21 @@
 
 Fixes from a review of the reminder and later-message work.
 
-- A reminder asked for after the assistant read a web page, an email, a
-  calendar entry, or a list waits for a yes. That text could have written
-  the sentence. Otherwise a reminder still saves with no yes.
+- A reminder waits for a yes while the conversation holds outside text: a
+  web page, an email, a calendar entry, a list, or a message from the other
+  person. That text could have written the sentence. Otherwise a reminder
+  still saves with no yes.
+- A daily mail digest keeps outside text in the conversation, so with one
+  running, most reminders will wait for a yes.
 - A one-time job has to say whether it is a reminder or a one-time report.
   A one-time mail check no longer skips the yes as if it were a reminder.
 - A watch that sees unrelated mail stays quiet. A mail check whose inbox
   call failed says the check failed, not that there is nothing to report.
-- Asking for a reminder and a question in one message answers both.
-- A reminder cannot arrive before the reply that confirms it.
+- Asking for a reminder and a question in one message answers both. If the
+  assistant's answer names a different time from the one saved, only the
+  saved time is sent.
+- A reminder cannot arrive before the reply that confirms it, including one
+  saved by a yes.
 - A database hiccup after a send no longer sends, records, or reports the
   same message twice.
 - A reminder may mention scheduling a job interview. A report that asks to

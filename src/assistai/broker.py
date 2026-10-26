@@ -359,7 +359,10 @@ class BoundSurface:
             )
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
-        return await self._run(call, self._catalog.meta(call.name))
+        result = await self._run(call, self._catalog.meta(call.name))
+        if call.name == JOB_CREATE:
+            _note_saved_reminder(self.saved_reminders, self.saved_job_ids, result.content)
+        return result
 
     async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
         with using_agent(self._agent, tainted=self._scope.tainted):

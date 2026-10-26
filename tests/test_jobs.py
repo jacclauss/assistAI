@@ -676,6 +676,43 @@ async def test_a_tainted_digest_report_is_untrusted(tmp_path: Path) -> None:
     store.close()
 
 
+async def test_a_tainted_job_failure_notice_is_untrusted(tmp_path: Path) -> None:
+    """The notice quotes the job name, which the tainted conversation chose."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_job(kind="schedule", name="call 555 0100 now", tainted=True, next_run_at=1.0))
+    channel = _FakeJobChannel(RuntimeError("gmail down"))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert "call 555 0100 now" in channel.notified[0][1]
+    assert channel.notified[0][2] is True
+    assert channel.persisted[0][1] is True
+    store.close()
+
+
+async def test_a_tainted_watch_expiry_notice_is_untrusted(tmp_path: Path) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(
+        _job(
+            kind="watch",
+            ttl_seconds=60,
+            expires_at=5.0,
+            next_run_at=100.0,
+            tainted=True,
+        )
+    )
+    channel = _FakeJobChannel(JobOutcome(text="NONE", found=False, untrusted=False))
+    home = household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+    runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: 10.0)
+
+    await runner._tick()
+
+    assert channel.notified[0][2] is True
+    store.close()
+
+
 async def test_a_clean_digest_report_stays_trusted(tmp_path: Path) -> None:
     store = Store(tmp_path / "assistai.sqlite")
     store.save_job(_job(kind="schedule", next_run_at=1.0))
@@ -1444,6 +1481,7 @@ async def test_a_job_confirmed_in_a_tainted_conversation_remembers_it(tmp_path: 
     )
     await channel.handle(inbound(text="check email every morning"))
     await first.aclose()
+    preview = store.load_history("jacob")[-1]
     store.save_history("jacob", [])
     channel._histories.pop("jacob", None)
 
@@ -1452,6 +1490,61 @@ async def test_a_job_confirmed_in_a_tainted_conversation_remembers_it(tmp_path: 
     found = store.find_job("jacob", name="morning email")
     assert found is not None
     assert found.tainted
+    # Both quote the stored prompt, which the outside text may have written.
+    assert "summarize important mail" in (preview.content or "")
+    assert preview.untrusted
+    summary = store.load_history("jacob")[-1]
+    assert summary.role == "assistant"
+    assert summary.untrusted
+    store.close()
+
+
+async def test_a_reminder_confirmed_by_yes_waits_for_the_summary(tmp_path: Path) -> None:
+    """A due reminder saved at yes must not reach the phone ahead of the confirmation."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_history(
+        "jacob",
+        [Message(role="user", content="[relay] read this", untrusted=True, created_at=time.time())],
+    )
+    first = client_for(
+        _job_then_text(
+            {
+                "kind": "schedule",
+                "name": "pool",
+                "prompt": "Put the cleaner in the pool.",
+                "every_seconds": 86400,
+                "once": True,
+                "verbatim": True,
+                "in_seconds": 60,
+            }
+        )
+    )
+    held: list[bool] = []
+
+    class _WatchingSignal(FakeSignal):
+        async def send(self, recipient: str, text: str) -> None:
+            saved = store.find_job("jacob", name="pool")
+            if saved is not None:
+                held.append(channel.holds_job(saved.id))
+            await super().send(recipient, text)
+
+    channel = channel_for(
+        tmp_path,
+        _WatchingSignal(),
+        first,
+        jacob_tools=("job_create",),
+        store=store,
+    )
+    await channel.handle(inbound(text="remind me about the pool"))
+    await first.aclose()
+    assert store.find_job("jacob", name="pool") is None
+
+    await channel.handle(inbound(text="yes"))
+
+    saved = store.find_job("jacob", name="pool")
+    assert saved is not None
+    assert held == [True]
+    assert not channel.holds_job(saved.id)
     store.close()
 
 

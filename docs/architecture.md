@@ -222,14 +222,17 @@ sentence ([decision 0001](decisions/0001-reminders-stage-when-tainted.md)).
 The broker binds the conversation's taint next to the acting agent while a
 handler runs, and a confirm runs with the proposal's taint too. Each job
 row stores that as `tainted`. The reminder text, the relay confirmation,
-and the digest report of a tainted job are stored untrusted, so they
-cannot outlive the page that shaped them as the assistant's own words. A
+the digest report, and the failure and expiry notices of a tainted job are
+stored untrusted, and so are a tainted turn's proposal preview and the
+summary after its yes, so none of them can outlive the page that shaped
+them as the assistant's own words. A
 delay is `in_seconds`, added to the server clock. A named
 `start_at` is refused unless `get_time` ran in that same turn, and it has
 no timezone suffix. The Signal reply starts with the time the server stored
 and the name to cancel, then the rest of the model's answer; the tool result
-tells the model not to restate the time. A turn that fails after the save
-cancels that reminder, and the runner skips a reminder until the turn that
+tells the model not to restate the time, and an answer that names any other
+clock time is dropped. A turn that fails after the save cancels that
+reminder, and the runner skips a reminder until the turn or the yes that
 saved it has ended, so it cannot reach the phone before that reply.
 `once` cancels the job after that send, and it has to say `verbatim` true
 or false; a default would turn a one-time digest into a text that skips the

@@ -627,7 +627,7 @@ async def test_the_sent_reminder_time_is_the_servers(
                     finish="tool_calls",
                 )
             ),
-            completion_stream(text_event("Done.", finish="stop")),
+            completion_stream(text_event("I will text you at 12:44 PM.", finish="stop")),
         )
     )
     signal = FakeSignal()
@@ -644,8 +644,7 @@ async def test_the_sent_reminder_time_is_the_servers(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "The new reminder system is working."\n'
-            "Name: check\n\nDone.",
+            'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check',
         )
     ]
     await fireworks.aclose()

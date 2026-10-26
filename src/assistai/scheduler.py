@@ -200,7 +200,8 @@ class JobRunner:
                 job,
                 agent,
                 format_expire_message(job.name),
-                untrusted=False,
+                # The name was chosen in the conversation that made the job.
+                untrusted=job.tainted,
                 after="cancel",
             )
             return
@@ -227,7 +228,7 @@ class JobRunner:
                 job,
                 agent,
                 format_fail_message(job.name),
-                untrusted=False,
+                untrusted=job.tainted,
                 after=after,
             )
             return
@@ -240,7 +241,7 @@ class JobRunner:
                 job,
                 agent,
                 format_fail_message(job.name),
-                untrusted=False,
+                untrusted=job.tainted,
                 after=after,
             )
             return
@@ -261,7 +262,7 @@ class JobRunner:
                 job,
                 agent,
                 format_expire_message(job.name),
-                untrusted=False,
+                untrusted=job.tainted,
                 after="cancel",
             )
             return
