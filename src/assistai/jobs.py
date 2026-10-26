@@ -86,6 +86,8 @@ JOB_CREATE_SPEC = ToolSpec(
         "start_at is a named local time, ISO-8601 without a timezone suffix "
         "(2026-12-07T08:00:00). Call get_time in this same turn before using it. "
         "A start_at without that call is rejected. "
+        "A daily check with no named hour omits start_at and does not ask what time. "
+        "If this call is rejected, call get_time if you have not, then call job_create again. "
         "A reminder that begins in 50 days and then repeats every 10 days is "
         "in_seconds 4320000 and every_seconds 864000. "
         "once true sends a single message and then the job ends. "

@@ -23,6 +23,10 @@ Fixes from a review of the reminder and later-message work.
   same message twice.
 - A reminder may mention scheduling a job interview. A report that asks to
   make another job is still refused.
+- Asking to archive mail calls the filing tool in that same turn. The yes
+  is the reply to that stored list, not a question the assistant asks first.
+- "Every morning" with no hour is a daily mail check. It does not ask what
+  time.
 
 ## 0.1.7 — 22 October 2026
 

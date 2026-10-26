@@ -47,6 +47,8 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert "in_seconds 120" in prompt
     assert "it was wrong" in prompt
     assert "inbox_unread" in prompt
+    assert "Do not ask them to reply yes in your own text" in prompt
+    assert "every morning" in prompt
     assert household.agent_for_signal_dm("+15555550199") is None
     assert jacob.tools == (
         "get_time",
