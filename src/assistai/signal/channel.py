@@ -733,7 +733,11 @@ def _frame_summary(payload: object) -> dict[str, object]:
     }
 
 
-_CLOCK_TIME = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\b\.?|\b\d{1,2}:\d{2}\b", re.IGNORECASE)
+_CLOCK_TIME = re.compile(
+    r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\b\.?|\b\d{1,2}:\d{2}\b"
+    r"|\b\d{1,2}\s*o'?clock\b|\bnoon\b|\bmidnight\b",
+    re.IGNORECASE,
+)
 
 
 def _names_another_time(reply: str, said: str) -> bool:

@@ -650,6 +650,19 @@ async def test_the_sent_reminder_time_is_the_servers(
     await fireworks.aclose()
 
 
+@pytest.mark.parametrize(
+    "said",
+    ["I will text you at noon.", "See you at 9 o'clock.", "Set for 20:55.", "Done at 8:56pm."],
+)
+def test_a_reply_naming_another_time_is_caught(said: str) -> None:
+    from assistai.signal.channel import _names_another_time
+
+    stored = 'I will text you at 8:55 PM today: "It is working."\nName: check'
+
+    assert _names_another_time(said, stored)
+    assert not _names_another_time("Also, it is 8:55 PM then. Pickup is Tuesday.", stored)
+
+
 async def test_a_reminder_keeps_the_rest_of_the_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
