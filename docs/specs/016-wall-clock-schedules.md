@@ -1,18 +1,21 @@
 # 016 — Wall-clock schedules the server owns
 
-Status: draft
+Status: ready
 
 Implements: [prd.md § Jobs](../prd.md), [prd.md § Relay](../prd.md),
 [prd.md § Calendar](../prd.md), and the "Timezone for 'every morning at 7'"
 item in [prd.md § Open engineering](../prd.md).
+Decision: [0002](../decisions/0002-daily-repeats-keep-local-time.md).
 Audit: option B, findings C-1, C-2, C-3, C-7, C-11, X3-1, X3-3, X3-4, X3-5,
 X3-7, B-2, B-7, B-8, F-6.
 
 ## Outcome
 
 A daily job runs at the same local time every day, including across
-daylight saving, after a slow run, and after a retry. "Every morning" with
-no hour runs in the morning. Moving a job keeps its date and hour unless the
+daylight saving, after a slow run, and after a retry. A daily job cannot
+exist without a named local time: "every morning" with no hour gets "what
+time?" back, and nothing is saved or staged until the person names one.
+Moving a job keeps its date and hour unless the
 person asked to change them. The person names a time in the words they used
 ("tomorrow at 8", "Monday at 7:30", "December 7 at 9"). The server turns
 that into an instant with its own clock. Every time the person sees, in a
@@ -114,8 +117,8 @@ A new module holds every local-time rule. Nothing else calls `strftime`,
   and exits non-zero. The validator for a set value is unchanged. The REPL
   keeps working without it. `.env.example` uncomments
   `ASSISTAI_TIMEZONE=America/Chicago`. This closes B-8.
-- New `Settings.job_default_time: str = "07:00"` (`ASSISTAI_JOB_DEFAULT_TIME`),
-  validated as HH:MM. The value is open question 1.
+- There is no default time of day for a job. A whole-day repeat always
+  carries the hour the person named.
 - At start, the gateway logs `clock.zone` with the zone name, the local
   time, and the current UTC offset.
 - Before the channel and the job runner start, `Gateway._wait_for_clock`
@@ -214,7 +217,8 @@ their place:
   minute in total. Only for a duration the person said ("in two hours",
   "in 50 days").
 - `every_days`: whole days between runs. The run keeps its local time
-  across daylight saving. 7 is weekly.
+  across daylight saving, so the gap is 23 or 25 hours on a DST day
+  (decision 0002). 7 is weekly. It needs `at`.
 - `every_minutes`: elapsed minutes between runs, at least 1. A multiple of
   1440 is refused with "use every_days so it keeps its local time".
 - `once`, `verbatim`, `ttl_seconds`, `name`, `prompt`, `kind`, and `body`
@@ -226,11 +230,27 @@ their place:
 - A repeating job has exactly one of `every_days` or `every_minutes`. A
   `once` job has neither and needs `at` or `delay`. A verbatim reminder
   still needs `at` or `delay`.
-- `every_days` with no `at` and no `delay` starts at the next
-  `job_default_time`. The 9:12 PM "every morning" request starts tomorrow
-  at 7:00 AM. This replaces the prompt sentence that produced C-2.
-- `every_days` with `delay` repeats at the local time of that first run.
+- `every_days` needs `at` with an `hour`. Without it, `parse_create`
+  raises `JobError("a daily or weekly job needs the time of day the person
+  named. Ask them what time, then call again with at")`. `every_days` with
+  `delay` and no `at` is refused the same way, because a delay names when
+  the first run is, not the hour it repeats at. This check is in the
+  parser, so it holds on every path:
+  - A digest stages only after `_staging_error` runs `parse_create`, so the
+    refused call is never stored as a proposal.
+  - A clean-conversation verbatim reminder runs its handler at once, and
+    the handler calls `parse_create` before `store.save_job`, so no row is
+    written.
+  - A relay goes through `parse_relay_when`, which calls `parse_create`.
+  - The refusal goes back to the model as a tool error. The prompt tells it
+    to ask the person what time and call nothing else. The person sees a
+    question, not a preview.
+  The 9:12 PM "every morning" request therefore saves nothing and gets
+  "What time each morning?" back. This closes C-2 in code, not in the
+  prompt: a daily job cannot be created without a named local time.
 - `every_minutes` with no first time starts one interval from now, as today.
+  A multiple of 1440 is refused, so `every_minutes` cannot stand in for a
+  daily job with no hour.
 - `parse_relay_when` uses the same parser. A relay with no `at` or `delay`
   still sends at the yes.
 - A call that carries `every_seconds`, `in_seconds`, or `start_at` is
@@ -253,6 +273,9 @@ the first run with `resolve_at` or the delay, build a `Schedule`, and save
   next run is the date of the stored next run at that time, or the next day
   if that has passed, unless `at` names a `day` or `date`. For an elapsed
   job, `at` sets the next run and re-anchors the grid.
+- Turning an elapsed job into a whole-day one needs `at`, by the same rule
+  as `job_create`. A whole-day job that only changes `every_days` keeps its
+  stored `at_local`.
 - The watch TTL check is unchanged. This closes C-3.
 
 The `get_time` gate in `BoundSurface.execute` moves from `start_at` to
@@ -265,9 +288,9 @@ PRD says. A `delay` is not gated. `get_time`'s result gains `weekday` and
 `format_proposal` runs at stage time; the yes runs later. "Tomorrow" in a
 preview shown at 11:58 PM would mean a different day at a 12:03 AM yes. So
 when the broker stages `job_create`, `relay`, or `job_reschedule`, it
-stores a canonical copy of the call: `at.day`, an `at` with neither `day`
-nor `date`, and the default morning time all become `at.date` plus `fold`
-where it matters. Nothing else in the arguments changes. The staged tool
+stores a canonical copy of the call: `at.day` and an `at` with neither
+`day` nor `date` become `at.date` plus `fold` where it matters. The server
+never adds an `at` the model did not send. Nothing else in the arguments changes. The staged tool
 result returns the canonical arguments to the model, and the preview is
 formatted from them. A `delay` stays a delay and the preview says it counts
 from the yes. This is the "resolved call" the architecture already
@@ -282,8 +305,9 @@ agent and the taint. When the first run of a confirmed `at` has passed:
 - A repeating job starts at its next slot. The `say` line says so ("8:00
   AM today had passed; first run tomorrow at 8:00 AM").
 - A one-time reminder or relay that passed by no more than
-  `staging_ttl_seconds` plus 60 seconds goes out at the yes, and the `say`
-  line says the named time had passed. Open question 2.
+  `staging_ttl_seconds` plus 60 seconds, about 11 minutes, goes out at the
+  yes, and the `say` line says the named time had passed ("8:02 PM had
+  passed when you said yes; I will text you now").
 - Anything older is refused with that sentence.
 
 Outside a confirm, a past `at` is refused as before. This closes B-7
@@ -309,7 +333,7 @@ whether that becomes a refusal.
 | `job_cancel` result | id and name | adds a `say` sentence naming the run that will not happen |
 | `relay` future result | `say` from `describe_saved_reminder` | the same, through `say_when` |
 | `describe_saved_reminder` | its own `strftime` | `say_when`. The sentence keeps "8:00 AM" spelled so the X3-2 regex still matches it |
-| `_format_job_create` | "Every: 86400 seconds", "First run" only for `start_at` | "First run: tomorrow at 7:00 AM (Saturday, October 31)" or "First run: 2 hours after you reply yes", and "Repeats: every day at 7:00 AM" or "Once" |
+| `_format_job_create` | "Every: 86400 seconds", "First run" only for `start_at` | "First run: tomorrow at 8:00 AM (Saturday, October 31)" or "First run: 2 hours after you reply yes", and "Repeats: every day at 8:00 AM" or "Once" |
 | `_job_create_line` (bundles) | interval only | the same first run and repeat text as the single preview |
 | `_format_job_reschedule`, `_job_reschedule_line` | interval only | "Next run: ..., then every ..." |
 | `relay.when_phrase` | raw `start_at`, delay phrase | `say_when` for `at`, `say_duration` plus "after you reply yes" for `delay` |
@@ -337,16 +361,23 @@ appears outside `clock.py`.
 
 ### Prompts and tool descriptions
 
-- `agents.system_prompt_for` loses "A repeating check with no named hour
-  ... is verbatim false, every_seconds 86400, and no start_at" and the
-  `start_at` and `in_seconds` sentences. It gains: copy the person's words
-  into `at` (`day` for "tomorrow" or a weekday, `date` for a calendar date,
-  neither for a bare hour); use `delay` only for a duration they said; a
-  daily job is `every_days` 1 and keeps its time; a daily check with no hour
-  omits `at`.
-- `JOB_CREATE_SPEC`, `JOB_RESCHEDULE_SPEC`, `RELAY_SPEC`, and
-  `GET_TIME_SPEC` change to match. The relay example "in_seconds is 120"
-  becomes `delay` with `minutes` 2.
+- `agents.system_prompt_for` loses "Do not ask them what time" and "A
+  repeating check with no named hour, such as every morning, is verbatim
+  false, every_seconds 86400, and no start_at" (`agents.py:164-166`), and
+  the `start_at` and `in_seconds` sentences. It gains: copy the person's
+  words into `at` (`day` for "tomorrow" or a weekday, `date` for a calendar
+  date, neither for a bare hour); use `delay` only for a duration they
+  said; a daily or weekly job is `every_days` with `at` and keeps its time;
+  if they did not name the time of day, ask what time and call no tool
+  until they answer.
+- `JOB_CREATE_SPEC` loses "A daily check with no named hour omits start_at
+  and does not ask what time" (`jobs.py:89`) and the "begins in 50 days and
+  then repeats every 10 days is in_seconds 4320000" example. It gains the
+  same ask-what-time sentence.
+- `JOB_RESCHEDULE_SPEC`, `RELAY_SPEC`, and `GET_TIME_SPEC` change to match.
+  The relay example "in_seconds is 120" becomes `delay` with `minutes` 2.
+- The prompt is not the enforcement. The parser refusal above is. The
+  prompt only tells the model what to say when it is refused.
 
 ### Eval harness
 
@@ -366,9 +397,18 @@ New or changed cases, all at `America/Chicago`:
 - `reminder-tomorrow-late-night`: "remind me tomorrow at 8 to take the
   bins in" at 2026-10-30T23:30. Expects `at.day` "tomorrow" or `at.date`
   "2026-10-31".
-- `job-morning-email` (changed): expects `every_days` 1 and no `delay`.
+- `job-morning-email` (changed): "Every morning, check my email and tell
+  me if anything important came in." The expectation reverses. It was
+  `staged = ["job_create"]`. It becomes `no_calls = ["job_create"]`,
+  `no_staged = ["job_create", "mail_file", "relay"]`, and
+  `reply_contains = ["time"]`: the model asks what time and creates
+  nothing.
+- `job-morning-email-named-hour` (new): the same request in history, the
+  assistant's "What time each morning?", then the user's "8am". Expects a
+  staged `job_create` with `every_days` 1, `at.hour` 8, `at.minute` 0, and
+  no `delay`.
 - `job-dated-digest`: "Starting December 9, check flight prices to Denver
-  every morning". Expects `at.date` "2026-12-09".
+  every morning at 7". Expects `at.date` "2026-12-09" and `at.hour` 7.
 - `job-list-when`: a `job_list` fixture with the mgmplus row in the new
   shape. "When is my mgmplus reminder?" must contain "December 10" and
   "8:00 AM", and must not contain "2:00 PM" or "14:00".
@@ -383,9 +423,17 @@ New or changed cases, all at `America/Chicago`:
   time resolved.
 - `docs/pi-deploy.md`: `ASSISTAI_TIMEZONE` is required; the
   `store jobs` check; a "Roll back a schema change" section.
-- `docs/release-notes.md` for each deploy.
+- `docs/release-notes.md` for each deploy. The deploy C note says that
+  "every morning" with no hour now asks what time, that this reverses the
+  0.1.8 note "'Every morning' with no hour is a daily mail check. It does
+  not ask what time", and that the question is intended.
 - `.env.example`: the timezone line is uncommented.
-- The PRD is unchanged unless open question 4 or 5 says otherwise.
+- `docs/prd.md` § Jobs: the sentence "The first run and the gap between
+  repeats can be any future value the clock can represent" is amended in
+  commit 5, the commit that makes whole-day repeats keep their local hour,
+  to say a whole-day repeat keeps its local time and is 23 or 25 hours
+  across a DST change ([decision 0002](../decisions/0002-daily-repeats-keep-local-time.md)).
+  The `get_time` rule in that section is unchanged.
 
 ## Risks and mitigations
 
@@ -436,13 +484,15 @@ image tag, and a version 14 image refuses version 15.
 often for a few days, and old `start_at` calls in history invite copying.
 
 - Refusals name the replacement fields, which takes one retry.
-- The six eval cases above must pass at their `pass_rate` over ten trials,
-  and `make compare` must score the new schemas, before deploy C.
+- The seven eval cases above must pass at their `pass_rate` over ten
+  trials, and `make compare` must score the new schemas, before deploy C.
 - Before deploy C, every `job_create` and `relay` call in the Pi's stored
   history (the `tool_calls` column of the copied file) is replayed through a
   throwaway script that maps its old arguments to the new ones. Each must be
-  expressible. This checks the new arguments cover what the household has
-  actually asked for.
+  expressible. A whole-day call that had no `start_at` is expected to map
+  to "needs a time"; the script counts those so the owner knows how often
+  the new question would have been asked. This checks the new arguments
+  cover what the household has actually asked for.
 - After deploy, watch `jobs.legacy_arguments_refused` and `tool.failed`
   with `name=job_create` or `name=relay`. They should fall to zero within
   the 14-day history window. If reminders fail outright, roll back to the
@@ -456,12 +506,39 @@ stored call has `start_at` or `in_seconds`.
 - The operator deploys when the `proposals` table is empty. Proposals
   expire after ten minutes, so this means waiting at most that long.
 
-**The default morning hour surprises someone.** C-2's fix changes what
-"every morning" means.
+**Asking what time undoes a 0.1.8 fix.** 0.1.8 added "Every morning ...
+does not ask what time" to the prompt (`agents.py:164-166`, `jobs.py:89`)
+because the model asked for a time in 1 of 3 eval trials, and asking was
+treated as a failure. That sentence is what produced C-2. The owner has now
+decided the question is the right answer: a daily job needs a named hour.
+What was the complaint in 0.1.8 is intended behaviour now.
 
-- The preview names the hour before the yes. The release note and the
-  household message below say what the default is.
-- The value is open question 1, and it is a setting.
+- The refusal is in `parse_create`, so it holds even when the model copies
+  the old pattern from history. A model that ignores the new prompt sends
+  `every_days` with no `at`, gets the refusal, and asks.
+- `job-morning-email` is re-pointed at the new behaviour, so the eval that
+  caught "it asked" now fails if it does not ask.
+  `job-morning-email-named-hour` checks the second half: once the person
+  says "8am", the job stages at 8:00.
+- A model could still invent an hour instead of asking. Code cannot tell an
+  invented 8:00 from a named one. A digest always stages, so the preview
+  names the hour before the yes. A verbatim reminder's `say` line names it
+  as it saves. The first eval case grades the first turn, where the
+  invented hour would show up as a `job_create` call.
+- `every_minutes` 1440 is refused, so the model cannot get a daily job
+  without an hour through the elapsed form.
+- "Begins in 50 days, then every 10 days" now needs an hour too. The model
+  asks, or uses `at.date` and the hour if the person gave one.
+  `test_jobs.py::test_a_daily_reminder_can_start_fifty_days_out` moves to
+  `at` with a `date` and an hour.
+- The deploy C release note says plainly that "every morning" now asks
+  what time, that this reverses the 0.1.8 note, and that it is intended.
+  The owner tells his spouse himself.
+- Until commit 6 ships, deploy B still runs the 0.1.8 prompt and maps a
+  whole-day `every_seconds` with no `start_at` to the hour of the request,
+  as 0.1.8 does. No daily job is expected to be created in that window. If
+  one is, `store jobs` shows its hour, and it can be rescheduled after
+  deploy C.
 
 **Rewriting the staged call weakens "what you approved is what runs".**
 
@@ -499,8 +576,9 @@ stored call has `start_at` or `in_seconds`.
 - Watch `clock.unsynced` and `clock.sync_unknown` after each restart.
 
 **Nothing in this spec suppresses a message without saying so.** Every new
-refusal (gap time, legacy argument, whole-day minutes, unset timezone)
-returns a reason the model passes on, or stops startup with a log line. The
+refusal (gap time, legacy argument, whole-day minutes, a whole-day repeat
+with no hour, unset timezone) returns a reason the model passes on, or
+stops startup with a log line. The
 one check that could suppress a real reminder, a delay beside a clock time,
 ships as log only. That is why no replayed-history eval is needed to tune
 this spec. The history replay above checks expressiveness instead.
@@ -509,7 +587,8 @@ this spec. The history replay above checks expressiveness instead.
 strict `xfail` in commit 1, so `make check` passes and each one proves the
 bug. The fixing commit removes the mark. They are the zoned-clock tests in
 report section 6, item 2: daily 8:00 across fall-back (C-1), "every
-morning" at 21:12 (C-2), reschedule keeps the next date (C-3), `job_list`
+morning" with no hour at 21:12 saves and stages nothing (C-2; today it
+saves a 9:12 PM job), reschedule keeps the next date (C-3), `job_list`
 reports local time (X3-3), a spring-gap calendar add (X3-1), 1:40 AM after
 fall-back (X3-1), the year bound on Dec 31 at 7:00 PM CST (X3-7), and the
 UTC default (B-8).
@@ -528,8 +607,14 @@ UTC default (B-8).
 - `test_config.py::test_defaults_are_conservative` asserts the timezone
   default is unset.
 - `test_agents.py::test_example_roster_loads` drops the `start_at`,
-  `in_seconds`, "in_seconds 120", and "every morning" substrings. The eval
-  cases above replace them, as TT4-12 asked.
+  `in_seconds`, "in_seconds 120", and "every morning" substrings (lines
+  39-51). The last of those pinned the sentence that produced C-2. The
+  parser test and the two morning-email eval cases replace them, as TT4-12
+  asked.
+- `test_jobs.py::test_a_daily_reminder_can_start_fifty_days_out` names a
+  date and an hour, because a whole-day repeat now needs one.
+- `evals/cases/job-morning-email.toml` reverses: it expected a staged
+  `job_create` and now expects a question and no `job_create`.
 - `test_staging.py::test_a_job_create_preview_shows_the_stored_schedule`
   and `::test_cancel_then_create_preview_names_the_jobs` assert the first
   run and repeat text.
@@ -542,12 +627,14 @@ UTC default (B-8).
 - The remaining job, relay, and store tests that pass `every_seconds`,
   `in_seconds`, or `start_at` change arguments only.
 
-**The household relies on today's behaviour.** After deploy C, Jacob sends
-his spouse something like: "The assistant now keeps daily reminders at the
-same time across daylight saving. 'Every morning' with no time means 7:00
-AM. Confirmations now say the day, like 'tomorrow at 8:00 AM (Saturday,
-October 31)'. A time that doesn't exist when the clocks spring forward gets
-a question back." The release notes say the same.
+**The household relies on today's behaviour.** The deploy C release notes
+say what changed: daily reminders keep the same time across daylight
+saving; "every morning" with no time now gets "what time?" back, which
+reverses 0.1.8 on purpose; confirmations say the day, like "tomorrow at
+8:00 AM (Saturday, October 31)"; a time that doesn't exist when the clocks
+spring forward gets a question back; and a one-time reminder whose time
+passed while waiting for the yes is sent at the yes. The owner tells his
+spouse himself. The bot sends no notice.
 
 ## Rollout
 
@@ -560,8 +647,8 @@ Each commit is one logical change, updates the doc it changes, and passes
 | 2 | Add `clock.py`: the household clock, `resolve_at`, `next_slot`, and the formatter, with its own tests and no callers. | A |
 | 3 | Refuse to start Signal without a timezone, log the zone, wait for a believable clock, and expire a proposal after a backward step. | A |
 | 4 | Store wall-clock schedules in schema 15, backfill live rows from their chosen slot, and add `store jobs` and `store downgrade`. Until commit 6, `job_create` maps a whole-day `every_seconds` to `every_days`. | B |
-| 5 | Advance every job to its next slot so runs keep their local time across DST, slow runs, and retries. | B |
-| 6 | Take named times as `at` and durations as `delay`, refuse the old arguments, start a daily job with no hour at the default time, and store staged times resolved. | C |
+| 5 | Advance every job to its next slot so runs keep their local time across DST, slow runs, and retries, and amend the PRD § Jobs repeat-gap sentence per decision 0002. | B |
+| 6 | Take named times as `at` and durations as `delay`, refuse the old arguments, refuse a daily job with no named hour so the person is asked what time, and store staged times resolved. | C |
 | 7 | Keep a job's next run and hour when it is rescheduled. | C |
 | 8 | Format every time in tool results, previews, and confirmations with the one formatter, and drop Unix times from what the model reads. | C |
 | 9 | Start a confirmed job whose time passed during the yes at its next slot, or at the yes for a one-time send. | C |
@@ -581,24 +668,26 @@ showing the mgmplus reminder on Thursday, December 10 at 8:00 AM, then
 Friday and Saturday at 8:00 AM. Rollback:
 `docker compose ... stop gateway`, then
 `docker compose ... run --rm --no-deps gateway store downgrade --to 14`,
-then load the deploy A image and `up -d --no-build`. Closed when `state
+then load the deploy A image and `up -d --no-build`. Closed when `store
 jobs` matches the rehearsal. There is no Nov 1 deadline for this deploy:
 the morning email job is cancelled and the mgmplus reminder first runs
 December 10. The deadline is March 14, 2027, or the next daily job someone
 creates, whichever comes first.
 
-**Deploy C (commits 6 to 11).** Before: `make eval` with the six time cases
-at their pass rates, `make compare`, the history replay, and an empty
+**Deploy C (commits 6 to 11).** Before: `make eval` with the seven time
+cases at their pass rates, `make compare`, the history replay, and an empty
 `proposals` table. After, from Jacob's phone: "remind me in 2 minutes to
 test 016" arrives on time and the confirmation names today and the minute;
 "remind me tomorrow at 7:05 to test the morning" names tomorrow, the
-weekday, and 7:05 AM; "when is my mgmplus reminder?" names December 10 at
-8:00 AM; "move the test reminder to 7:10" previews the next run; then
-cancel both tests. Watch `jobs.legacy_arguments_refused`,
+weekday, and 7:05 AM; "every morning, check my email" gets "what time?"
+back and `store jobs` shows no new job; answering "8am" previews a daily
+job at 8:00 AM, and "no" discards it; "when is my mgmplus reminder?" names
+December 10 at 8:00 AM; "move the test reminder to 7:10" previews the next
+run; then cancel both tests. Watch `jobs.legacy_arguments_refused`,
 `jobs.delay_with_named_clock`, `jobs.slots_skipped`, `jobs.dst_shifted`,
 and `tool.failed` for a week. Rollback is the deploy B image, which reads
 the same schema. Closed after the phone checks pass, the next morning's
-7:05 test fires at 7:05, and the household message is sent.
+7:05 test fires at 7:05, and the release notes are published.
 
 ## Acceptance criteria
 
@@ -607,11 +696,22 @@ the same schema. Closed after the phone checks pass, the next morning's
   Closes C-1. (`tests/test_clock.py::test_daily_eight_am_stays_eight_am_across_fall_back`,
   `tests/test_clock.py::test_daily_eight_am_stays_eight_am_across_spring_forward`,
   `tests/test_jobs.py::test_a_late_run_and_a_retry_do_not_move_the_next_run`)
-- [ ] AC2 — "Every morning" with no hour, asked at 21:12, first runs at the
-  default time the next morning; the model omits the hour and uses
-  `every_days` 1. Closes C-2.
-  (`tests/test_jobs.py::test_every_morning_without_an_hour_runs_at_the_default_time`,
-  `evals/cases/job-morning-email.toml`)
+- [ ] AC2 — A whole-day repeat with no named hour is refused by the
+  parser, so nothing is staged for a digest, nothing is saved for a clean
+  verbatim reminder, and no relay is stored; `every_days` with only a
+  `delay`, and `every_minutes` 1440, are refused the same way. Closes C-2:
+  a daily job cannot be created without a named local time.
+  (`tests/test_jobs.py::test_a_whole_day_repeat_without_a_named_time_is_refused`,
+  `tests/test_broker.py::test_a_daily_job_without_a_time_is_neither_staged_nor_saved`,
+  `tests/test_relay.py::test_a_daily_relay_without_a_time_is_refused`,
+  `tests/test_jobs.py::test_minutes_that_make_whole_days_are_refused`)
+- [ ] AC2a — Asked "Every morning, check my email and tell me if anything
+  important came in.", the model makes no `job_create` call and asks what
+  time; given "8am" next, it stages `job_create` with `every_days` 1 and
+  `at.hour` 8. Closes C-2 at the model level.
+  (`evals/cases/job-morning-email.toml` with `no_calls = ["job_create"]`,
+  `no_staged = ["job_create", "mail_file", "relay"]`,
+  `reply_contains = ["time"]`; `evals/cases/job-morning-email-named-hour.toml`)
 - [ ] AC3 — A reschedule that changes only the repeat keeps the next run
   and its hour; one that changes the hour keeps the date. Closes C-3.
   (`tests/test_jobs.py::test_reschedule_keeps_the_next_run_and_its_hour`,
@@ -668,9 +768,9 @@ the same schema. Closed after the phone checks pass, the next morning's
   (`tests/test_staging.py::test_every_job_preview_names_the_first_run`,
   `tests/test_staging.py::test_a_reschedule_preview_names_the_next_run`)
 - [ ] AC12 — A confirmed repeating job whose first time passed during the
-  yes starts at its next slot; a one-time reminder or relay that passed
-  within the proposal window goes out at the yes and says so; an older one
-  is refused with the reason. Closes B-7.
+  yes starts at its next slot; a one-time reminder or relay no more than
+  about 11 minutes late goes out at the yes and says the named time had
+  passed; an older one is refused with the reason. Closes B-7.
   (`tests/test_channel.py::test_a_lapsed_daily_job_starts_at_its_next_slot`,
   `tests/test_channel.py::test_a_lapsed_one_time_reminder_is_sent_at_the_yes`,
   `tests/test_relay.py::test_a_lapsed_relay_is_sent_at_the_yes`)
@@ -693,11 +793,10 @@ the same schema. Closed after the phone checks pass, the next morning's
 - [ ] AC16 — Household local times are formatted only in `clock.py`.
   (`tests/test_invariants.py::test_local_times_are_formatted_in_one_place`)
 - [ ] AC17 — `every_seconds`, `in_seconds`, and `start_at` are refused with
-  the names that replace them, a staged call from before the update is
-  refused at commit with "ask again", and `every_minutes` that make whole
-  days are refused. (`tests/test_jobs.py::test_legacy_time_arguments_are_refused_with_the_new_names`,
-  `tests/test_channel.py::test_a_proposal_from_before_the_update_asks_again`,
-  `tests/test_jobs.py::test_minutes_that_make_whole_days_are_refused`)
+  the names that replace them, and a staged call from before the update is
+  refused at commit with "ask again".
+  (`tests/test_jobs.py::test_legacy_time_arguments_are_refused_with_the_new_names`,
+  `tests/test_channel.py::test_a_proposal_from_before_the_update_asks_again`)
 - [ ] AC18 — A job missed while the Pi was down runs once, then returns to
   its slot. (`tests/test_jobs.py::test_a_job_missed_while_down_runs_once_then_returns_to_its_slot`)
 - [ ] AC19 — Staging changes only time fields when it resolves a call.
@@ -706,11 +805,13 @@ the same schema. Closed after the phone checks pass, the next morning's
   the zone data knows the 2026 and 2027 transitions.
   (`tests/test_clock.py::test_next_slot_holds_its_rules_for_many_schedules`,
   `tests/test_clock.py::test_the_zone_database_knows_the_2026_and_2027_transitions`)
-- [ ] AC21 — The six time eval cases pass at their `pass_rate` over ten
+- [ ] AC21 — The seven time eval cases pass at their `pass_rate` over ten
   trials. (`make eval` on the cases named above)
 - [ ] AC22 — Architecture, Pi deploy, release notes, and `.env.example`
-  describe this behaviour. (`tests/test_invariants.py::test_relative_doc_links_resolve`,
-  manual read)
+  describe this behaviour; the PRD § Jobs repeat-gap sentence is amended in
+  commit 5 per decision 0002; the deploy C release note says "every
+  morning" now asks what time and that this reverses 0.1.8 on purpose.
+  (`tests/test_invariants.py::test_relative_doc_links_resolve`, manual read)
 - [ ] AC23 — Each deploy's closing check in Rollout passes on the Pi.
   (manual, recorded in the PR)
 
@@ -743,35 +844,37 @@ the same schema. Closed after the phone checks pass, the next morning's
 
 ## Open questions
 
-Only the owner can close these. Status stays `draft` until they are.
+All closed by the owner on 2026-10-30.
 
-1. **Default time for a daily job with no named hour.** This spec proposes
-   7:00 AM as `ASSISTAI_JOB_DEFAULT_TIME`. The 0.1.8 morning email ran at
-   8:00. Which hour, and should the same default apply to the spouse?
-2. **A one-time reminder or relay whose time passes while waiting for the
-   yes.** Proposed: send it at the yes if it is less than eleven minutes
-   late, and say the named time had passed. The alternative is to refuse
-   and ask again. Which?
-3. **Times the clocks skip or repeat.** Proposed: refuse a time in the
-   spring-forward gap when a reminder, relay, or calendar event is created,
-   and ask for another; take the next occurrence still ahead of a repeated
-   time and name the zone. A repeating job's slot in the gap runs an hour
-   later that day. The alternative for creation is to move a gap time to
-   3:00 AM and say so. Which?
-4. **Keep the `get_time` gate for `at`?** The PRD says "A named clock time
-   is refused until the assistant has read the clock in that turn". With
-   the server resolving "tomorrow" and weekday names itself, the gate adds a
-   tool round and no check. This spec keeps it, as the PRD requires.
-   Dropping it for relative days is a PRD change and needs a decision file.
-5. **PRD wording on repeat gaps (possible conflict).** PRD § Jobs says "the
-   gap between repeats can be any future value the clock can represent".
-   Under this spec, a whole-day gap follows the local clock, so it is 23 or
-   25 hours on a DST day, and a gap in minutes that makes whole days is
-   refused in favour of `every_days`. I read that as within the PRD's
-   intent, since the PRD lists "every morning at 7" as open engineering. If
-   the owner reads "gap" as a fixed number of seconds, this is a conflict,
-   and closing it needs a decision file and a PRD edit.
-6. **Who tells the household.** Proposed: release notes, and Jacob texts
-   his spouse after deploy C. Should the bot send that note itself? That
-   would need a one-time outbound notice, whose durable record belongs to
-   spec 018.
+1. **Default time for a daily job with no named hour.** Closed: there is
+   none. A daily job with no named hour asks the person what time, and
+   nothing is saved or staged until they name one. This reverses the 0.1.8
+   behaviour and the prompt sentences at `agents.py:164-166` and
+   `jobs.py:89`. Reflected in Outcome; Startup (no default setting);
+   Time arguments (the `parse_create` refusal and the paths it covers);
+   Prompts and tool descriptions; Eval harness (`job-morning-email`
+   reversed, `job-morning-email-named-hour` added); Risks ("Asking what
+   time undoes a 0.1.8 fix"); Rollout commit 6 and the deploy C phone
+   check; AC2 and AC2a.
+2. **A one-time reminder or relay whose time passes before the yes.**
+   Closed: send it at the yes if it is no more than about 11 minutes late,
+   and say the named time had passed. Reflected in "A start time that
+   passes before the yes" and AC12.
+3. **Times the clocks skip or repeat.** Closed: refuse a skipped time at
+   creation and ask for another; a repeated hour takes the next occurrence
+   still ahead and names the zone; a repeating job's slot in the gap runs
+   an hour later that day. Reflected in `resolve_at` and `next_slot`,
+   Calendar adds, and AC6.
+4. **Keep the `get_time` requirement for `at`.** Closed: kept. Reflected in
+   the `get_time` gate paragraph, AC5, and the Docs list (the PRD rule is
+   unchanged).
+5. **Repeat gaps across DST.** Closed: a whole-day repeat keeps its local
+   hour, so the gap is 23 or 25 hours on a DST day. Recorded in
+   [decision 0002](../decisions/0002-daily-repeats-keep-local-time.md). The
+   PRD § Jobs sentence about the repeat gap is amended in commit 5.
+   Reflected in the `every_days` argument, the Docs list, Rollout commit 5,
+   and AC22.
+6. **Who tells the household.** Closed: the release notes, and the owner
+   texts his spouse himself. The bot sends no notice. Reflected in Docs
+   (deploy C release note), Risks ("The household relies on today's
+   behaviour"), and the deploy C closing check.
