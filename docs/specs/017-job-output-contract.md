@@ -1,6 +1,6 @@
 # 017 — A job-run contract and one checked path for model text
 
-Status: draft
+Status: ready
 
 Implements: [prd.md § Jobs](../prd.md), [prd.md § Memory](../prd.md), and
 [prd.md § Principles](../prd.md) ("Irreversible and cross-boundary actions
@@ -8,6 +8,10 @@ stage first"). Changes [architecture.md § Staged actions](../architecture.md),
 [§ Jobs](../architecture.md), [§ Persistence](../architecture.md), and
 [§ Prompt injection defenses](../architecture.md). Supersedes three points of
 [spec 015](015-reminder-fixes.md), listed under Design.
+
+Decision: [0003](../decisions/0003-reworded-reminders-wait-for-yes.md), a
+reworded reminder waits for a yes. It extends
+[0001](../decisions/0001-reminders-stage-when-tainted.md).
 
 Depends on [spec 016](016-wall-clock-schedules.md), which ships first and owns
 `SCHEMA_VERSION` 15 and the one formatter for local times.
@@ -93,6 +97,12 @@ from it:
 carry it in one field shape that the turn's facts can collect. If 016 ships a
 formatter that returns only a string, adding the parts is a change to 016's
 module, agreed with that spec, not a second formatter here.
+
+017 assumes no default hour. 016 has a daily job with no named hour ask the
+person what time. That question is an ordinary reply: it passes
+`check_outbound` because it is not a `yes_request`, and it stages nothing.
+The person's answer is an ordinary turn. Every time 017 shows or checks
+comes from a tool result, never from a default.
 
 If 016 slips, 017's first deploy can still ship. The time check stays in
 shadow mode until the formatter lands, and the 0.1.8 `_names_another_time`
@@ -427,8 +437,9 @@ the rule.
   messages against `CONFIRM_WORDS` and `REJECT_WORDS`. The default confirm
   set is yes, y, yeah, yep, yup, ok, okay, sure, confirm, do it, go ahead,
   send it, yes please, and 👍 sent as text. The default reject set is no, n,
-  nope, discard, and cancel. The owner approves these sets (open question
-  1). Anything else is not a decision.
+  nope, discard, and cancel. These are the owner's sets (question 1).
+  Anything else is not a decision. A 👍 reaction has no text and is not a
+  decision.
 - **"cancel" on a cancellation.** When every stored call is `job_cancel`,
   "cancel" and "stop" are ambiguous. `parse_decision` returns `ambiguous`.
   The server re-shows the preview with "Reply yes to cancel {name}, or no to
@@ -461,9 +472,12 @@ server wrote, not a heuristic. The second deploy replaces it with the `ref`.
   ed, or ing removed, and ignoring "don't", "forget", "remember", "reminder")
   must appear in the person's message this turn. Otherwise the reminder
   stages, and the person sees its text before it is saved.
-  `BoundSurface` gets the person's text from `ToolBroker.for_agent`. This
-  ships in shadow (`broker.reminder_unmatched` with the overlap ratio) and
-  enforces only if the owner accepts the PRD change (open question 4).
+  `BoundSurface` gets the person's text from `ToolBroker.for_agent`.
+  [Decision 0003](../decisions/0003-reworded-reminders-wait-for-yes.md)
+  accepts this rule. It ships log-only, as the `reminder_words` shadow check
+  (`broker.reminder_unmatched` with the overlap ratio, and the reminder
+  still saves). It enforces only in the commit that also amends the PRD
+  § Jobs sentence (Rollout step 15).
 - **Stored bytes.** `jobs.parse_create` and `relay.parse_body` refuse text
   that fails the `markup` check, so the bytes that are later sent unchanged
   were clean when stored.
@@ -496,7 +510,9 @@ It does the following:
 
 A file at version 14 migrates through 016's step to 15 and then to 16.
 
-**Downgrade.** `python -m assistai store downgrade --to 15` drops
+**Downgrade.** 016 adds the `python -m assistai store` command group and its
+`store downgrade` command. 017 adds that command's 16-to-15 step, which runs
+for `python -m assistai store downgrade --to 15`. The step drops
 `job_runs`, `jobs.pending_record`, `proposals.id`, `messages.origin`, and
 `messages.record` with `ALTER TABLE ... DROP COLUMN`, which needs SQLite
 3.35 or later. It then sets `user_version` to 15, all in one transaction.
@@ -526,7 +542,11 @@ All live in `Settings`, with the `ASSISTAI_` prefix:
 - Spec 015 is superseded on three points: the tainted digest prompt is now
   fenced, the listed-mail rule is replaced by the counted nudge, and the
   reminder-time regex is replaced by `time_claim`. The architecture says so.
-- `prd.md` changes only if decision 0002 is accepted (B-1).
+- `prd.md` § Jobs: the "remind me" sentence is amended to match decision
+  0003, in the commit that turns B-1 enforcement on (Rollout step 15), and
+  not before. `architecture.md` § Jobs changes in the same commit.
+- `docs/decisions/0003-reworded-reminders-wait-for-yes.md` lands with this
+  spec. The decisions index row for it is added when the spec merges.
 
 ## Risks and mitigations
 
@@ -539,8 +559,8 @@ conversation, and they still do. The only active job on the Pi is a verbatim
 reminder, which runs no model. Mitigation: the job's prompt has to be
 self-contained, and the `job_create` description says so. The run gets its
 own earlier run times, so "new since last time" still works through a Gmail
-`after:` search. Open question 3 asks the owner whether any job he wants
-depends on chat.
+`after:` search. The owner confirmed that a job sees only its prompt and its
+own earlier run facts (question 3).
 
 **A strict check suppresses a real message.** The audit names this risk too.
 Mitigations:
@@ -600,7 +620,7 @@ the first week. The household is told before the second deploy.
 **A wider confirm set confirms by accident.** "ok" right after a preview now
 runs it. Mitigation: a decision applies only to the preview that is the
 newest stored row, so "ok" can only answer what the person was just shown.
-The owner approves the word set.
+The owner chose the word set.
 
 **More model calls lengthen turns across a deploy.** A repair round makes a
 turn take longer, and so widens the window in which SIGTERM cancels a turn.
@@ -786,16 +806,29 @@ Manual checks that close deploy B:
 as they are.
 
 14. After a week of `outbound.would_refuse` logs and a clean replay, set
-    `ASSISTAI_OUTBOUND_SHADOW_CHECKS=` (empty) in `.env` on the Pi and
-    restart. Then a commit makes the empty list the default: "Enforce the
+    `ASSISTAI_OUTBOUND_SHADOW_CHECKS=reminder_words` in `.env` on the Pi and
+    restart. Then a commit makes that list the default: "Enforce the
     repetition, inbox, and time checks now that a week of shadow logs shows
     no real message would be refused." Once `time_claim` enforces, the same
-    commit deletes `_names_another_time`.
-15. Only if decision 0002 is accepted: "Wait for a yes when a reminder's
-    sentence is not the person's own words." This also amends the PRD.
+    commit deletes `_names_another_time`. `reminder_words` stays log-only,
+    because enforcing it changes PRD behaviour.
+15. After a week of `broker.reminder_unmatched` logs shows the 60% threshold
+    stages no reminder the person phrased themselves: "Wait for a yes when a
+    reminder's sentence is not the person's own words, as decision 0003
+    accepts." This commit empties the default shadow list, amends the PRD
+    § Jobs "remind me" sentence, and updates architecture § Jobs and the
+    release notes, all together. Then `.env` on the Pi sets the empty list,
+    and the household is told that a reminder the assistant rewords now
+    shows its text and waits for a yes.
 
-Roll back by restoring the shadow list in `.env`. Manual check: a week with
-no `outbound.refused` on a message the owner wanted to receive.
+Roll back step 14 by restoring the shadow list in `.env`. Roll back step 15
+by reverting its commit, which also reverts the PRD sentence, so the code
+and the PRD never disagree. Setting `reminder_words` in `.env` alone is only
+a stopgap until that revert ships. Manual checks: a week with no
+`outbound.refused` on a message the owner wanted to receive, and after step
+15, "remind me to take the bins out at 7" saves at once, while "every day at
+7, check my email and summarize it" never saves a verbatim reminder without
+a yes.
 
 ## Acceptance criteria
 
@@ -954,8 +987,12 @@ the findings it closes.
   and a digest marked verbatim with the prompt "No new mail." waits for a yes
   (`tests/test_broker.py::test_a_reminder_whose_text_is_not_the_persons_is_logged`,
   `tests/test_broker.py::test_a_reminder_whose_text_is_not_the_persons_stages`).
-  Closes B-1 only if decision 0002 is accepted. Otherwise B-1 stays open at
-  medium.
+  A reminder whose sentence is mostly the person's words still saves at once
+  in a clean conversation
+  (`tests/test_broker.py::test_a_reminder_in_the_persons_words_saves_at_once`).
+  Enforcement lands in the same commit as the PRD § Jobs amendment that
+  decision 0003 requires (Rollout step 15, manual read of `prd.md`). Closes
+  B-1.
 
 **Store, invariants, rollout**
 
@@ -991,7 +1028,7 @@ the findings it closes.
   (`tests/test_invariants.py::test_relative_doc_links_resolve`, manual read).
 
 Coverage of the findings this spec owns: A-1 (AC1, AC13), A-3 (AC2), A-4
-(AC17), B-1 (AC25, conditional), B-9 (AC23), B-10 (AC9), C-5 and C-6
+(AC17), B-1 (AC25, enforced at Rollout step 15), B-9 (AC23), B-10 (AC9), C-5 and C-6
 (AC14), C-13 (AC15), D-2 (AC20, AC21), F-2 (AC15), X1-3 (AC6, AC22), X1-4
 (AC7, narrowed for counts), X1-5 (AC8), X1-7 (AC3), X2-1 (AC11, AC13), X2-2
 (AC12), X2-4 (AC24), X2-5 (AC18), X2-6 (AC4, AC11, AC13), X3-2 (AC10), X4-1
@@ -1029,41 +1066,46 @@ Coverage of the findings this spec owns: A-1 (AC1, AC13), A-3 (AC2), A-4
 
 ## Open questions
 
-Status stays `draft` until these close. The coordinator asks the owner.
+None are open. The owner answered all eight on 2026-10-30.
 
-1. **Which words confirm and which discard?** The proposal is: yes, y,
+1. **Which words confirm and which discard?** Answer: confirm is yes, y,
    yeah, yep, yup, ok, okay, sure, confirm, do it, go ahead, send it, yes
-   please, and 👍 sent as text, against no, n, nope, discard, and cancel.
-   Should a 👍 reaction confirm too? That needs envelope work and is out of
-   scope here.
-2. **Should any other message withdraw a live proposal?** That includes a
-   question like "what time is that?", after which the model has to propose
-   again. The alternative is to keep it live but unconfirmable until the
-   preview is re-shown.
-3. **Should any job read the conversation?** This spec gives a job only its
-   prompt and its own earlier run facts. Is there a job you want whose
-   prompt depends on something said in chat? No PRD text requires it, so
-   this is a check, not a conflict.
+   please, and 👍 sent as text. Discard is no, n, nope, discard, and
+   cancel. No reaction support in this spec. Reflected in Design § What a
+   yes is bound to (near-yes words), Out of scope (reactions), and AC22.
+2. **Should any other message withdraw a live proposal?** Answer: yes. Any
+   other message withdraws it, and the model must propose again. Reflected
+   in Design § What a yes is bound to (withdrawal) and AC20.
+3. **Should any job read the conversation?** Answer: no. A job sees only its
+   prompt and its own earlier run facts. Reflected in Design § The job-run
+   contract (what a run is shown), Risks (a job that drew on conversation
+   context), and AC12.
 4. **B-1: should a reminder wait for a yes when its saved sentence is not
-   mostly your own words?** This conflicts with the PRD (§ Jobs: "Saying
-   'remind me' saves it with no yes, unless the conversation already holds
-   mail, web, calendar, list, or relay text"). Closing it needs decision file
-   0002 and a PRD amendment. If the answer is no, B-1 stays open at medium,
-   with the server's saved sentence, shown at once, as the only check.
-5. **Are the caps right?** A job report is held to 1,900 characters (one
-   Signal message) and a reply to 3,800. A longer digest is asked to shorten
-   once and is then reported as a failed check.
-6. **Do you want the "Looked at: mail (3 found)" line at the end of every
-   job message?** It is the code's account of what was checked.
-7. **Old echo rows: leave them out of requests (the proposal, reversible),
-   or delete the four echo rows from jacob's history in the migration?**
-   Deleting cannot be undone. Leaving them out ages them off by about Nov 13.
-8. **Should a job run see its earlier reports' text?** The proposal shows
-   only times, tools, counts, and statuses, so a digest cannot copy an
-   earlier report. The cost is that it cannot compare its wording with
-   yesterday's.
+   mostly the person's own words?** Answer: yes, accepted as
+   [decision 0003](../decisions/0003-reworded-reminders-wait-for-yes.md),
+   which extends decision 0001. It ships log-only until the decision and
+   the PRD edit land, and the PRD § Jobs sentence is amended in the same
+   commit that turns enforcement on. Reflected in Design § Smaller fixes
+   (B-1), § Docs that change with the code, Rollout steps 14 and 15, and
+   AC25.
+5. **Are the caps right?** Answer: yes. 1,900 characters for a job report
+   and 3,800 for a reply. Reflected in Design § One outbound check (the
+   `length` check), § Config keys, AC4, and the deploy A manual check.
+6. **Should every job message end with the "Looked at: mail (3 found)"
+   line?** Answer: yes. Reflected in Design § The job-run contract (the
+   status table and `format_looks`), AC15, and the deploy A manual check.
+7. **Old echo rows: leave them out of requests or delete them?** Answer:
+   leave them in storage and exclude them from what the model is sent,
+   which is reversible. Reflected in Design § Server text is stored as
+   records (the `legacy` rules), § Schema 16 (assistant rows without tool
+   calls stay `legacy`), Risks (the migration misclassifies rows), and AC11.
+8. **Should a job run see its earlier reports' text?** Answer: no. It sees
+   only times, tools, counts, and statuses of earlier runs. Reflected in
+   Design § The job-run contract (what a run is shown, and `job_runs`
+   storing no report text) and AC12.
 
-PRD conflict: only question 4 (B-1). It needs decision 0002 before AC25 can
-enforce. The rest of the spec matches the PRD and makes the code match
-`architecture.md`'s existing "the next inbound message either confirms it or
-does not".
+PRD conflict: question 4 (B-1) changed PRD behaviour, and decision 0003
+resolves it. `prd.md` is not edited by this spec's first commits. Its § Jobs
+sentence changes only in Rollout step 15, with enforcement. The rest of the
+spec matches the PRD and makes the code match `architecture.md`'s existing
+"the next inbound message either confirms it or does not".
