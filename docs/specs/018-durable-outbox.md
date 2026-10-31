@@ -1,6 +1,6 @@
 # 018 — A durable outbox for every external write, and a job runner of its own
 
-Status: draft
+Status: ready
 
 Implements: [prd.md § Jobs](../prd.md) ("Jobs survive a restart", "A job
 failure ... messages the owner. No silent skip"),
@@ -8,6 +8,7 @@ failure ... messages the owner. No silent skip"),
 is not repeated"), [prd.md § Memory](../prd.md), and
 [architecture.md § Staged actions](../architecture.md) and
 [§ Persistence](../architecture.md).
+Decision: [0004](../decisions/0004-relays-after-an-outage.md).
 
 Depends on: spec 016 (wall-clock schedules, schema 15) and spec 017 (job-run
 contract and the checked outbound path, schema 16 if it needs one). This
@@ -109,12 +110,14 @@ response. `SignalClient.send` and `_chunks` go away in stage 2.
 
 **Uncertain parts.** Signal has no idempotency key. A part that was
 `sending` when the process died may or may not have arrived. At start, the
-recovery step marks every `sending` part `uncertain`. The default rule,
-pending open question 1, is to send an uncertain part again once, preceded
-by the fixed line "Sent again after a restart. You may already have this
-part." The window is one HTTP POST plus the SQLite update after it. The
-shutdown drain below lets an in-flight POST finish, so only a SIGKILL or a
-power cut leaves one.
+recovery step marks every `sending` part `uncertain`. An uncertain part is
+sent once more, preceded by the fixed line "Sent again after a restart. You
+may already have this part." This holds for every outbound message,
+relays included. On a relay the line goes in front of the stored bytes,
+which are unchanged ([decision 0004](../decisions/0004-relays-after-an-outage.md)).
+The window is one HTTP POST plus the SQLite update after it. The shutdown
+drain below lets an in-flight POST finish, so only a SIGKILL or a power cut
+leaves one.
 
 **Order and retries.** The worker sends one row at a time per recipient,
 oldest first, so a reply and a report to the same phone arrive in the order
@@ -150,10 +153,11 @@ more to do.
 **Backups and downgrade.** Before `Store._init_schema` applies any
 migration, it writes `assistai.sqlite.pre-v{N}.bak` with
 `sqlite3.Connection.backup`, mode 600, keeping the last three. Stdlib only;
-no new dependency. The `assistai store` command that 016 adds (`jobs` and
-`downgrade --to N`) gains two subcommands: `backup`, and `check` (open a
-file, migrate it, print row counts per table and what each migration moved). Each stage ships the
-reverse of its own migration in `downgrade`. It refuses while a row of that
+no new dependency. The `python -m assistai store` command group that 016
+adds (`jobs` and `downgrade --to N`) gains two subcommands: `backup`, and
+`check` (open a file, migrate it, print row counts per table and what each
+migration moved). Each stage ships the reverse of its own migration in
+`downgrade`. It refuses while a row of that
 stage is unfinished (an unsent part, a committing proposal, a running job
 run) unless `--force` is given, and prints what `--force` would drop. An
 older image still refuses a newer file, which is the safe default
@@ -180,8 +184,9 @@ previous image again.
 - `docker/docker-compose.yml` sets `stop_grace_period: 30s` on `gateway`.
   `docs/pi-deploy.md` adds `--timeout 30` to the deploy command and a
   rollback section.
-- `Store._init_schema` writes the backup before migrating. `assistai store
-  backup` and `assistai store check` exist.
+- `Store._init_schema` writes the backup before migrating.
+  `python -m assistai store backup` and `python -m assistai store check`
+  exist.
 
 ### Stage 1: conversation sends (schema 17)
 
@@ -259,7 +264,9 @@ Changes:
   then a `relay_confirmation` row to the sender ("Sent to the other phone"),
   enqueued only when the record step is done. That keeps the PRD rule that
   the sender is told only after her record is stored. `deliver_stored_relay`
-  splits into `enqueue_relay` and the record step.
+  splits into `enqueue_relay` and the record step. An uncertain relay part
+  is sent once more after the resend line, in front of the unchanged stored
+  bytes. Her record stores the body only, without that line.
 - An immediate relay at commit enqueues the same row. The handler waits for
   its parts, up to 30 seconds, before returning. A record that fails is
   retried by its step and never resends the text. If the parts have not
@@ -269,9 +276,14 @@ Changes:
   removed. The rows are the record.
 - A relay that cannot be sent tells the sender after its third failed
   attempt: "Your message to {name}, due at {time}, has not gone out yet.
-  I am still trying." Past `relay_late_limit_seconds` (default one hour,
-  open question 2), it is `cancelled` and the sender is told it was not
-  delivered. The time uses spec 016's formatter.
+  I am still trying." A relay may go out up to one hour after its time
+  (`relay_late_limit_seconds`, 3600). Past that, it is `cancelled`, and the
+  sender is told "Your message to {name}, due at {time}, was not delivered."
+  The limit counts from the relay's scheduled time, so it also covers a Pi
+  that was off at that time. The time uses spec 016's formatter
+  ([decision 0004](../decisions/0004-relays-after-an-outage.md)).
+- prd.md § Relay is amended in the commit that ships this stage, for the
+  resend line on relays and the one-hour limit, as decision 0004 requires.
 - Before the first part of a `relay`, `reminder`, or `job_report` row goes
   out, the worker checks `jobs.cancelled_at` for `source_job_id`. A
   cancelled job's unsent row is `cancelled` and logged
@@ -351,8 +363,8 @@ Proposals:
 - When any call failed, the server stores a new proposal holding only the
   failed calls, with `retry_of` set, and appends its preview to the
   summary: "Reply yes to try these again." It is built from the stored
-  calls, like every preview. Open question 4 asks whether the owner wants
-  this.
+  calls, like every preview, and opens when the summary has arrived. Done
+  and uncertain calls are never in it.
 - A "no" moves the proposal to `discarded` and appends the "no" and
   "Discarded." in one transaction. On failure the cached history is rolled
   back to its baseline, the proposal stays `open`, and the reply is "I could
@@ -380,8 +392,13 @@ Inbound:
   edit into a fresh message.
 - A row that already exists is a duplicate. It is logged
   `signal.inbound_duplicate` and gets no turn and no reply.
-- An edit gets the fixed reply "I already answered the first version. Send
-  the change as a new message." It gets no model turn. Open question 3.
+- An edit to a message already answered gets the fixed reply "I already
+  answered the first version. Send the change as a new message." and
+  nothing else: no model turn, no tool call. The per-sender lock means an
+  edit is handled only after its original's turn ends, so the original is
+  `answered` or `interrupted` by then. An edit whose original is not in
+  `inbound` (never received) or is `interrupted` was never answered, so it
+  runs as a new message.
 - Both checks ship behind `ASSISTAI_INBOUND_DEDUPE=log`. In `log` mode they
   record and log `would_drop=true` and run the turn as today. The default
   flips to `enforce` in a later commit, after a week of Pi logs.
@@ -393,13 +410,14 @@ Recovery adds:
   {time} message. Nothing from it was saved. Send it again if you still need
   it." The time uses spec 016's formatter. No excerpt of their text is
   stored or sent.
-- A `committing` proposal whose yes is younger than
-  `commit_resume_seconds` (default `staging_ttl_seconds`, open question 5)
-  resumes. `pending` calls run. `running` calls become `uncertain` and, until
-  stage 4, are not run again. The summary starts "After a restart:". Past
-  the window, `pending` calls become `abandoned`, and the summary says what
-  ran, what did not, and what to check. The remaining calls can be
-  confirmed again through the retry proposal.
+- A `committing` proposal whose yes came less than ten minutes before the
+  gateway starts again (`commit_resume_seconds`, 600) finishes
+  automatically. `pending` calls run. `running` calls become `uncertain`
+  and, until stage 4, are not run again. The summary starts "After a
+  restart:". If the gateway starts again ten minutes or more after the yes,
+  it stops: `pending` calls become `abandoned`, and the summary says what
+  ran, what did not, and what to check. Nothing more runs without a new
+  yes.
 - A `staged` proposal whose preview row was withdrawn becomes `withdrawn`.
 
 Migration from 18: copy a live `proposals` row into `staged_proposals` as
@@ -583,34 +601,37 @@ and possibly a live proposal. Mitigation: a fixture builder,
 version 017 leaves, using that commit's schema dump, and fills it with
 those shapes. It uses placeholder text, never real household text. Each
 stage's migration test opens it. Each migration runs in one transaction and
-logs `store.migrated` with counts per table and per rule. Before each deploy,
-`assistai store check` runs against a copy of the Pi's state file on the
-Mac. It runs against the copy, never the live volume. Open question 6 asks
-whether that copy may leave the Pi. The backup is written before any
-migration.
+logs `store.migrated` with counts per table and per rule. Before each
+deploy, the new image's `python -m assistai store check` runs on the Pi
+against a copy of the state file in a second volume, with no network. The
+state file never leaves the Pi. The steps are under Rollout. The backup is
+written before any migration.
 
 **Rolling back the schema.** Every 0.1.x image refuses a newer file. The
-rollback for any stage is: stop the gateway; run `assistai store downgrade
---to N` from the new image with `docker compose run --rm --no-deps gateway`;
-start the previous image tag. `downgrade` refuses while that stage has
-unfinished rows, and the stop drains them first. The `.bak` file is the
-fallback. Restoring it loses whatever was written since the deploy, so it
-is the last resort. Each stage's downgrade has a test that opens the
-downgraded file with the previous version's `SCHEMA_VERSION` and schema.
-Before each deploy, the same downgrade runs on the Mac against the migrated
-copy, and the previous image is started against it.
+rollback for any stage is: stop the gateway; run `python -m assistai store
+downgrade --to N` from the new image with `docker compose run --rm --no-deps
+gateway store downgrade --to N`; start the previous image tag. `downgrade`
+refuses while that stage has unfinished rows, and the stop drains them
+first. The `.bak` file is the fallback. Restoring it loses whatever was
+written since the deploy, so it is the last resort. Each stage's downgrade
+has a test that opens the downgraded file with the previous version's
+`SCHEMA_VERSION` and schema. Before each deploy, the dry run on the Pi also
+downgrades the migrated copy and opens it with the previous image's
+`store jobs`, in the second volume, with no network.
 
 **Duplicates or gaps from uncertain parts.** A kill inside one POST can
 repeat or drop that part. Mitigation: the drain lets the POST finish. A part
 POST gets its own 15-second timeout, `signal_part_timeout_seconds`, instead of
-the 60-second request timeout, so the drain is bounded. The rule is open
-question 1. Logs `outbox.part_uncertain`. On a deploy with nobody texting,
-the expected count is zero.
+the 60-second request timeout, so the drain is bounded. An uncertain part
+is sent once more after the resend line, so the failure mode is a labelled
+repeat, never a silent gap (decision 0004). Logs `outbox.part_uncertain`.
+On a deploy with nobody texting, the expected count is zero.
 
 **Late messages after an outage.** A reply saved before a long outage goes
 out late, which beats silence (PRD: "Failures never fail closed with
 silence"). A preview that would arrive after its proposal's lifetime is
-withdrawn, not opened. A scheduled relay has a late limit, open question 2.
+withdrawn, not opened. A scheduled relay goes out at most one hour late;
+after that it is dropped and the sender is told (decision 0004).
 
 **A stuck or crashed worker leaves everything queued.** Mitigation: the
 worker loop logs and continues on any exception, as `JobRunner.run` does.
@@ -627,16 +648,17 @@ on the Pi. A drop logs the sender and timestamp, never text.
 
 **Refusing edits changes something the household may rely on.** Mitigation:
 log-only first (`signal.edit_refused` with `would_refuse=true`), a release
-note, and Jacob tells his wife before the enforce flip. Open question 3.
+note, and Jacob tells his wife before the enforce flip. The refusal covers
+only edits to messages already answered.
 
 **Restart notices become noise.** Mitigation: a notice goes only to a person
 whose turn was actually interrupted. The drain finishes most turns. Watch
 `recovery.turn_interrupted` per deploy. If it is above zero on deploys when
 nobody was texting, that is a bug, not noise.
 
-**Resuming a yes after a restart surprises someone.** Mitigation: only
-within the resume window, and the summary says "After a restart:".
-Open question 5.
+**Resuming a yes after a restart surprises someone.** Mitigation: only when
+the gateway is back within ten minutes of the yes, and the summary says
+"After a restart:". Later than that, it stops and says what ran.
 
 **iCloud or Gmail behave differently from the fakes.** The 412 rule assumes
 iCloud honours `If-None-Match: *` on an existing URL. The draft lookup
@@ -683,26 +705,45 @@ appearing after stage 2.
 words. Jacob tells his wife before stage 3 enforces: an edited message gets
 a "send it as a new message" reply, and after a restart the bot may text
 that it did not finish her last message. Stage 2: a later message that
-cannot go out now says so. No bot broadcast; that would be a new kind of
-unprompted message.
+cannot go out now says so, a message more than an hour late is dropped,
+and a message cut off by a restart may arrive again under "Sent again after
+a restart". No bot broadcast; that would be a new kind of unprompted
+message.
 
 ## Rollout
 
-Each deploy is one stage. Before each one, on the Mac: `make check`;
-`assistai store check` against a copy of the Pi's state file; downgrade
-that copy and start the previous image against it. On the Pi: save the
-running image under its tag, as `docs/pi-deploy.md` says; `docker compose
---env-file .env -f docker/docker-compose.yml up -d --no-build --timeout 30`.
+Each deploy is one stage. On the Mac, `make check` passes. On the Pi, the
+state file never leaves the Pi, and the dry run touches only a copy:
+
+1. Save the running image as `docs/pi-deploy.md` says, and tag it
+   `assistai/gateway:previous`. Load the new tar.
+2. `docker compose --env-file .env -f docker/docker-compose.yml run --rm
+   --no-deps gateway store backup` writes a consistent copy of the live file
+   while the gateway runs.
+3. Create a second volume, `assistai_gateway-state-dryrun`, and copy only
+   that backup into it as `assistai.sqlite`, with a throwaway `alpine`
+   container.
+4. Against that volume, with `--network none` so nothing can reach Signal or
+   a provider: the new image's `store check` must migrate it and print the
+   expected counts; the new image's `store downgrade --to N` must succeed;
+   `assistai/gateway:previous` running `store jobs` must open the result and
+   list the active reminder.
+5. Remove the dry-run volume.
+6. Deploy: `docker compose --env-file .env -f docker/docker-compose.yml up
+   -d --no-build --timeout 30`.
+
+Stages:
 
 1. **Stage 0.** Commits: the `PartedSignal` double; the crash harness; the
    strict xfail tests; `stop_grace_period` and the deploy timeout;
-   backup-before-migrate and `assistai store backup` and `check`. Pi check:
+   backup-before-migrate and `python -m assistai store backup` and `check`.
+   Pi check:
    `docker inspect` on the gateway container shows `StopTimeout` 30, and
    `store backup` writes a mode-600 file in the state volume.
 2. **Stage 1, schema 17.** Commits: the outbox tables and worker; channel
    sends through the outbox; proposals open on delivery; summary only after
    save; update notice saved with its send; recovery for uncertain parts;
-   `store downgrade --to 16`; docs. Pi check: ask a question whose answer is
+   `python -m assistai store downgrade --to 16`; docs. Pi check: ask a question whose answer is
    over 1,900 characters and see `outbox.delivered parts=2` or more; stage a
    relay to yourself, check `staging.opened` follows the preview's last
    part, and say no.
@@ -736,7 +777,7 @@ running image under its tag, as `docs/pi-deploy.md` says; `docker compose
    appear once per slot.
 
 The rollback image for each stage is the previous stage's tag, after
-`store downgrade`.
+`python -m assistai store downgrade --to N`.
 
 ## Acceptance criteria
 
@@ -747,6 +788,7 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC0.3 — Every test under "Tests that fail first" exists, is a strict xfail, and names its finding (`make check`, manual read)
 - [ ] AC0.4 — A migration writes a mode-600 backup first (`tests/test_store.py::test_a_migration_writes_a_private_backup_first`)
 - [ ] AC0.5 — The gateway gets 30 seconds to stop (manual: `docker inspect` on the Pi shows `StopTimeout` 30)
+- [ ] AC0.6 — Before every deploy of stages 1 to 5, the dry run under Rollout passes on the Pi against a copy in a second volume with no network, and the dry-run volume is removed afterwards (manual)
 
 ### Stage 1 (schema 17)
 
@@ -756,7 +798,7 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC1.4 — A reply saved and then cancelled before its send goes out after a restart, and a preview too old by then is withdrawn with a notice. Closes E-5 and X6-7 (`tests/test_channel.py::test_a_reply_cancelled_before_send_goes_out_after_restart`, `tests/test_channel.py::test_a_stale_preview_is_withdrawn_not_sent`)
 - [ ] AC1.5 — A summary whose save fails is not sent until it is stored, and the next turn sees it. Closes X5-4, D-12, and X6-3 (`tests/test_channel.py::test_a_summary_is_sent_only_after_it_is_stored`)
 - [ ] AC1.6 — An update notice is saved and queued together; a failed save sends nothing, and a later check sends it once. Closes G-4 (`tests/test_updates.py::test_a_notice_is_saved_before_it_is_sent`)
-- [ ] AC1.7 — A part in flight at a kill is uncertain at the next start and follows the rule chosen in open question 1 (`tests/test_outbox.py::test_a_part_in_flight_at_a_kill_is_uncertain_after_restart`)
+- [ ] AC1.7 — A part in flight at a kill is uncertain at the next start and is sent once more after "Sent again after a restart. You may already have this part.", and only once (`tests/test_outbox.py::test_a_part_in_flight_at_a_kill_is_uncertain_after_restart`, `tests/test_outbox.py::test_an_uncertain_part_is_resent_once_after_the_marker`)
 - [ ] AC1.8 — Outbox rows keep their untrusted label, and their errors hold no response body (`tests/test_outbox.py::test_an_outbox_record_keeps_its_untrusted_label`, `tests/test_outbox.py::test_outbox_errors_hold_no_response_body`)
 - [ ] AC1.9 — A Pi-shaped version 16 file migrates, a live proposal stays confirmable, and the downgrade opens as version 16 (`tests/test_store.py::test_schema_v16_gains_the_outbox_and_keeps_rows`, `tests/test_store.py::test_downgrade_from_v17_opens_as_v16`)
 - [ ] AC1.10 — Architecture, deploy notes, and release notes describe the outbox and the rollback (`tests/test_invariants.py::test_relative_doc_links_resolve`, manual read)
@@ -767,26 +809,26 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC2.2 — A report whose later part fails resends only that part. Closes C-9, job half (`tests/test_jobs.py::test_a_report_part_failure_does_not_resend_earlier_parts`)
 - [ ] AC2.3 — The report and the advance commit together, so a failing advance does not append the report twice. Closes C-8 (`tests/test_jobs.py::test_a_failed_advance_does_not_append_the_report_twice`)
 - [ ] AC2.4 — An immediate relay whose record fails is recorded later without a second send, and the sender is told it was sent. Closes C-10 (`tests/test_relay.py::test_an_immediate_relay_record_is_retried_without_resending`)
-- [ ] AC2.5 — A relay that cannot be sent tells the sender after three attempts, and past the late limit it is dropped and the sender is told. Closes C-12 (`tests/test_jobs.py::test_a_relay_that_cannot_send_tells_the_sender`, `tests/test_jobs.py::test_a_relay_past_its_late_limit_is_dropped_and_said`)
+- [ ] AC2.5 — A relay that cannot be sent tells the sender after three attempts; it may still go out up to one hour after its time, and after that it is dropped and the sender is told. Closes C-12 (`tests/test_jobs.py::test_a_relay_that_cannot_send_tells_the_sender`, `tests/test_jobs.py::test_a_relay_fifty_nine_minutes_late_still_goes_out`, `tests/test_jobs.py::test_a_relay_past_its_late_limit_is_dropped_and_said`)
+- [ ] AC2.5a — An uncertain relay part is sent once more with the resend line in front of the unchanged stored bytes, and her record holds the body only (`tests/test_jobs.py::test_an_uncertain_relay_part_is_resent_after_the_marker`)
 - [ ] AC2.6 — A relay or report whose job is cancelled before its first part is not sent. Closes the send half of C-4 (`tests/test_jobs.py::test_a_relay_cancelled_mid_tick_is_not_sent`, `tests/test_jobs.py::test_a_queued_report_of_a_cancelled_job_is_not_sent`)
 - [ ] AC2.7 — The sender is told a relay went out only after her record is stored (`tests/test_jobs.py::test_a_relay_confirmation_waits_for_the_record`)
 - [ ] AC2.8 — Only `outbox.py` calls the Signal transport (`tests/test_invariants.py::test_only_the_outbox_sends_signal`)
 - [ ] AC2.9 — Version 17 job outboxes migrate: delivered ones are not resent, cancelled undelivered ones are dropped, 016's columns are untouched, and the downgrade restores the old columns (`tests/test_store.py::test_schema_v17_moves_job_outboxes_into_the_outbox`, `tests/test_store.py::test_downgrade_from_v18_restores_job_outbox_columns`)
-- [ ] AC2.10 — Docs and release notes describe job sends, relay notices, and the late limit (manual read)
+- [ ] AC2.10 — Docs and release notes describe job sends, relay notices, the resend line, and the late limit, and prd.md § Relay is amended in this stage's commit as decision 0004 requires (`tests/test_invariants.py::test_relative_doc_links_resolve`, manual read)
 
 ### Stage 3 (schema 19)
 
 - [ ] AC3.1 — A reminder saved in a turn that shutdown cancels never fires, and the person is told at the next start. Closes E-1 and X6-1 (`tests/test_channel.py::test_a_reminder_saved_in_a_cancelled_turn_never_fires`, `tests/test_recovery.py::test_an_interrupted_turn_is_reported_after_restart`)
 - [ ] AC3.2 — A reminder whose rollback cancel fails stays held, cannot fire, and is cancelled by recovery. Closes X5-6 (`tests/test_channel.py::test_a_failed_rollback_cancel_leaves_the_reminder_held`)
-- [ ] AC3.3 — A yes interrupted after its first call finishes the rest once after a restart inside the window, and past it reports what ran and what did not. Closes E-2, X5-3, and X6-2 (`tests/test_recovery.py::test_an_interrupted_yes_finishes_after_restart`, `tests/test_recovery.py::test_an_old_interrupted_yes_reports_what_ran`)
+- [ ] AC3.3 — A yes interrupted after its first call finishes the rest once when the gateway is back within ten minutes of the yes; at ten minutes or later it runs nothing more and reports what ran and what did not. Closes E-2, X5-3, and X6-2 (`tests/test_recovery.py::test_an_interrupted_yes_finishes_after_restart`, `tests/test_recovery.py::test_an_old_interrupted_yes_reports_what_ran`)
 - [ ] AC3.4 — A "no" whose save fails leaves the proposal open and history unchanged. Closes D-10 and X6-4 (`tests/test_channel.py::test_a_failed_no_leaves_history_and_proposal_consistent`)
-- [ ] AC3.5 — A failed confirmed call is listed as not run, and the failed calls alone can be confirmed again. Closes X1-6 and X5-1 (`tests/test_staging.py::test_a_failed_call_is_not_reported_as_ran`, `tests/test_channel.py::test_failed_calls_can_be_confirmed_again_alone`)
+- [ ] AC3.5 — A failed confirmed call is listed as not run, and the summary offers a yes that retries only the failed calls. Closes X1-6 and X5-1 (`tests/test_staging.py::test_a_failed_call_is_not_reported_as_ran`, `tests/test_channel.py::test_failed_calls_can_be_confirmed_again_alone`)
 - [ ] AC3.6 — The same frame delivered twice runs one turn; in log mode it is logged and still runs. Closes D-3 and X5-5 (`tests/test_channel.py::test_a_repeated_frame_runs_one_turn`, `tests/test_channel.py::test_dedupe_log_mode_only_logs`)
-- [ ] AC3.7 — An edit gets the fixed reply and no model turn, and parses with `edit_of`. Closes D-3 (`tests/test_channel.py::test_an_edit_does_not_run_a_second_turn`, `tests/test_envelopes.py::test_reads_edits`)
+- [ ] AC3.7 — An edit to a message already answered gets the fixed reply and nothing else, and parses with `edit_of`; an edit whose original was never answered runs as a new message. Closes D-3 (`tests/test_channel.py::test_an_edit_does_not_run_a_second_turn`, `tests/test_channel.py::test_an_edit_of_an_unanswered_message_runs_as_new`, `tests/test_envelopes.py::test_reads_edits`)
 - [ ] AC3.8 — 017's yes binding is applied only to an open proposal (`tests/test_channel.py::test_a_yes_binds_only_to_an_open_proposal`)
 - [ ] AC3.9 — A live version 18 proposal, with 017's fields, migrates as open; existing jobs stay armed; the downgrade restores `proposals` (`tests/test_store.py::test_schema_v18_gains_proposal_states_and_keeps_a_live_proposal`, `tests/test_store.py::test_downgrade_from_v19_restores_the_live_proposal`)
-- [ ] AC3.10 — On the Pi, a week of `would_drop` and `would_refuse` counts is read before the enforce flip, and a redeploy during a turn produces one notice (manual)
-- [ ] AC3.11 — Architecture's staged-actions section describes the states, the open-on-delivery rule, and resume (manual read)
+- [ ] AC3.10 — On the Pi, a week of `would_drop` and `would_refuse` counts is read before the enforce flip, and a redeploy during a turn produces one notice (manual)- [ ] AC3.11 — Architecture's staged-actions section describes the states, the open-on-delivery rule, and resume (manual read)
 
 ### Stage 4 (schema 20)
 
@@ -820,8 +862,15 @@ The rollback image for each stage is the previous stage's tag, after
   label.
 - Staging: a proposal becomes confirmable later than today, only after the
   person has seen all of it. Resuming a yes after a restart runs only calls
-  the person confirmed, with the stored arguments. The retry proposal is
-  built from stored calls and needs its own yes.
+  the person confirmed, with the stored arguments, and only within ten
+  minutes of that yes. The retry proposal is built from stored failed calls
+  and needs its own yes.
+- Relays: the resend line is a fixed server line placed outside the stored
+  bytes, which are unchanged. It holds no model or outside text, and her
+  record stores the body only (decision 0004).
+- The migration dry run runs on the Pi with `--network none` against a copy
+  in a second volume, which is removed afterwards. The state file, with its
+  history, mail summaries, and Gmail tokens, never leaves the Pi.
 - A job still cannot reach a sink, a staging tool, or `job_*`. Moving
   `run_job` out of the channel keeps `report_only=True` on its surface.
 - Gmail stays on `gmail.modify`. The draft lookup is a read. `_refuse_path`
@@ -835,36 +884,41 @@ The rollback image for each stage is the previous stage's tag, after
 
 ## Open questions
 
-These need the owner. Status stays `draft` until they are closed.
+All closed by the owner on 2026-10-30.
 
 1. **A message part that may or may not have arrived when the process was
-   killed.** Send it again once, after the line "Sent again after a
-   restart. You may already have this part." (recommended), or skip it and
-   tell the person part of a message may be missing? For a relay this puts a
-   server line in front of the stored bytes on her phone. The PRD says the
-   gateway "sends those same bytes". If the marker applies to relays, that
-   needs a decision file.
-2. **How late may a scheduled relay go out after an outage?** Recommended:
-   up to one hour late, then dropped and the sender told. The PRD says the
-   bytes go out "at the chosen time" and does not say what happens when they
-   cannot. Closing this needs a decision file.
-3. **Edited messages.** Reply "I already answered the first version. Send
-   the change as a new message." and do nothing else (recommended), or treat
-   an edit as a new message as today? The PRD is silent. Either way this
-   changes how a typo fix behaves for both people.
-4. **Confirmed calls that failed.** Should the summary offer a yes that
-   retries only the failed calls (recommended), or only say what failed and
-   leave asking again to the person?
-5. **A yes interrupted by a restart.** Finish the remaining calls
-   automatically within ten minutes of the yes (recommended), or always
-   stop and say what ran?
-6. **A copy of the Pi's state file on the Mac.** The migration dry run is
-   only as good as the file it runs on. The file holds conversation
-   history, mail summaries, and Gmail refresh tokens. May a copy leave the
-   Pi for the dry run and be deleted afterwards, or should the dry run run
-   on the Pi against a copy in a second volume?
+   killed.** Answer: send it once more, after the line "Sent again after a
+   restart. You may already have this part." This holds for every outbound
+   message, relays included; for a relay the line goes in front of the
+   stored bytes on the other phone. Reflected in: Shared pieces, "Uncertain
+   parts"; stage 2's relay bullet; Risks, "Duplicates or gaps"; AC1.7 and
+   AC2.5a; [decision 0004](../decisions/0004-relays-after-an-outage.md).
+2. **How late may a scheduled relay go out after an outage?** Answer: up to
+   one hour late. After that it is dropped and the sender is told.
+   Reflected in: stage 2's late-limit bullet (`relay_late_limit_seconds`,
+   3600); Risks, "Late messages after an outage"; AC2.5;
+   [decision 0004](../decisions/0004-relays-after-an-outage.md).
+3. **Edited messages.** Answer: an edit to a message already answered gets
+   "I already answered the first version. Send the change as a new
+   message." and nothing else. Reflected in: stage 3, Inbound; Risks,
+   "Refusing edits"; AC3.7. An edit whose original was never answered runs
+   as a new message.
+4. **Confirmed calls that failed.** Answer: the summary offers a yes that
+   retries only the failed calls. Reflected in: stage 3, Proposals (the
+   retry proposal, built from the stored calls, opening when the summary
+   has arrived); Security review; AC3.5.
+5. **A yes interrupted by a restart.** Answer: if the gateway is back within
+   ten minutes of the yes, the remaining calls finish automatically;
+   otherwise it stops and says what ran. Reflected in: stage 3, Recovery
+   adds (`commit_resume_seconds`, 600); Risks, "Resuming a yes"; Security
+   review; AC3.3.
+6. **Where the migration dry run runs.** Answer: on the Pi, against a copy
+   in a second volume. The state file never leaves the Pi. Reflected in:
+   Risks, "Migrating live rows" and "Rolling back the schema"; the dry-run
+   steps under Rollout; Security review; AC0.6.
 
-PRD conflicts: none in the default design. Questions 1 (if the marker
-applies to relays) and 2 touch prd.md § Relay step 3 and each needs a
-decision file to close. Option C's "separate job runner" stays an in-process
-task, so it does not conflict with the architecture's scheduling decision.
+PRD conflicts: answers 1 and 2 change prd.md § Relay step 3. Decision 0004
+records both, and prd.md § Relay is amended in the stage 2 commit that
+ships them (AC2.10). No conflict remains open. Option C's "separate job
+runner" stays an in-process task, so it does not conflict with the
+architecture's scheduling decision.
