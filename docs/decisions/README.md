@@ -26,3 +26,6 @@ What gets easier, what gets harder, which docs and tests changed.
 | # | Decision |
 | --- | --- |
 | [0001](0001-reminders-stage-when-tainted.md) | A reminder waits for a yes when the conversation is tainted |
+| [0002](0002-daily-repeats-keep-local-time.md) | A daily repeat keeps its local time of day |
+| [0003](0003-reworded-reminders-wait-for-yes.md) | A reworded reminder waits for a yes |
+| [0004](0004-relays-after-an-outage.md) | A relay after a restart or an outage |
