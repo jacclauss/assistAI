@@ -281,6 +281,20 @@ def say_day(day: dt.date, *, clock: HouseholdClock) -> str:
     return text
 
 
+def local_reading(instant: float, *, clock: HouseholdClock) -> tuple[str, str]:
+    """An instant as ISO-8601 local time and its UTC offset, for operator logs.
+
+    The offset is spelled out so a log line shows which side of a daylight
+    saving change the gateway believes it is on. People read ``say_when``.
+    """
+    local = _local(instant, clock.zone)
+    offset = local.utcoffset() or dt.timedelta(0)
+    minutes = int(offset.total_seconds()) // 60
+    sign = "-" if minutes < 0 else "+"
+    hours, rest = divmod(abs(minutes), 60)
+    return local.isoformat(timespec="seconds"), f"{sign}{hours:02d}:{rest:02d}"
+
+
 def _check_at(at: LocalAt) -> None:
     if not 0 <= at.hour <= 23:
         raise JobError("hour must be 0 to 23")

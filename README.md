@@ -93,7 +93,10 @@ from its own account, so a personal number cannot text its own assistant.
    ```
    ASSISTAI_SIGNAL_ACCOUNT=+15555550100
    ASSISTAI_SIGNAL_ALLOW_FROM=+15555550101
+   ASSISTAI_TIMEZONE=America/Chicago
    ```
+
+   The gateway refuses to start Signal without `ASSISTAI_TIMEZONE`.
 
 4. Copy the agent roster and put real numbers in:
 
@@ -111,9 +114,10 @@ from its own account, so a personal number cannot text its own assistant.
    expires. Research tools (`web_search`, `web_fetch`) need both `web_access`
    and a place on `tools`. `calendar_today` reads the shared iCloud calendar
    named by `ASSISTAI_CALDAV_CALENDAR`. `calendar_add` proposes one event and
-   writes it only after a yes. Put the Apple ID, that name, and
-   `ASSISTAI_TIMEZONE` in `.env`. The app-specific password stays in the macOS
-   Keychain (`security add-generic-password -s assistai -a caldav -U -w`) or,
+   writes it only after a yes. Put the Apple ID and that name in `.env`;
+   "today" is a day in `ASSISTAI_TIMEZONE`. The app-specific password
+   stays in the macOS Keychain
+   (`security add-generic-password -s assistai -a caldav -U -w`) or,
    on the Pi, in a mode-600 file outside this repo. Jobs may use research and
    the calendar when reporting. Copy the example tools into a live
    `config/assistai.toml` that was created earlier.

@@ -35,7 +35,7 @@ def test_defaults_are_conservative() -> None:
     assert settings.caldav_password is None
     assert settings.caldav_password_file is None
     assert settings.caldav_calendar == ""
-    assert settings.timezone == "UTC"
+    assert settings.timezone is None
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,16 +108,6 @@ def test_invalid_signal_account_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
         Settings()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "B-8: timezone defaults to UTC, so an unset zone is silently UTC; "
-        "fixed by spec 016 commit 3"
-    ),
-)
 def test_the_timezone_has_no_default() -> None:
     """A household time zone is named on purpose, never assumed."""
-    # object, not str: today's annotation would make mypy reject the None check.
-    timezone: object = Settings().timezone
-
-    assert timezone is None
+    assert Settings().timezone is None

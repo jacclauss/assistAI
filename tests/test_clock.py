@@ -9,6 +9,7 @@ import pytest
 from assistai.clock import (
     LocalAt,
     Schedule,
+    local_reading,
     next_slot,
     resolve_at,
     say_day,
@@ -456,3 +457,17 @@ def test_the_household_today_is_not_the_utc_date_in_the_evening() -> None:
 
     assert clock.today() == date(2026, 10, 30)
     assert say_day(date(2026, 10, 31), clock=clock) == "tomorrow, Saturday, October 31"
+
+
+def test_a_local_reading_names_the_offset_on_each_side_of_fall_back() -> None:
+    """The operator log must show which 1:30 the gateway believes it is."""
+    clock = chicago_clock(0.0)
+
+    assert local_reading(chicago(2026, 11, 1, 1, 30), clock=clock) == (
+        "2026-11-01T01:30:00-05:00",
+        "-05:00",
+    )
+    assert local_reading(chicago(2026, 11, 1, 1, 30, fold=1), clock=clock) == (
+        "2026-11-01T01:30:00-06:00",
+        "-06:00",
+    )

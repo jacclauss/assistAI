@@ -13,9 +13,9 @@ import structlog
 
 from assistai.agents import AgentSpec, Household, system_prompt_for
 from assistai.broker import BoundSurface, Scope, ToolBroker
-from assistai.config import Settings
+from assistai.config import TIMEZONE_REQUIRED, Settings
 from assistai.conversation import apply_window, last_assistant_text, trusted_context
-from assistai.errors import AssistAIError, StoreError
+from assistai.errors import AssistAIError, HouseholdConfigError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.loop import run_turn
 from assistai.inference.tools import bind_clock
@@ -85,6 +85,9 @@ class SignalChannel:
         broker: ToolBroker,
         store: Store,
     ) -> None:
+        if settings.timezone is None:
+            raise HouseholdConfigError(TIMEZONE_REQUIRED)
+        self._timezone = settings.timezone
         self._settings = settings
         self._signal = signal
         self._policy = policy
@@ -100,12 +103,12 @@ class SignalChannel:
                 signal=signal,
                 inject=self._inject_relay,
                 store=store,
-                timezone=self._settings.timezone,
+                timezone=self._timezone,
             ),
         )
-        for name, handler in bind_jobs(store, timezone=self._settings.timezone).items():
+        for name, handler in bind_jobs(store, timezone=self._timezone).items():
             broker.bind(name, handler)
-        broker.bind("get_time", bind_clock(self._settings.timezone))
+        broker.bind("get_time", bind_clock(self._timezone))
         self._histories: dict[str, list[Message]] = {}
         self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}
@@ -219,7 +222,7 @@ class SignalChannel:
                 async with self._history_lock(agent.name):
                     try:
                         messages = self._history(
-                            agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                            agent.name, system_prompt_for(agent, timezone=self._timezone)
                         )
                     except StoreError:
                         log.exception("store.history_unreadable", agent=agent.name)
@@ -339,7 +342,7 @@ class SignalChannel:
             self._histories.pop(agent.name, None)
             try:
                 messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    agent.name, system_prompt_for(agent, timezone=self._timezone)
                 )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
@@ -369,7 +372,7 @@ class SignalChannel:
             async with self._history_lock(agent.name):
                 try:
                     messages = self._history(
-                        agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                        agent.name, system_prompt_for(agent, timezone=self._timezone)
                     )
                 except StoreError:
                     log.exception("store.history_unreadable", agent=agent.name)
@@ -483,7 +486,7 @@ class SignalChannel:
         async with self._history_lock(agent.name):
             try:
                 messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    agent.name, system_prompt_for(agent, timezone=self._timezone)
                 )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
@@ -516,7 +519,7 @@ class SignalChannel:
                 self._histories.pop(agent.name, None)
                 try:
                     messages = self._history(
-                        agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                        agent.name, system_prompt_for(agent, timezone=self._timezone)
                     )
                 except StoreError:
                     log.error("store.save_failed_after_commit", agent=agent.name)
@@ -544,7 +547,7 @@ class SignalChannel:
         async with self._history_lock(agent.name):
             try:
                 messages = self._history(
-                    agent.name, system_prompt_for(agent, timezone=self._settings.timezone)
+                    agent.name, system_prompt_for(agent, timezone=self._timezone)
                 )
             except StoreError:
                 log.exception("store.history_unreadable", agent=agent.name)
@@ -678,9 +681,7 @@ class SignalChannel:
         agent = self._agent_named(agent_name)
         loaded = self._store.load_history(agent_name)
         messages = [
-            Message(
-                role="system", content=system_prompt_for(agent, timezone=self._settings.timezone)
-            ),
+            Message(role="system", content=system_prompt_for(agent, timezone=self._timezone)),
             *loaded,
             Message(role="user", content=content, untrusted=True, created_at=time.time()),
         ]

@@ -163,3 +163,28 @@ async def test_repl_eof_exits_cleanly() -> None:
         writeln=lambda s: None,
     )
     await client.aclose()
+
+
+async def test_the_repl_answers_get_time_without_a_timezone() -> None:
+    """Only Signal needs the household zone. The REPL keeps its UTC clock."""
+    handler, seen = recorded(
+        sequence(
+            completion_stream(
+                tool_event(call_id="c1", name="get_time", arguments="{}", finish="tool_calls")
+            ),
+            completion_stream(text_event("It is noon.", finish="stop")),
+        )
+    )
+    client = client_for(handler)
+    unset = settings()
+    assert unset.timezone is None
+
+    text = await chat_once(
+        unset, "what time is it", client=client, manifest=manifest(), write=lambda _s: None
+    )
+
+    follow_up = json.loads(seen[1].content)
+    tool_messages = [message for message in follow_up["messages"] if message["role"] == "tool"]
+    assert set(json.loads(tool_messages[0]["content"])) == {"utc"}
+    assert text == "It is noon."
+    await client.aclose()

@@ -12,6 +12,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from assistai.clock import HouseholdClock
+from assistai.sysclock import ClockState
 
 CHICAGO = ZoneInfo("America/Chicago")
 
@@ -58,3 +59,15 @@ def chicago_clock(now: float | Callable[[], float]) -> HouseholdClock:
         return HouseholdClock(zone=CHICAGO, now=now)
     moment = now
     return HouseholdClock(zone=CHICAGO, now=lambda: moment)
+
+
+class FakeClockSync:
+    """The kernel's sync state as a test sets it. Counts how often it was asked."""
+
+    def __init__(self, state: ClockState = ClockState.SYNCED) -> None:
+        self.current = state
+        self.asked = 0
+
+    def state(self) -> ClockState:
+        self.asked += 1
+        return self.current

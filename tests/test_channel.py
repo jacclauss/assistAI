@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from assistai.broker import ToolBroker, builtin_catalog
-from assistai.errors import StoreError
+from assistai.errors import HouseholdConfigError, StoreError
 from assistai.inference.client import FireworksClient
 from assistai.inference.types import ToolSpec
 from assistai.signal.channel import SignalChannel
@@ -1579,3 +1579,9 @@ async def test_a_concurrent_turn_does_not_steal_the_relay_sender(tmp_path: Path)
     assert "From Jacob:\npick up milk" in outbound
     assert all(not text.startswith("From Spouse:") for text in outbound)
     await channel._fireworks.aclose()
+
+
+def test_a_channel_without_a_timezone_is_refused(tmp_path: Path) -> None:
+    """The gateway refuses first; the channel does not fall back to UTC if it is built directly."""
+    with pytest.raises(HouseholdConfigError, match="ASSISTAI_TIMEZONE"):
+        channel_for(tmp_path, FakeSignal(), None, timezone=None)

@@ -327,6 +327,13 @@ async def test_missing_calendar_config_is_an_error() -> None:
         await client.agenda(datetime(2026, 9, 22).date())
 
 
+async def test_a_calendar_without_a_timezone_does_not_guess_utc() -> None:
+    """A "today" read in UTC is tomorrow in a Chicago evening."""
+    client = CalendarClient(_configured(timezone=None))
+    with pytest.raises(CalendarError, match="timezone is not configured"):
+        await client.agenda(datetime(2026, 9, 22).date())
+
+
 async def test_two_calendars_with_the_same_name_are_not_guessed() -> None:
     listed = _calendars().text.replace(
         "<d:displayname>Personal</d:displayname>",

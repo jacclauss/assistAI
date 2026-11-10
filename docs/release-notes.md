@@ -1,5 +1,17 @@
 # Release notes
 
+## Unreleased
+
+- The gateway needs `ASSISTAI_TIMEZONE` to start Signal. There is no longer
+  a UTC default. Without it the gateway logs `gateway.timezone_missing` and
+  exits. `make chat` still works without it.
+- Before Signal starts, the gateway waits up to two minutes for a
+  synchronized clock that is not behind the time it last saw. It logs the
+  zone and its UTC offset as `clock.zone`, then `clock.synced`, or
+  `clock.unsynced` when it starts anyway.
+- A proposal is dropped if the clock steps back to before it was made.
+  Say the request again.
+
 ## 0.1.8 — 24 October 2026
 
 Fixes from a review of the reminder and later-message work.
