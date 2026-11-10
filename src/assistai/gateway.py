@@ -246,14 +246,13 @@ class Gateway:
         it forward, fresh history looks old enough to delete. The clock is
         believed when the kernel says it is synchronized (or cannot say) and
         it is not more than five minutes behind the newest event in the store.
-        After the wait runs out Signal starts anyway; a household with no bot
-        is worse. Returns False when shutdown arrives first.
+        A row more than a day ahead is ignored only while the kernel says
+        synchronized, so a bad row cannot hold startup and a clock days behind
+        cannot pass as an empty store. After the wait runs out Signal starts
+        anyway; a household with no bot is worse. Returns False when shutdown
+        arrives first.
         """
         newest = self._store.newest_event_at() if self._store is not None else None
-        ahead = newest - self._now() if newest is not None else 0.0
-        if ahead > STORE_FUTURE_SECONDS:
-            log.warning("clock.store_in_future", ahead_seconds=round(ahead))
-            newest = None
         loop = asyncio.get_running_loop()
         # The wait is timed on the monotonic clock: the wall clock is the
         # thing that may step while we wait.
@@ -261,12 +260,21 @@ class Gateway:
         deadline = started + self._clock_wait_seconds
         waiting = False
         unknown_logged = False
+        future_logged = False
         while True:
             state = self._clock_sync.state()
             if state is ClockState.UNKNOWN and not unknown_logged:
                 log.warning("clock.sync_unknown", reason="the kernel did not report clock state")
                 unknown_logged = True
             behind = newest - self._now() if newest is not None else 0.0
+            # Only a synced kernel can call a far-ahead row bad. Unsynced or
+            # unknown, the same row may mean the clock is days behind, and
+            # dropping it would let that clock through.
+            if state is ClockState.SYNCED and behind > STORE_FUTURE_SECONDS:
+                if not future_logged:
+                    log.warning("clock.store_in_future", ahead_seconds=round(behind))
+                    future_logged = True
+                behind = 0.0
             kernel_ok = state is not ClockState.UNSYNCED
             store_ok = behind <= CLOCK_BEHIND_SECONDS
             if kernel_ok and store_ok:

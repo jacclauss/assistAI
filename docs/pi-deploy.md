@@ -196,8 +196,10 @@ started after two minutes on a clock the kernel had not synchronized, or one
 still behind the stored history: check NTP on the Pi
 (`timedatectl status`). `clock.sync_unknown` means the container could not
 ask the kernel, so only the stored history was checked. `clock.store_in_future`
-means a stored time is more than a day ahead of the clock; that row was
-ignored.
+means the kernel said the clock was synchronized but a stored time is more
+than a day ahead of it; that row was ignored. If the Pi's clock really is
+that far behind, `timedatectl status` will show it. Without a synced kernel
+the row is not ignored, and Signal waits the two minutes.
 
 ### Texts
 

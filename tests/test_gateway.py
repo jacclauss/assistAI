@@ -475,6 +475,41 @@ async def test_a_future_row_does_not_hold_startup(tmp_path: Path) -> None:
     assert any(entry["event"] == "gateway.signal_started" for entry in logs)
 
 
+async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Path) -> None:
+    """With no word from the kernel, a row 15 days ahead may mean the clock is 15 days behind.
+
+    Dropping it would start Signal at once, and history saved on that clock is
+    deleted when NTP later steps it forward past the 14-day window.
+    """
+    now = 1_800_000_000.0
+    _remember(tmp_path, at=now + 15 * 86400)
+    gateway = _clock_gateway(
+        kernel=FakeClockSync(ClockState.UNKNOWN),
+        tmp_path=tmp_path,
+        now=FakeClock(now),
+        wait_seconds=0.1,
+    )
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(gateway.run())
+        await asyncio.sleep(0.05)
+        assert gateway._channel_task is None
+        await asyncio.sleep(0.3)
+        gateway.request_shutdown("test")
+        await asyncio.wait_for(task, timeout=1)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == [
+        "clock.zone",
+        "clock.sync_unknown",
+        "clock.waiting_for_sync",
+        "clock.unsynced",
+    ]
+    waiting = next(entry for entry in logs if entry["event"] == "clock.waiting_for_sync")
+    assert waiting["behind_store_seconds"] == 15 * 86400
+    assert any(entry["event"] == "gateway.signal_started" for entry in logs)
+
+
 def _clock_gateway(
     *,
     kernel: FakeClockSync,

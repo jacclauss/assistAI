@@ -137,7 +137,10 @@ A new module holds every local-time rule. Nothing else calls `strftime`,
   refused, it logs `clock.sync_unknown` and relies on the store check. A
   stored timestamp more than 24 hours ahead is logged as
   `clock.store_in_future` and ignored, so a bad row cannot hold the gateway
-  down.
+  down, but only while the kernel reports the clock synchronized. Unsynced
+  or unknown, that row is kept and holds startup: it may mean the clock is
+  days behind. With the kernel synced, a clock days behind still looks like
+  a bad row; this is open.
 - `Store.take_proposal` also treats a proposal as expired when
   `now < created_at - 60`. A backward step can no longer keep a tainted
   proposal confirmable past its ten minutes. Together with the startup wait
@@ -591,9 +594,11 @@ What was the complaint in 0.1.8 is intended behaviour now.
 **The startup clock wait holds the gateway down.**
 
 - The wait is capped at 120 seconds and honours shutdown. A stored
-  timestamp more than 24 hours ahead is ignored.
+  timestamp more than 24 hours ahead is ignored when the kernel says synced.
   `test_gateway.py::test_signal_waits_for_a_synced_clock_then_starts` and
-  `test_gateway.py::test_a_future_row_does_not_hold_startup`.
+  `test_gateway.py::test_a_future_row_does_not_hold_startup`. With the
+  kernel call refused, that row still holds startup until the wait runs
+  out: `test_gateway.py::test_a_refused_kernel_call_does_not_drop_a_far_ahead_row`.
 - Watch `clock.unsynced` and `clock.sync_unknown` after each restart.
 
 **Nothing in this spec suppresses a message without saying so.** Every new
