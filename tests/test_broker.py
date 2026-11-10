@@ -13,6 +13,7 @@ from assistai.inference.types import Message, ToolCall, ToolSpec
 from assistai.jobs import Job, bind_jobs
 from assistai.store import Store
 from tests.agent_fakes import agent, household
+from tests.clock_fakes import FakeClock, chicago, wall
 from tests.fakes import body, tool_call
 
 
@@ -866,3 +867,45 @@ async def test_audit_is_bounded() -> None:
 
     assert len(broker.audit) == AUDIT_LIMIT
     assert broker.audit[-1].tool == f"t{AUDIT_LIMIT + 49}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C-2: a daily digest with no hour is staged and, after yes, saved to run at "
+        "the minute it was asked, 9:12 PM; fixed by spec 016 commit 6"
+    ),
+)
+async def test_a_daily_job_without_a_time_is_neither_staged_nor_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'Every morning' with no hour gets a question back, not a job at whatever time it is."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    ).for_agent(jacob, Scope())
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+    daily = {"kind": "schedule", "every_seconds": 86400}
+    digest = {**daily, "name": "morning email", "prompt": "Summarize my unread mail."}
+    reminder = {**daily, "name": "morning pills", "prompt": "Take your pills.", "verbatim": True}
+
+    # A digest stages and a clean verbatim reminder saves at once: both paths are checked.
+    results = [
+        await body(surface, ToolCall(id="c1", name="job_create", arguments=json.dumps(digest))),
+        await body(surface, ToolCall(id="c2", name="job_create", arguments=json.dumps(reminder))),
+    ]
+    staged = surface.take_staged()
+    for call in staged:
+        await surface.commit(call)  # the person's yes
+
+    for name in ("morning email", "morning pills"):
+        saved = store.find_job("jacob", name=name)
+        assert saved is None, f"{name} saved for {wall(saved.next_run_at)}"
+    assert staged == ()
+    assert all("error" in result for result in results), results
+    store.close()

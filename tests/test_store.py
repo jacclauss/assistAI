@@ -863,3 +863,23 @@ def _proposal(
         created_at=created_at,
         expires_at=expires_at,
     )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "X3-5: take_proposal checks only expires_at, so a clock stepped back an hour "
+        "keeps a stale yes live; fixed by spec 016 commit 3"
+    ),
+)
+def test_a_backward_clock_step_expires_a_proposal(tmp_path: Path) -> None:
+    """A clock that moved back before the proposal was made cannot be trusted to time it out."""
+    store = _store(tmp_path)
+    made = 1_800_000_000.0
+    store.replace_proposal(_proposal("jacob", "{}", created_at=made, expires_at=made + 600))
+
+    live, expired = store.take_proposal("jacob", now=made - 3600)
+
+    assert live is None
+    assert expired is True
+    store.close()

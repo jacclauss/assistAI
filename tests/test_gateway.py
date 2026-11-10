@@ -10,7 +10,7 @@ from pydantic import SecretStr
 from structlog.testing import capture_logs
 
 from assistai.config import Settings
-from assistai.errors import HouseholdConfigError, SignalUnavailableError
+from assistai.errors import AssistAIError, HouseholdConfigError, SignalUnavailableError
 from assistai.gateway import Gateway, install_signal_handlers
 from tests.fakes import PRIMARY, QUARANTINE, catalog_response, client_for, manifest
 from tests.signal_fakes import FakeChannel, FakeSignal, signal_settings
@@ -313,3 +313,29 @@ async def test_sigterm_requests_a_graceful_shutdown() -> None:
     await asyncio.wait_for(task, timeout=1)
 
     assert gateway.beats == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "B-8: an unset ASSISTAI_TIMEZONE falls back to UTC and Signal starts anyway; "
+        "fixed by spec 016 commit 3"
+    ),
+)
+async def test_signal_does_not_start_without_a_timezone() -> None:
+    """Without a household zone every reminder time is wrong, so nobody gets an answer."""
+    channel = FakeChannel()
+    gateway = Gateway(
+        signal_settings(heartbeat_seconds=0.01, FIREWORKS_API_KEY=None),
+        signal=FakeSignal(),
+        channel=channel,
+    )
+
+    task = asyncio.create_task(gateway.run())
+    await asyncio.sleep(0.05)
+    gateway.request_shutdown("test")
+    outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+
+    assert channel.ran is False
+    # __main__ turns an AssistAIError into exit status 2.
+    assert isinstance(outcome, AssistAIError)

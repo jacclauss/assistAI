@@ -11,19 +11,21 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-from assistai.agents import AgentSpec
+from assistai.agents import AgentSpec, Household
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.config import Settings
 from assistai.errors import InferenceError, JobError, SignalError, StoreError
-from assistai.inference.types import Message, ToolSpec
+from assistai.inference.types import Message, ToolCall, ToolSpec
 from assistai.jobs import JOB_CANCEL_SPEC, Job, JobOutcome, bind_jobs, is_nothing, parse_create
 from assistai.relay import using_agent
 from assistai.scheduler import JobRunner, NotifyStatus
 from assistai.store import Store
 from tests.agent_fakes import agent, household
 from tests.channel_fakes import channel_for
+from tests.clock_fakes import FakeClock, chicago, wall
 from tests.fakes import (
     Handler,
+    body,
     client_for,
     completion_stream,
     recorded,
@@ -2074,3 +2076,217 @@ async def test_job_run_cannot_stage_a_relay(tmp_path: Path) -> None:
     assert all(recipient != "+15555550102" for recipient, _text in signal.sent)
     await fireworks.aclose()
     store.close()
+
+
+def _daily_reminder(next_run_at: float, **overrides: object) -> Job:
+    """The mgmplus row's shape: a verbatim daily reminder, so no model call runs."""
+    values: dict[str, object] = {
+        "name": "mgmplus cancel reminder",
+        "prompt": "Cancel MGM+ before the rate goes up.",
+        "every_seconds": 86400,
+        "verbatim": True,
+        "created_at": chicago(2026, 10, 30, 21, 12),
+        "next_run_at": next_run_at,
+    }
+    values.update(overrides)
+    return _job(**values)
+
+
+def _next_run(store: Store) -> str:
+    saved = store.find_job("jacob", name="mgmplus cancel reminder")
+    assert saved is not None
+    return wall(saved.next_run_at)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C-1: a daily repeat adds 86400 s to the finish time, so 8:00 AM CDT "
+        "becomes 7:00 AM CST; fixed by spec 016 commit 5"
+    ),
+)
+async def test_a_daily_eight_am_job_stays_eight_am_across_fall_back(tmp_path: Path) -> None:
+    """A daily job keeps its local hour when Chicago leaves daylight saving on 2026-11-01."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 10, 31, 8)))
+    clock = FakeClock(chicago(2026, 10, 31, 8))
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+
+    await runner._tick()
+    assert _next_run(store) == "2026-11-01 08:00:00 CST"
+
+    clock.set(chicago(2026, 11, 1, 8))
+    await runner._tick()
+    assert _next_run(store) == "2026-11-02 08:00:00 CST"
+    store.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C-1: a daily repeat adds 86400 s to the finish time, so 8:00 AM CST "
+        "becomes 9:00 AM CDT; fixed by spec 016 commit 5"
+    ),
+)
+async def test_a_daily_eight_am_job_stays_eight_am_across_spring_forward(
+    tmp_path: Path,
+) -> None:
+    """A daily job keeps its local hour when Chicago enters daylight saving on 2027-03-14."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2027, 3, 13, 8)))
+    clock = FakeClock(chicago(2027, 3, 13, 8))
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+
+    await runner._tick()
+    assert _next_run(store) == "2027-03-14 08:00:00 CDT"
+
+    clock.set(chicago(2027, 3, 14, 8))
+    await runner._tick()
+    assert _next_run(store) == "2027-03-15 08:00:00 CDT"
+    store.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C-1: the next run is counted from when the retried send finished, so it "
+        "drifts to 8:03 AM; fixed by spec 016 commit 5"
+    ),
+)
+async def test_a_late_run_and_a_retry_do_not_move_the_next_run(tmp_path: Path) -> None:
+    """A slow digest and a failed send still leave tomorrow's run at 8:00 AM."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 7, 8), verbatim=False))
+    clock = FakeClock(chicago(2026, 12, 7, 8))
+    channel = _FakeJobChannel(
+        JobOutcome(text="two new invoices", found=True, untrusted=False),
+        notify="failed",
+        during_run=lambda: clock.set(chicago(2026, 12, 7, 8, 2)),
+    )
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+
+    await runner._tick()
+    channel.notify = "sent"
+    clock.set(chicago(2026, 12, 7, 8, 3))
+    await runner._tick()
+
+    assert channel.runs == 1
+    assert "two new invoices" in channel.notified[0][1]
+    assert _next_run(store) == "2026-12-08 08:00:00 CST"
+    store.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "C-3: a reschedule sets the next run to now plus the new interval, "
+        "dropping Dec 7 at 8:00 AM; fixed by spec 016 commit 7"
+    ),
+)
+async def test_reschedule_keeps_the_next_run_and_its_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing only how often a job repeats does not move the run already planned."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 7, 8)))
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await reschedule({"name": "mgmplus cancel reminder", "every_seconds": 7 * 86400})
+
+    assert _next_run(store) == "2026-12-07 08:00:00 CST"
+    store.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "X3-3: job_list hands the model next_run_at as a Unix float to convert; "
+        "fixed by spec 016 commit 8"
+    ),
+)
+async def test_job_list_reports_local_time_not_unix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model reads the household's words for a time, never a number it must convert."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    list_jobs = bind_jobs(store, timezone="America/Chicago")["job_list"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        raw = await list_jobs({})
+
+    assert _unix_numbers(json.loads(raw)) == []
+    assert "December 10" in raw
+    assert "8:00 AM" in raw
+    store.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "X3-1: start_at is read with fold 0, so 1:40 AM after fall-back is the "
+        "CDT 1:40 already past; fixed by spec 016 commit 6"
+    ),
+)
+async def test_a_reminder_at_one_forty_after_fall_back_is_twenty_minutes_away(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At 1:20 AM CST the next 1:40 AM is the one still ahead, twenty minutes out."""
+    store = Store(tmp_path / "assistai.sqlite")
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        catalog.bind(name, handler)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    ).for_agent(jacob)
+    now = chicago(2026, 11, 1, 1, 20, fold=1)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(now))
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+
+    saved = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_create",
+            arguments=json.dumps(
+                {
+                    "kind": "schedule",
+                    "name": "thermostat",
+                    "prompt": "Turn the thermostat down.",
+                    "every_seconds": 86400,
+                    "once": True,
+                    "verbatim": True,
+                    "start_at": "2026-11-01T01:40",
+                }
+            ),
+        ),
+    )
+
+    assert saved.get("ok") is True, saved
+    created = store.find_job("jacob", name="thermostat")
+    assert created is not None
+    assert created.next_run_at == now + 1200
+    store.close()
+
+
+def _home() -> Household:
+    return household(agent("jacob", "+15555550101"), agent("spouse", "+15555550102"))
+
+
+def _unix_numbers(value: object) -> list[float]:
+    """Every number in a tool result large enough to be a Unix time."""
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [value] if value > 1e9 else []
+    if isinstance(value, dict):
+        return [n for item in value.values() for n in _unix_numbers(item)]
+    if isinstance(value, list):
+        return [n for item in value for n in _unix_numbers(item)]
+    return []

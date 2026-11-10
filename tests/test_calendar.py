@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Self
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
-from assistai.broker import ToolBroker, builtin_catalog
+from assistai.broker import BoundSurface, ToolBroker, builtin_catalog
 from assistai.calendar.client import CalendarClient, host_allowed
 from assistai.calendar.draft import parse_add
 from assistai.calendar.ics import render_event
@@ -17,6 +17,7 @@ from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_TODAY, bind_calendar
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from tests.agent_fakes import agent, household
+from tests.clock_fakes import chicago
 from tests.fakes import settings, tool_call
 
 _PASSWORD = "app-secret-password"
@@ -550,3 +551,68 @@ async def test_calendar_add_stages_until_commit() -> None:
     )
     assert "summary is required" in refused.content
     assert surface.take_staged() == ()
+
+
+def _staging_surface() -> BoundSurface:
+    async def handler(_arguments: dict[str, Any]) -> str:
+        raise AssertionError("a refused add must not reach the calendar")
+
+    jacob = agent("jacob", "+15555550101", tools=("calendar_add",))
+    catalog = builtin_catalog()
+    catalog.bind(CALENDAR_ADD, handler)
+    return ToolBroker(catalog, household(jacob, agent("spouse", "+15555550102")).broker).for_agent(
+        jacob
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "X3-1: a naive start is accepted even when that wall time does not exist; "
+        "fixed by spec 016 commit 10"
+    ),
+)
+async def test_add_in_the_spring_gap_is_refused() -> None:
+    """2:30 AM on 2027-03-14 never happens in Chicago. Saying so beats guessing an hour."""
+    surface = _staging_surface()
+
+    refused = await surface.execute(
+        tool_call(
+            name=CALENDAR_ADD,
+            arguments='{"summary": "Feed the baby", "start": "2027-03-14T02:30"}',
+        )
+    )
+
+    assert "does not exist" in refused.content
+    assert surface.take_staged() == ()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "X3-7: the ten-year bound uses date.today(), the UTC date on the Pi, which is "
+        "already 2027 at 7:00 PM CST on Dec 31; fixed by spec 016 commit 10"
+    ),
+)
+async def test_year_bound_uses_the_household_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On New Year's Eve evening in Chicago, the household year is still 2026."""
+    utc_day = datetime.fromtimestamp(chicago(2026, 12, 31, 19), UTC).date()
+
+    class PiDate(date):
+        # The Pi container's local clock is UTC, so its date.today() is the UTC date.
+        @classmethod
+        def today(cls) -> Self:
+            return cls(utc_day.year, utc_day.month, utc_day.day)
+
+    monkeypatch.setattr("assistai.calendar.draft.date", PiDate)
+    surface = _staging_surface()
+
+    too_far = await surface.execute(
+        tool_call(name=CALENDAR_ADD, arguments='{"summary": "Renew", "start": "2037-01-15T10:00"}')
+    )
+    in_range = await surface.execute(
+        tool_call(name=CALENDAR_ADD, arguments='{"summary": "Look", "start": "2016-12-31T10:00"}')
+    )
+
+    assert "too far" in too_far.content
+    assert "staged" in in_range.content
