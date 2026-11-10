@@ -7,8 +7,11 @@ those days and let this module turn them into the instants the code stores.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+from assistai.clock import HouseholdClock
 
 CHICAGO = ZoneInfo("America/Chicago")
 
@@ -47,3 +50,11 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+def chicago_clock(now: float | Callable[[], float]) -> HouseholdClock:
+    """The household clock in Chicago, stopped at ``now`` or driven by a ``FakeClock``."""
+    if callable(now):
+        return HouseholdClock(zone=CHICAGO, now=now)
+    moment = now
+    return HouseholdClock(zone=CHICAGO, now=lambda: moment)
