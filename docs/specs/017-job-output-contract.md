@@ -338,8 +338,14 @@ CREATE INDEX IF NOT EXISTS job_runs_job ON job_runs(job_id, finished_at);
 
 Spec 018 stage 5 adds claim columns to this table (`slot`, `attempt`,
 `claimed_at`, `outbox_id`, `phase`). It does not create a second `job_runs`
-and it does not change these columns. Its downgrade to schema 20 drops only
-the columns it added. The rows written here stay. Dropping the table is the
+and it does not rename, retype, or remove these columns. It does change one
+thing here: `finished_at`, `status`, and `looks` become nullable, because
+stage 5 writes a claim row when a slot starts and fills those three when
+the run finishes. From stage 5 on, `record_job_run` updates that claim row
+instead of inserting, and only rows with a `status` are this spec's
+results. Its downgrade to schema 20 rebuilds the table with these columns
+exactly as declared above, the three `NOT NULL` again, and keeps every
+row that has them. The rows written here stay. Dropping the table is the
 16-to-15 downgrade below, and only that.
 
 `Store.record_job_run(run)` inserts the row and, in the same transaction,

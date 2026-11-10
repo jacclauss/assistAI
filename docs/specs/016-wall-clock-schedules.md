@@ -170,19 +170,27 @@ still step a row after a rollback.
   whose `zone` is NULL, active and cancelled alike. The gateway calls it on
   every start, before the runner. For each row:
   - `zone` is the household zone. The chosen slot is `next_run_at` when
-    the job has never run, and `next_run_at - every_seconds` when it has.
-    That earlier instant is the slot the person chose, so a daily job
-    stepped across Nov 1 by 0.1.8 keeps 8:00 and does not become 7:00.
-    `anchor_at` is that chosen slot, not the stored `next_run_at`.
+    the job has never run (`last_run_at IS NULL`), and
+    `next_run_at - every_seconds` when it has. That earlier instant is the
+    slot the person chose, so a daily job stepped across Nov 1 by 0.1.8
+    keeps 8:00 and does not become 7:00. `anchor_at` is that chosen slot,
+    not the stored `next_run_at`.
   - When `every_seconds` is a whole number of days, `every_days` is that
     number and `at_local` is the local time of the chosen slot, to the
-    minute. `next_run_at` is then replaced with
-    `next_slot(schedule, after=max(now, chosen))`. The drifted instant is
-    discarded. The job's next fire is the next correct local slot, once.
-    It does not fire at the drifted hour and again at 8:00 the same
-    morning.
-  - Otherwise the row stays elapsed with its `every_seconds`, and
-    `next_run_at` is left as stored.
+    minute.
+  - A row that has never run keeps its stored `next_run_at`. Nothing has
+    stepped it, so it is the chosen slot itself and has not drifted. The
+    mgmplus row keeps 2026-12-10 08:00 CST. If that instant has already
+    passed, the row is due and runs once at the next tick, and
+    `advance_job` then puts it on its slot, as for any missed run.
+  - A row that has run, and is whole-day, has its `next_run_at` replaced
+    with `next_slot(schedule, after=max(now, chosen))`. The chosen slot
+    already ran, so the next fire is strictly after it. The drifted
+    instant is discarded. The job's next fire is the next correct local
+    slot, once. It does not fire at the drifted hour and again at 8:00 the
+    same morning.
+  - A row whose `every_seconds` is not a whole number of days stays
+    elapsed with its `every_seconds`, and `next_run_at` is left as stored.
   - Each row is logged as `store.job_schedule_migrated` with the job id,
     `every_days`, `at_local`, and whether it is cancelled. Never the prompt.
   - The runner skips a row whose `zone` is still NULL and logs
@@ -464,7 +472,12 @@ day until noticed.
   row with an outbox, a 60-second watch, and a delayed relay. It asserts
   every row survives, cancelled rows stay cancelled and gain a zone, the
   mgmplus row gets `every_days` 1 and `at_local` 08:00 with an unchanged
-  `next_run_at`, and the watch stays elapsed.
+  `next_run_at`, and the watch stays elapsed. The test runs the backfill
+  with `now` on 2026-11-09, so the stored first fire is still ahead.
+- `test_store.py::test_a_legacy_row_that_never_ran_keeps_its_first_fire`
+  backfills a never-run daily row at three clocks: a day before its first
+  fire, a minute before it, and an hour after it. In all three,
+  `next_run_at` is unchanged. It is never moved to the following day.
 - Before deploy B, the operator copies the Pi's state volume (the tar
   command in `pi-deploy.md`), opens the copy with the new image, and runs
   `store jobs --next 3` and `store jobs --from 2027-03-12 --next 4`. Both
@@ -794,11 +807,14 @@ the same schema. Closed after the phone checks pass, the next morning's
   (`tests/test_calendar.py::test_calendar_today_names_the_day_relative_to_today`)
 - [ ] AC15 — A version 14 file shaped like the Pi's upgrades with every row
   kept, the mgmplus row at `every_days` 1 and 08:00, cancelled rows intact,
-  and a stepped daily row on its original hour. Its `next_run_at` is the
-  next correct local slot, not the drifted instant, so it texts once that
-  day. Rollback to 14 and forward again backfills a row the older version
-  wrote.
+  and a stepped daily row on its original hour. A row that has never run
+  keeps its stored first fire, so the mgmplus row still fires on
+  December 10 at 8:00 AM, not December 11. A stepped row's `next_run_at`
+  is the next correct local slot, not the drifted instant, so it texts
+  once that day. Rollback to 14 and forward again backfills a row the
+  older version wrote.
   (`tests/test_store.py::test_schema_v14_gains_wall_clock_schedules_and_keeps_rows`,
+  `tests/test_store.py::test_a_legacy_row_that_never_ran_keeps_its_first_fire`,
   `tests/test_store.py::test_a_legacy_daily_row_that_ran_keeps_its_hour`,
   `tests/test_store.py::test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it`,
   `tests/test_store.py::test_downgrade_refuses_a_file_it_does_not_recognise`)

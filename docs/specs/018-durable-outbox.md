@@ -465,20 +465,46 @@ Migration from 19 creates `applied_effects`. Downgrade drops it.
 `job_runs` already exists. Spec 017 created it at schema 16, with the
 finish columns and the result `status` (`reported`, `nothing`, `quiet`,
 `not_checked`, `refused`). This stage does not create that table again and
-does not replace those columns. `CREATE TABLE IF NOT EXISTS` would keep
-017's shape and then fail every `slot` query.
+does not rename, retype, or remove any of its columns.
+`CREATE TABLE IF NOT EXISTS` would keep 017's shape and then fail every
+`slot` query.
 
-This stage adds columns to that table:
+This stage changes that table:
 
 - `slot REAL`, the instant spec 016 scheduled. Null on rows 017 wrote
   before this migration. Those rows are history, not claims.
 - `phase TEXT NOT NULL DEFAULT 'finished'`. `claimed`, `running`,
   `interrupted`, or `finished`. This is separate from 017's `status`, which
-  stays the result of a finished run and is null until then.
+  stays the result of a finished run.
 - `attempt INTEGER NOT NULL DEFAULT 1`, `claimed_at REAL`, `outbox_id TEXT`.
+- `finished_at`, `status`, and `looks` become nullable. 017 declares them
+  `NOT NULL` because it writes a row only when a run finishes. A claim is
+  written when a slot starts, before any of the three exists, so it cannot
+  be inserted while they are `NOT NULL`. These three are the only
+  nullability this stage changes. `id`, `job_id`, `agent`, and
+  `started_at` stay `NOT NULL`, and a claim sets `started_at` to the time
+  of its first claim. `finish_reason` and `refusal` are already nullable,
+  and `report_chars` and `untrusted` have defaults.
 
 A partial unique index on `(job_id, slot) WHERE slot IS NOT NULL` stops two
 claims for one slot. It does not cover 017's older rows.
+
+What each row holds:
+
+- A digest claim is inserted with `phase` `claimed` and `finished_at`,
+  `status`, and `looks` null. Its run transaction fills them, sets `phase`
+  `finished`, and sets `outbox_id`. `Store.record_job_run(run)` now
+  updates the claim row by its id instead of inserting a new one, so a
+  slot has one row from claim to finish.
+- A verbatim reminder or a relay row is inserted already `finished`, in
+  the same transaction as its enqueue and advance, with `finished_at` and
+  `outbox_id` set and `status` and `looks` null. No model ran, and 017
+  writes no run row for these.
+- A row with `status` set is a 017 result. `Store.recent_job_runs` returns
+  only those rows, so 017's readers never see a claim or a reminder row.
+- The trim in `record_job_run` keeps the newest 20 `finished` rows per job
+  and never deletes a row in any other phase, so the unique index still
+  covers every slot in progress.
 
 `history_meta` is new: `agent` primary key, `rev` integer.
 
@@ -489,13 +515,15 @@ Changes:
   before the next.
 - Each fire re-reads its row by id. It inserts a claim for `(job_id, slot)`
   with `phase` `claimed`. If that claim already exists, it continues only
-  when the phase is `interrupted`: it sets the phase back to `claimed` and
-  adds one to `attempt`. A `claimed`, `running`, or `finished` claim is
-  left alone. A cancelled or held job is not claimed. A verbatim
-  reminder or a relay is claimed, enqueued, and advanced in one
-  transaction, with no model. A digest is claimed, then run, then its
-  outcome, report row, and advance commit in one transaction with a
-  `cancelled_at IS NULL` guard.
+  when the phase is `interrupted`: it sets the phase back to `claimed`,
+  sets `claimed_at`, and adds one to `attempt`. A `claimed`, `running`, or
+  `finished` claim is left alone, because inside one process those belong
+  to a fire that is still going or is done. A cancelled or held job is not
+  claimed. A verbatim reminder or a relay is claimed, enqueued, and
+  advanced in one transaction, with no model, so it has no claimed state
+  a crash can leave behind. A digest commits its claim, sets `phase`
+  `running` when `JobModel` starts, and then its outcome, report row, and
+  advance commit in one transaction with a `cancelled_at IS NULL` guard.
 - `run_job` moves from `SignalChannel` into `src/assistai/scheduler.py` as
   `JobModel`. It reads whatever context spec 017 defines straight from
   SQLite. It takes no peer lock, no `_slots` permit, and no history lock.
@@ -509,18 +537,39 @@ Changes:
   messages on top, and saves again, up to three times. A turn's history
   lock stays inside the channel and is never taken by the runner or the
   worker.
-- Recovery sets a `running` phase to `interrupted`. The slot stays due.
-  The next claim finds that phase and runs the slot once more, because its
-  report never went out. A `finished` phase does not run again. An
-  interrupted row is the claim, so "do nothing if the claim exists" does
-  not apply to it.
+- Recovery sets every `claimed` and every `running` phase to
+  `interrupted`, and logs `recovery.run_interrupted` with the job id, the
+  slot, and the phase it found. Recovery runs before the runner starts, so
+  no fire of this process owns such a row. It is what a crash left between
+  the claim commit and the run transaction, whether before `running` was
+  set or after. The slot stays due, because only the run transaction
+  advances `next_run_at`. The next tick finds the `interrupted` phase and
+  runs the slot once more, because its report never went out. A
+  `finished` phase does not run again. An interrupted row is the claim, so
+  "do nothing if the claim exists" does not apply to it. If the job was
+  cancelled before the restart, the row stays `interrupted` and nothing is
+  sent, as the cancel asked.
 
-Migration from 20 adds the columns and the partial index, and creates
-`history_meta`. It does not rebuild `job_runs`. `history_meta` starts at 0
-for each agent with history. Existing run rows get `phase` `finished` and a
-null `slot`. Downgrade to 20 drops `slot`, `attempt`, `claimed_at`,
-`outbox_id`, and `phase`, and keeps every 017 column and row. It refuses
-while any phase is `claimed` or `running`. It does not drop `job_runs`.
+SQLite cannot drop `NOT NULL` with `ALTER TABLE`, so the migration from 20
+rebuilds `job_runs` in one transaction. It creates `job_runs_v21` with
+017's columns in 017's order, `finished_at`, `status`, and `looks`
+nullable, and the five claim columns. It copies every row with `phase`
+`finished` and a null `slot`, drops `job_runs`, renames the copy, and
+recreates `job_runs_job` and the partial unique index. It also creates
+`history_meta`, which starts at 0 for each agent with history. Every 017
+row comes through with the same values.
+
+Downgrade to 20 puts 017's shape back, also by a rebuild in one
+transaction. It refuses while any phase is `claimed` or `running` unless
+`--force` is given, as every stage's downgrade does. It creates the table
+with 017's exact columns, `finished_at`, `status`, and `looks`
+`NOT NULL` again, and copies only rows where all three are set. Those are
+every row 017 wrote and every digest run this stage finished. Reminder and
+relay rows, interrupted claims, and with `--force` any claimed or running
+row are dropped, and `--force` prints them first. A dropped claim's slot
+is still due in `jobs.next_run_at`, so the version 20 runner runs it. The
+downgrade recreates `job_runs_job`, drops `history_meta`, and sets
+`user_version` to 20. It does not drop `job_runs`.
 
 ### Contracts with 016 and 017
 
@@ -538,6 +587,9 @@ This spec must leave these unchanged:
   (`status`, `looks`, `finish_reason`, `refusal`, `report_chars`) and is
   never re-derived. The runner decides what to send from `status` as 017
   says. `phase` only records whether the slot is still in progress.
+  `status` and `looks` are null only on a claim that has not finished and
+  on a reminder or relay row, which 017 never records. Stage 5's downgrade
+  restores 017's `NOT NULL` on them and on `finished_at`.
 - Spec 017's outbound check. Model text reaches `Outbox.enqueue` only
   after it. The enqueue API takes 017's checked type for model text and a
   separate type for server text. The worker does not edit a part. The one
@@ -721,7 +773,8 @@ network.
 `outbox.cancelled_before_send`, `outbox.withdrawn`, `staging.opened`,
 `staging.call_done`, `staging.call_failed`, `staging.call_uncertain`,
 `staging.summary_unsaved`, `recovery.turn_interrupted`,
-`recovery.proposal_resumed`, `recovery.proposal_abandoned`,
+`recovery.run_interrupted`, `recovery.proposal_resumed`,
+`recovery.proposal_abandoned`,
 `recovery.reminder_released`, `signal.inbound_duplicate`,
 `signal.edit_refused`, `jobs.run_claimed`, `jobs.run_reported`,
 `shutdown.drain_started`, `shutdown.turn_cancelled`, `shutdown.drained`.
@@ -797,9 +850,10 @@ Stages:
    uncertain retry on resume; docs. Before it ships, `make live` with the two
    provider tests. Pi check: confirm one calendar add and one draft, and see
    one of each.
-7. **Stage 5, schema 21.** Commits: claim columns on `job_runs`; per-job tasks; `JobModel`
-   out of the channel; `history_meta` and `append_history`; recovery for
-   runs; docs. Pi check: while one phone is mid-turn, a reminder on the
+7. **Stage 5, schema 21.** Commits: claim columns on `job_runs`, with
+   `finished_at`, `status`, and `looks` nullable by a rebuild; per-job
+   tasks; `JobModel` out of the channel; `history_meta` and
+   `append_history`; recovery for claimed and running runs; docs. Pi check: while one phone is mid-turn, a reminder on the
    other phone fires on time; `jobs.run_claimed` and `jobs.run_reported`
    appear once per slot.
 
@@ -873,9 +927,9 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC5.1 — One person's slow turn does not delay the other person's due reminder. Closes X6-6 (`tests/test_jobs.py::test_a_slow_turn_does_not_delay_another_persons_reminder`)
 - [ ] AC5.2 — The runner takes no channel lock and does not import `signal.channel` (`tests/test_invariants.py::test_the_job_runner_does_not_reach_into_the_channel`)
 - [ ] AC5.3 — A relay cancelled while another job runs in the same tick is not sent. Closes C-4 (`tests/test_jobs.py::test_a_relay_cancelled_during_another_run_is_not_sent`)
-- [ ] AC5.4 — A slot runs once. A restart during a run marks that claim interrupted and the next tick reclaims it and runs it once more. A finished slot never runs again (`tests/test_jobs.py::test_a_slot_runs_once_across_restarts`, `tests/test_jobs.py::test_an_interrupted_claim_is_reclaimed`)
+- [ ] AC5.4 — A slot runs once. A restart after a digest's claim commits, whether before its phase is `running` or during the run, marks that claim interrupted at recovery, and the next tick reclaims it and runs it once more. A finished slot never runs again (`tests/test_jobs.py::test_a_slot_runs_once_across_restarts`, `tests/test_jobs.py::test_an_interrupted_claim_is_reclaimed`, `tests/test_recovery.py::test_a_claim_left_before_running_is_reclaimed_after_restart`)
 - [ ] AC5.5 — A report appended during a turn survives that turn's save (`tests/test_channel.py::test_a_report_appended_mid_turn_survives_the_turn_save`)
-- [ ] AC5.6 — Migration adds claim columns to 017's `job_runs` and keeps its rows; downgrade drops those columns and still opens the 017 rows (`tests/test_store.py::test_schema_v20_adds_claim_columns_to_job_runs`, `tests/test_store.py::test_downgrade_from_v21_keeps_job_run_rows`)
+- [ ] AC5.6 — Migration rebuilds 017's `job_runs` with the claim columns and with `finished_at`, `status`, and `looks` nullable, and keeps its rows. A digest claim inserts with those three null, and its finish updates the same row. `recent_job_runs` returns only rows with a `status`. Downgrade rebuilds the table with those three `NOT NULL` again, keeps every row that has them, and the 017 rows still open (`tests/test_store.py::test_schema_v20_adds_claim_columns_to_job_runs`, `tests/test_store.py::test_a_claim_inserts_before_its_run_finishes`, `tests/test_store.py::test_recent_job_runs_skips_claims_and_reminder_rows`, `tests/test_store.py::test_downgrade_from_v21_restores_not_null_and_keeps_job_run_rows`)
 - [ ] AC5.7 — Architecture's jobs section describes the runner as its own task, still in-process (manual read)
 
 ## Security review
