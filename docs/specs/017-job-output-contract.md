@@ -336,6 +336,12 @@ CREATE TABLE IF NOT EXISTS job_runs (
 CREATE INDEX IF NOT EXISTS job_runs_job ON job_runs(job_id, finished_at);
 ```
 
+Spec 018 stage 5 adds claim columns to this table (`slot`, `attempt`,
+`claimed_at`, `outbox_id`, `phase`). It does not create a second `job_runs`
+and it does not change these columns. Its downgrade to schema 20 drops only
+the columns it added. The rows written here stay. Dropping the table is the
+16-to-15 downgrade below, and only that.
+
 `Store.record_job_run(run)` inserts the row and, in the same transaction,
 deletes all but the newest 20 rows for that job. `Store.recent_job_runs(agent,
 job_id, limit)` filters by agent as well as job. Report text is not stored

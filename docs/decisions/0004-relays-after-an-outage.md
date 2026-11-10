@@ -23,11 +23,12 @@ for 8:00 could arrive in the afternoon.
 ## Decision
 
 A part that may not have arrived when the process was killed is sent once
-more, after the line "Sent again after a restart. You may already have this
-part." This holds for every outbound message, relays included. On a relay
-that line goes in front of the stored bytes on the other phone; the bytes
-themselves are unchanged. A scheduled relay may go out up to one hour after
-its time. After that it is dropped, and the sender is told it was not
+more, after its own message, "Sent again after a restart. You may already
+have this part." That message is sent immediately before the part. The
+part itself is not edited, so a full-size part still fits one Signal send.
+This holds for every outbound message, relays included. On a relay the
+line is the message in front of the stored bytes on the other phone; the
+bytes themselves are unchanged. A scheduled relay may go out up to one hour after its time. After that it is dropped, and the sender is told it was not
 delivered.
 
 ## Consequences

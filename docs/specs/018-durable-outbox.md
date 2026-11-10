@@ -111,10 +111,13 @@ response. `SignalClient.send` and `_chunks` go away in stage 2.
 **Uncertain parts.** Signal has no idempotency key. A part that was
 `sending` when the process died may or may not have arrived. At start, the
 recovery step marks every `sending` part `uncertain`. An uncertain part is
-sent once more, preceded by the fixed line "Sent again after a restart. You
-may already have this part." This holds for every outbound message,
-relays included. On a relay the line goes in front of the stored bytes,
-which are unchanged ([decision 0004](../decisions/0004-relays-after-an-outage.md)).
+sent once more. Immediately before it, the worker inserts and sends a new
+part whose whole text is the fixed line "Sent again after a restart. You
+may already have this part." The original part is not edited, so a part
+that already fills `MAX_SEND_CHARS` still fits one Signal send. This holds
+for every outbound message, relays included. On a relay the line is the
+message in front of the stored bytes, which are unchanged
+([decision 0004](../decisions/0004-relays-after-an-outage.md)).
 The window is one HTTP POST plus the SQLite update after it. The shutdown
 drain below lets an in-flight POST finish, so only a SIGKILL or a power cut
 leaves one.
@@ -265,8 +268,9 @@ Changes:
   enqueued only when the record step is done. That keeps the PRD rule that
   the sender is told only after her record is stored. `deliver_stored_relay`
   splits into `enqueue_relay` and the record step. An uncertain relay part
-  is sent once more after the resend line, in front of the unchanged stored
-  bytes. Her record stores the body only, without that line.
+  is sent once more, with the resend line as the message in front of the
+  unchanged stored bytes. Her record stores the body only, without that
+  line.
 - An immediate relay at commit enqueues the same row. The handler waits for
   its parts, up to 30 seconds, before returning. A record that fails is
   retried by its step and never resends the text. If the parts have not
@@ -458,22 +462,36 @@ Migration from 19 creates `applied_effects`. Downgrade drops it.
 
 ### Stage 5: a job runner of its own (schema 21)
 
-Tables:
+`job_runs` already exists. Spec 017 created it at schema 16, with the
+finish columns and the result `status` (`reported`, `nothing`, `quiet`,
+`not_checked`, `refused`). This stage does not create that table again and
+does not replace those columns. `CREATE TABLE IF NOT EXISTS` would keep
+017's shape and then fail every `slot` query.
 
-- `job_runs`: `id`, `job_id`, `slot` (the instant spec 016 scheduled),
-  `status` (`claimed`, `running`, `reported`, `done`, `skipped`,
-  `interrupted`), `attempt`, `claimed_at`, `finished_at`, `outcome`
-  (spec 017's structured result, stored as 017 defines it), `outbox_id`.
-  Unique `(job_id, slot)`.
-- `history_meta`: `agent` primary key, `rev` integer.
+This stage adds columns to that table:
+
+- `slot REAL`, the instant spec 016 scheduled. Null on rows 017 wrote
+  before this migration. Those rows are history, not claims.
+- `phase TEXT NOT NULL DEFAULT 'finished'`. `claimed`, `running`,
+  `interrupted`, or `finished`. This is separate from 017's `status`, which
+  stays the result of a finished run and is null until then.
+- `attempt INTEGER NOT NULL DEFAULT 1`, `claimed_at REAL`, `outbox_id TEXT`.
+
+A partial unique index on `(job_id, slot) WHERE slot IS NOT NULL` stops two
+claims for one slot. It does not cover 017's older rows.
+
+`history_meta` is new: `agent` primary key, `rev` integer.
 
 Changes:
 
 - `JobRunner._tick` dispatches each due job as its own task, bounded by
   `job_concurrency` (default 2), and returns. It no longer awaits one fire
   before the next.
-- Each fire re-reads its row by id, claims `(job_id, slot)`, and does
-  nothing if the claim exists or the job is cancelled or held. A verbatim
+- Each fire re-reads its row by id. It inserts a claim for `(job_id, slot)`
+  with `phase` `claimed`. If that claim already exists, it continues only
+  when the phase is `interrupted`: it sets the phase back to `claimed` and
+  adds one to `attempt`. A `claimed`, `running`, or `finished` claim is
+  left alone. A cancelled or held job is not claimed. A verbatim
   reminder or a relay is claimed, enqueued, and advanced in one
   transaction, with no model. A digest is claimed, then run, then its
   outcome, report row, and advance commit in one transaction with a
@@ -491,13 +509,18 @@ Changes:
   messages on top, and saves again, up to three times. A turn's history
   lock stays inside the channel and is never taken by the runner or the
   worker.
-- Recovery marks a `running` run `interrupted`. That slot stays due and
-  runs once more, because its report never went out. A slot that reached
-  `reported` does not run again.
+- Recovery sets a `running` phase to `interrupted`. The slot stays due.
+  The next claim finds that phase and runs the slot once more, because its
+  report never went out. A `finished` phase does not run again. An
+  interrupted row is the claim, so "do nothing if the claim exists" does
+  not apply to it.
 
-Migration from 20 creates both tables. `history_meta` starts at 0 for each
-agent with history. Downgrade drops them, after refusing while a run is
-`running`.
+Migration from 20 adds the columns and the partial index, and creates
+`history_meta`. It does not rebuild `job_runs`. `history_meta` starts at 0
+for each agent with history. Existing run rows get `phase` `finished` and a
+null `slot`. Downgrade to 20 drops `slot`, `attempt`, `claimed_at`,
+`outbox_id`, and `phase`, and keeps every 017 column and row. It refuses
+while any phase is `claimed` or `running`. It does not drop `job_runs`.
 
 ### Contracts with 016 and 017
 
@@ -511,12 +534,16 @@ This spec must leave these unchanged:
   time in a notice uses 016's formatter. The C-1 tests 016 changes are
   016's. This spec's job tests take their expected next run from 016's
   function, not from a literal.
-- Spec 017's structured job result. It is stored in `job_runs.outcome` and
-  never re-derived. The runner decides what to send from it as 017 says.
+- Spec 017's structured job result. It stays in the columns 017 defined
+  (`status`, `looks`, `finish_reason`, `refusal`, `report_chars`) and is
+  never re-derived. The runner decides what to send from `status` as 017
+  says. `phase` only records whether the slot is still in progress.
 - Spec 017's outbound check. Model text reaches `Outbox.enqueue` only
   after it. The enqueue API takes 017's checked type for model text and a
-  separate type for server text. The worker never alters text. It only
-  splits it into parts after 017's length cap.
+  separate type for server text. The worker does not edit a part. The one
+  addition is the resend part inserted ahead of an uncertain part, and
+  that part is server text, not a change to the stored bytes. Splitting
+  happens at enqueue, after 017's length cap.
 - Spec 017's history representation for job runs, previews, summaries, and
   notices. The `history` step writes the messages 017 builds, unchanged.
   Recovery and failure notices use 017's notice form.
@@ -623,7 +650,7 @@ downgrades the migrated copy and opens it with the previous image's
 repeat or drop that part. Mitigation: the drain lets the POST finish. A part
 POST gets its own 15-second timeout, `signal_part_timeout_seconds`, instead of
 the 60-second request timeout, so the drain is bounded. An uncertain part
-is sent once more after the resend line, so the failure mode is a labelled
+is sent once more after its own resend message, so the failure mode is a labelled
 repeat, never a silent gap (decision 0004). Logs `outbox.part_uncertain`.
 On a deploy with nobody texting, the expected count is zero.
 
@@ -770,7 +797,7 @@ Stages:
    uncertain retry on resume; docs. Before it ships, `make live` with the two
    provider tests. Pi check: confirm one calendar add and one draft, and see
    one of each.
-7. **Stage 5, schema 21.** Commits: `job_runs`; per-job tasks; `JobModel`
+7. **Stage 5, schema 21.** Commits: claim columns on `job_runs`; per-job tasks; `JobModel`
    out of the channel; `history_meta` and `append_history`; recovery for
    runs; docs. Pi check: while one phone is mid-turn, a reminder on the
    other phone fires on time; `jobs.run_claimed` and `jobs.run_reported`
@@ -798,7 +825,7 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC1.4 — A reply saved and then cancelled before its send goes out after a restart, and a preview too old by then is withdrawn with a notice. Closes E-5 and X6-7 (`tests/test_channel.py::test_a_reply_cancelled_before_send_goes_out_after_restart`, `tests/test_channel.py::test_a_stale_preview_is_withdrawn_not_sent`)
 - [ ] AC1.5 — A summary whose save fails is not sent until it is stored, and the next turn sees it. Closes X5-4, D-12, and X6-3 (`tests/test_channel.py::test_a_summary_is_sent_only_after_it_is_stored`)
 - [ ] AC1.6 — An update notice is saved and queued together; a failed save sends nothing, and a later check sends it once. Closes G-4 (`tests/test_updates.py::test_a_notice_is_saved_before_it_is_sent`)
-- [ ] AC1.7 — A part in flight at a kill is uncertain at the next start and is sent once more after "Sent again after a restart. You may already have this part.", and only once (`tests/test_outbox.py::test_a_part_in_flight_at_a_kill_is_uncertain_after_restart`, `tests/test_outbox.py::test_an_uncertain_part_is_resent_once_after_the_marker`)
+- [ ] AC1.7 — A part in flight at a kill is uncertain at the next start. It is sent once more, unchanged, after a separate message that is only "Sent again after a restart. You may already have this part.", and only once. A part of 1,900 characters still fits one send (`tests/test_outbox.py::test_a_part_in_flight_at_a_kill_is_uncertain_after_restart`, `tests/test_outbox.py::test_an_uncertain_part_is_resent_once_after_the_marker`, `tests/test_outbox.py::test_a_full_part_plus_the_resend_message_fits_two_sends`)
 - [ ] AC1.8 — Outbox rows keep their untrusted label, and their errors hold no response body (`tests/test_outbox.py::test_an_outbox_record_keeps_its_untrusted_label`, `tests/test_outbox.py::test_outbox_errors_hold_no_response_body`)
 - [ ] AC1.9 — A Pi-shaped version 16 file migrates, a live proposal stays confirmable, and the downgrade opens as version 16 (`tests/test_store.py::test_schema_v16_gains_the_outbox_and_keeps_rows`, `tests/test_store.py::test_downgrade_from_v17_opens_as_v16`)
 - [ ] AC1.10 — Architecture, deploy notes, and release notes describe the outbox and the rollback (`tests/test_invariants.py::test_relative_doc_links_resolve`, manual read)
@@ -846,9 +873,9 @@ The rollback image for each stage is the previous stage's tag, after
 - [ ] AC5.1 — One person's slow turn does not delay the other person's due reminder. Closes X6-6 (`tests/test_jobs.py::test_a_slow_turn_does_not_delay_another_persons_reminder`)
 - [ ] AC5.2 — The runner takes no channel lock and does not import `signal.channel` (`tests/test_invariants.py::test_the_job_runner_does_not_reach_into_the_channel`)
 - [ ] AC5.3 — A relay cancelled while another job runs in the same tick is not sent. Closes C-4 (`tests/test_jobs.py::test_a_relay_cancelled_during_another_run_is_not_sent`)
-- [ ] AC5.4 — A slot runs once; a restart during a run re-runs that slot once, and a reported slot never runs again (`tests/test_jobs.py::test_a_slot_runs_once_across_restarts`)
+- [ ] AC5.4 — A slot runs once. A restart during a run marks that claim interrupted and the next tick reclaims it and runs it once more. A finished slot never runs again (`tests/test_jobs.py::test_a_slot_runs_once_across_restarts`, `tests/test_jobs.py::test_an_interrupted_claim_is_reclaimed`)
 - [ ] AC5.5 — A report appended during a turn survives that turn's save (`tests/test_channel.py::test_a_report_appended_mid_turn_survives_the_turn_save`)
-- [ ] AC5.6 — Migration and downgrade (`tests/test_store.py::test_schema_v20_gains_job_runs_and_history_revisions`, `tests/test_store.py::test_downgrade_from_v21_opens_as_v20`)
+- [ ] AC5.6 — Migration adds claim columns to 017's `job_runs` and keeps its rows; downgrade drops those columns and still opens the 017 rows (`tests/test_store.py::test_schema_v20_adds_claim_columns_to_job_runs`, `tests/test_store.py::test_downgrade_from_v21_keeps_job_run_rows`)
 - [ ] AC5.7 — Architecture's jobs section describes the runner as its own task, still in-process (manual read)
 
 ## Security review

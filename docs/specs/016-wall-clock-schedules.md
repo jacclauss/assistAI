@@ -76,9 +76,12 @@ A new module holds every local-time rule. Nothing else calls `strftime`,
   first scheduled run), and either `every_days` with `at_local` ("HH:MM"),
   or `every_seconds`. A one-time job has neither.
 - `resolve_at(at, *, clock) -> float`. A `date` is used as given. A `day`
-  is resolved against the local date: a weekday name is the next such day
-  after today. With neither, it is the next time that clock time comes
-  round, today if still ahead, otherwise tomorrow. A local time inside the
+  is resolved against the local date. `today` and `tomorrow` are those
+  dates. A weekday name is today when today is that weekday and the clock
+  time is still more than 60 seconds ahead; otherwise it is the next such
+  weekday. "Monday at 7:30" asked on Monday morning is this Monday, not
+  next week. With neither date nor day, it is the next time that clock
+  time comes round, today if still ahead, otherwise tomorrow. A local time inside the
   spring-forward gap raises, naming the day and the jump ("2:30 AM does not
   exist on Sunday, March 14, 2027: clocks go from 2:00 to 3:00"). A local
   time that happens twice is the first occurrence unless `fold` says 1 or
@@ -166,15 +169,20 @@ still step a row after a rollback.
   zone, so `Store.backfill_job_schedules(zone) -> int` fills every row
   whose `zone` is NULL, active and cancelled alike. The gateway calls it on
   every start, before the runner. For each row:
-  - `zone` is the household zone. `anchor_at` is `next_run_at`.
+  - `zone` is the household zone. The chosen slot is `next_run_at` when
+    the job has never run, and `next_run_at - every_seconds` when it has.
+    That earlier instant is the slot the person chose, so a daily job
+    stepped across Nov 1 by 0.1.8 keeps 8:00 and does not become 7:00.
+    `anchor_at` is that chosen slot, not the stored `next_run_at`.
   - When `every_seconds` is a whole number of days, `every_days` is that
-    number. `at_local` is the local time, to the minute, of the slot the
-    person chose. For a row that has never run, that is `next_run_at`, which
-    came from `start_at` or `in_seconds`. For a row that has run, it is
-    `next_run_at - every_seconds`, the slot that last fired, so a daily
-    job stepped across Nov 1 by 0.1.8 keeps its 8:00 and does not become
-    7:00.
-  - Otherwise the row stays elapsed with its `every_seconds`.
+    number and `at_local` is the local time of the chosen slot, to the
+    minute. `next_run_at` is then replaced with
+    `next_slot(schedule, after=max(now, chosen))`. The drifted instant is
+    discarded. The job's next fire is the next correct local slot, once.
+    It does not fire at the drifted hour and again at 8:00 the same
+    morning.
+  - Otherwise the row stays elapsed with its `every_seconds`, and
+    `next_run_at` is left as stored.
   - Each row is logged as `store.job_schedule_migrated` with the job id,
     `every_days`, `at_local`, and whether it is cancelled. Never the prompt.
   - The runner skips a row whose `zone` is still NULL and logs
@@ -747,11 +755,13 @@ the same schema. Closed after the phone checks pass, the next morning's
   `tests/test_jobs.py::test_reschedule_result_names_the_next_run`,
   `evals/cases/job-list-when.toml`)
 - [ ] AC8 — "Tomorrow at 8" at 11:30 PM local is the local tomorrow; a
-  relative day is fixed at stage time so a yes after midnight runs the
-  previewed date; an explicit date is shown with its weekday and relative
-  day before or as it saves. Closes the 11:30 PM case of X3-4; a wrong
-  explicit date is visible, not silent.
+  weekday named on that same morning, while the clock time is still ahead,
+  is today and not next week; a relative day is fixed at stage time so a
+  yes after midnight runs the previewed date; an explicit date is shown
+  with its weekday and relative day before or as it saves. Closes the
+  11:30 PM case of X3-4; a wrong explicit date is visible, not silent.
   (`tests/test_clock.py::test_tomorrow_at_eleven_thirty_pm_is_the_local_tomorrow`,
+  `tests/test_clock.py::test_monday_at_seven_thirty_on_monday_morning_is_today`,
   `tests/test_staging.py::test_a_relative_day_is_fixed_when_staged`,
   `evals/cases/reminder-tomorrow-late-night.toml`)
 - [ ] AC9 — A backward clock step expires a proposal, and Signal waits,
@@ -784,8 +794,10 @@ the same schema. Closed after the phone checks pass, the next morning's
   (`tests/test_calendar.py::test_calendar_today_names_the_day_relative_to_today`)
 - [ ] AC15 — A version 14 file shaped like the Pi's upgrades with every row
   kept, the mgmplus row at `every_days` 1 and 08:00, cancelled rows intact,
-  and a stepped daily row on its original hour; rollback to 14 and forward
-  again backfills a row the older version wrote.
+  and a stepped daily row on its original hour. Its `next_run_at` is the
+  next correct local slot, not the drifted instant, so it texts once that
+  day. Rollback to 14 and forward again backfills a row the older version
+  wrote.
   (`tests/test_store.py::test_schema_v14_gains_wall_clock_schedules_and_keeps_rows`,
   `tests/test_store.py::test_a_legacy_daily_row_that_ran_keeps_its_hour`,
   `tests/test_store.py::test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it`,
