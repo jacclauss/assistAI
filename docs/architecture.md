@@ -169,10 +169,13 @@ it cannot believe. The gateway refuses to start Signal without
 `ASSISTAI_TIMEZONE`; there is no default zone. At start it logs the zone and
 its current UTC offset, then waits up to two minutes for the kernel to report
 a synchronized clock that is not more than five minutes behind the newest
-event in the store. When the wait runs out it starts anyway and logs
-`clock.unsynced`; a household with no bot is worse. A stored time more than
-a day ahead is a bad row and is ignored. The REPL needs neither the zone nor
-the wait.
+event in the store. When the wait runs out it logs `clock.unsynced`. If the
+kernel is not synchronized and the clock is still behind the store, Signal
+does not start: the process exits and the container restart waits again,
+because history saved on that clock is deleted once NTP steps it forward.
+Otherwise it starts anyway; a household with no bot is worse. With the kernel
+synchronized, a stored time more than a day ahead is a bad row and is
+ignored. The REPL needs neither the zone nor the wait.
 
 ## Staged actions
 

@@ -133,14 +133,25 @@ A new module holds every local-time rule. Nothing else calls `strftime`,
   `jobs.created_at`, `jobs.last_run_at`, `proposals.created_at`). A clock
   more than 5 minutes behind that is not believed. It logs
   `clock.waiting_for_sync` once, then `clock.synced`, or `clock.unsynced`
-  when the 120 seconds run out and it starts anyway. If the kernel call is
-  refused, it logs `clock.sync_unknown` and relies on the store check. A
+  when the 120 seconds run out. What happens then depends on why the clock
+  is not believed. If the kernel is not reporting SYNCED and the clock is
+  still more than 5 minutes behind the store, the channel and the job runner
+  do not start: `clock.unsynced` gives the reason that Signal is not
+  starting, and the gateway raises `HouseholdConfigError`, so
+  `python -m assistai` exits 2 and Docker's `restart: unless-stopped` runs
+  the wait again. Otherwise (an unsynced kernel with the clock not behind
+  the store, or a synced kernel with the clock up to 24 hours behind the
+  store) Signal starts anyway and `clock.unsynced` says so. A shutdown
+  during the wait returns without starting anything and without the error.
+  If the kernel call is refused, it logs `clock.sync_unknown` and relies on
+  the store check. A
   stored timestamp more than 24 hours ahead is logged as
   `clock.store_in_future` and ignored, so a bad row cannot hold the gateway
   down, but only while the kernel reports the clock synchronized. Unsynced
-  or unknown, that row is kept and holds startup: it may mean the clock is
-  days behind. With the kernel synced, a clock days behind still looks like
-  a bad row; this is open.
+  or unknown, that row is kept, and the gateway refuses to start Signal
+  when the wait runs out: the row may mean the clock is days behind. With
+  the kernel synced, a clock days behind still looks like a bad row; this
+  is open.
 - `Store.take_proposal` also treats a proposal as expired when
   `now < created_at - 60`. A backward step can no longer keep a tainted
   proposal confirmable past its ten minutes. Together with the startup wait
@@ -596,10 +607,16 @@ What was the complaint in 0.1.8 is intended behaviour now.
 - The wait is capped at 120 seconds and honours shutdown. A stored
   timestamp more than 24 hours ahead is ignored when the kernel says synced.
   `test_gateway.py::test_signal_waits_for_a_synced_clock_then_starts` and
-  `test_gateway.py::test_a_future_row_does_not_hold_startup`. With the
-  kernel call refused, that row still holds startup until the wait runs
-  out: `test_gateway.py::test_a_refused_kernel_call_does_not_drop_a_far_ahead_row`.
-- Watch `clock.unsynced` and `clock.sync_unknown` after each restart.
+  `test_gateway.py::test_a_future_row_does_not_hold_startup`.
+- With the kernel unsynced or the call refused, a clock still behind the
+  store when the wait runs out keeps Signal down by design: the process
+  exits 2 and Docker restarts it into another wait, until NTP sets the
+  clock. A bad row ahead of the clock does the same until the kernel
+  reports synchronized.
+  `test_gateway.py::test_a_refused_kernel_call_does_not_drop_a_far_ahead_row`.
+- Watch `clock.unsynced` and `clock.sync_unknown` after each restart. A
+  restart loop with `clock.unsynced` and "Signal is not starting" means
+  NTP on the Pi is not working.
 
 **Nothing in this spec suppresses a message without saying so.** Every new
 refusal (gap time, legacy argument, whole-day minutes, a whole-day repeat
@@ -783,9 +800,16 @@ the same schema. Closed after the phone checks pass, the next morning's
   `tests/test_staging.py::test_a_relative_day_is_fixed_when_staged`,
   `evals/cases/reminder-tomorrow-late-night.toml`)
 - [ ] AC9 — A backward clock step expires a proposal, and Signal waits,
-  bounded, for a believable clock. Closes the remaining X3-5 impact.
+  bounded, for a believable clock. When the bounded wait runs out with the
+  kernel not synchronized and the clock still more than 5 minutes behind
+  the newest stored event, the gateway refuses to start Signal: the channel
+  and the job runner never start, and it raises `HouseholdConfigError`.
+  That refusal is what closes the history wipe, the remaining X3-5 impact.
+  A synced kernel still ignores a stored row more than 24 hours ahead, so
+  one bad timestamp cannot hold startup.
   (`tests/test_store.py::test_a_backward_clock_step_expires_a_proposal`,
   `tests/test_gateway.py::test_signal_waits_for_a_synced_clock_then_starts`,
+  `tests/test_gateway.py::test_a_refused_kernel_call_does_not_drop_a_far_ahead_row`,
   `tests/test_gateway.py::test_a_future_row_does_not_hold_startup`)
 - [ ] AC10 — The calendar year bound uses the household date on Dec 31 at
   7:00 PM CST. Closes X3-7.

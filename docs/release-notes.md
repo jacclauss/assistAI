@@ -8,7 +8,9 @@
 - Before Signal starts, the gateway waits up to two minutes for a
   synchronized clock that is not behind the time it last saw. It logs the
   zone and its UTC offset as `clock.zone`, then `clock.synced`, or
-  `clock.unsynced` when it starts anyway.
+  `clock.unsynced` when the wait runs out. If the clock is still behind
+  and the kernel does not say it is synchronized, Signal does not start;
+  the gateway exits and Docker runs the wait again.
 - A proposal is dropped if the clock steps back to before it was made.
   Say the request again.
 

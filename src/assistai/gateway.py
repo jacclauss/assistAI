@@ -38,10 +38,15 @@ from assistai.store import Store, store_path
 from assistai.sysclock import ClockState, ClockSync, KernelClockSync
 from assistai.updates.watcher import UpdateWatcher
 
-# How long Signal waits for a believable clock before it starts anyway. A
-# gateway that never starts is worse than one that starts on a doubtful
-# clock and says so in the log.
+# How long Signal waits for a believable clock. After that an unsynced kernel
+# alone starts anyway, since a household with no bot is worse. A clock still
+# behind the store without a synced kernel refuses instead: history saved on
+# it is deleted once NTP steps it forward.
 CLOCK_WAIT_SECONDS = 120.0
+CLOCK_BEHIND_REFUSED = (
+    "the clock is behind the newest stored event and the kernel does not say it "
+    "is synchronized, so Signal is not starting; the container restart waits again"
+)
 # Docker kills ten seconds after SIGTERM, so the wait checks for shutdown
 # far more often than that.
 CLOCK_POLL_SECONDS = 1.0
@@ -248,9 +253,11 @@ class Gateway:
         it is not more than five minutes behind the newest event in the store.
         A row more than a day ahead is ignored only while the kernel says
         synchronized, so a bad row cannot hold startup and a clock days behind
-        cannot pass as an empty store. After the wait runs out Signal starts
-        anyway; a household with no bot is worse. Returns False when shutdown
-        arrives first.
+        cannot pass as an empty store. When the wait runs out with the kernel
+        not synchronized and the clock still behind the store, it raises
+        HouseholdConfigError so the process exits and the restart waits again;
+        any other doubtful clock starts anyway, since a household with no bot is
+        worse. Returns False when shutdown arrives first.
         """
         newest = self._store.newest_event_at() if self._store is not None else None
         loop = asyncio.get_running_loop()
@@ -294,6 +301,14 @@ class Gateway:
                 waiting = True
             remaining = deadline - loop.time()
             if remaining <= 0:
+                if state is not ClockState.SYNCED and not store_ok:
+                    log.error(
+                        "clock.unsynced",
+                        kernel=state.value,
+                        behind_store_seconds=round(behind),
+                        reason=CLOCK_BEHIND_REFUSED,
+                    )
+                    raise HouseholdConfigError(CLOCK_BEHIND_REFUSED)
                 log.warning(
                     "clock.unsynced",
                     kernel=state.value,

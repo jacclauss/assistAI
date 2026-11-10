@@ -191,15 +191,22 @@ docker compose --env-file .env -f docker/docker-compose.yml exec gateway python 
 
 It prints `-05:00 -06:00 -05:00`.
 
-After every restart, look for these warnings. `clock.unsynced` means Signal
-started after two minutes on a clock the kernel had not synchronized, or one
-still behind the stored history: check NTP on the Pi
-(`timedatectl status`). `clock.sync_unknown` means the container could not
+After every restart, look for these warnings. `clock.unsynced` comes after
+two minutes on a clock that was never believed, and its `reason` says which
+case it was. If the kernel had not synchronized the clock but it was not
+behind the stored history, Signal started anyway. If the kernel did not say
+synchronized and the clock was still more than five minutes behind the
+stored history, the reason says Signal is not starting: the gateway exits
+with status 2 and Docker restarts it into another two-minute wait. A
+container that keeps restarting with that line has a Pi clock that NTP is
+not setting. Check NTP on the Pi (`timedatectl status`) in either case.
+`clock.sync_unknown` means the container could not
 ask the kernel, so only the stored history was checked. `clock.store_in_future`
 means the kernel said the clock was synchronized but a stored time is more
 than a day ahead of it; that row was ignored. If the Pi's clock really is
 that far behind, `timedatectl status` will show it. Without a synced kernel
-the row is not ignored, and Signal waits the two minutes.
+the row is not ignored: Signal waits the two minutes, then refuses to start
+until the kernel reports the clock synchronized.
 
 ### Texts
 

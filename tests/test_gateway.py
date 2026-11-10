@@ -478,8 +478,9 @@ async def test_a_future_row_does_not_hold_startup(tmp_path: Path) -> None:
 async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Path) -> None:
     """With no word from the kernel, a row 15 days ahead may mean the clock is 15 days behind.
 
-    Dropping it would start Signal at once, and history saved on that clock is
-    deleted when NTP later steps it forward past the 14-day window.
+    Starting Signal on that clock, at once or after the wait, saves history
+    that is deleted when NTP later steps it forward past the 14-day window.
+    The gateway exits instead, and the container restart waits again.
     """
     now = 1_800_000_000.0
     _remember(tmp_path, at=now + 15 * 86400)
@@ -490,14 +491,15 @@ async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Pat
         wait_seconds=0.1,
     )
 
-    with capture_logs() as logs:
-        task = asyncio.create_task(gateway.run())
-        await asyncio.sleep(0.05)
-        assert gateway._channel_task is None
-        await asyncio.sleep(0.3)
-        gateway.request_shutdown("test")
-        await asyncio.wait_for(task, timeout=1)
+    with (
+        capture_logs() as logs,
+        pytest.raises(HouseholdConfigError, match="Signal is not starting"),
+    ):
+        await asyncio.wait_for(gateway.run(), timeout=1)
 
+    assert gateway._channel_task is None
+    assert gateway._job_task is None
+    assert not any(entry["event"] == "gateway.signal_started" for entry in logs)
     events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
     assert events == [
         "clock.zone",
@@ -507,7 +509,8 @@ async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Pat
     ]
     waiting = next(entry for entry in logs if entry["event"] == "clock.waiting_for_sync")
     assert waiting["behind_store_seconds"] == 15 * 86400
-    assert any(entry["event"] == "gateway.signal_started" for entry in logs)
+    unsynced = next(entry for entry in logs if entry["event"] == "clock.unsynced")
+    assert "Signal is not starting" in unsynced["reason"]
 
 
 def _clock_gateway(
