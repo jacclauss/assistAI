@@ -23,6 +23,10 @@ DmPolicy = Literal["pairing", "allowlist"]
 FIREWORKS_INFERENCE_URL = "https://api.fireworks.ai/inference/v1"
 FIREWORKS_ACCOUNT_URL = "https://api.fireworks.ai/v1"
 SIGNAL_DEFAULT_URL = "http://signal-cli:8080"
+TIMEZONE_REQUIRED = (
+    "ASSISTAI_TIMEZONE is not set. Signal needs the household's IANA time zone, "
+    "for example ASSISTAI_TIMEZONE=America/Chicago"
+)
 
 
 class Settings(BaseSettings):
@@ -117,7 +121,6 @@ class Settings(BaseSettings):
 
     # Shared iCloud calendar. One Apple ID that can see the household calendar.
     # The password is an app-specific password, never the Apple ID password.
-    # "Today" is a day in this timezone, not UTC.
     caldav_base_url: str = "https://caldav.icloud.com/"
     caldav_username: str = ""
     # Last resort. The gateway prefers the macOS Keychain, then a mode-600 file
@@ -126,7 +129,11 @@ class Settings(BaseSettings):
     caldav_password: SecretStr | None = None
     caldav_password_file: Path | None = None
     caldav_calendar: str = ""
-    timezone: str = "UTC"
+    # The household's IANA zone. Every named time, "today", and daily job is
+    # read on this clock. No default: a zone assumed to be UTC moves every
+    # reminder by hours without a word, so Signal refuses to start without
+    # one. The REPL does not need it.
+    timezone: str | None = None
 
     # Gmail. One OAuth client for the household; each agent has their own
     # refresh token in the state database. The scope is gmail.modify only.
@@ -155,6 +162,8 @@ class Settings(BaseSettings):
     @field_validator("timezone")
     @classmethod
     def _timezone(cls, value: object) -> object:
+        if value is None:
+            return None
         if not isinstance(value, str) or not value.strip():
             raise ValueError("timezone must be an IANA name")
         cleaned = value.strip()

@@ -35,7 +35,7 @@ def test_defaults_are_conservative() -> None:
     assert settings.caldav_password is None
     assert settings.caldav_password_file is None
     assert settings.caldav_calendar == ""
-    assert settings.timezone == "UTC"
+    assert settings.timezone is None
 
 
 def test_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,3 +106,8 @@ def test_invalid_signal_account_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_the_timezone_has_no_default() -> None:
+    """A household time zone is named on purpose, never assumed."""
+    assert Settings().timezone is None

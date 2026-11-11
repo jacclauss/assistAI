@@ -80,7 +80,7 @@ class CalendarClient:
     async def agenda(self, day: date | None = None, *, now: datetime | None = None) -> Agenda:
         """Events overlapping ``day``. Omitted day means today in the household zone."""
         _require_configured(self._settings)
-        zone = ZoneInfo(self._settings.timezone)
+        zone = ZoneInfo(_zone_name(self._settings))
         moment = now if now is not None else datetime.now(zone)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=zone)
@@ -110,7 +110,7 @@ class CalendarClient:
         clipped = events[:MAX_EVENTS]
         return Agenda(
             calendar=self._settings.caldav_calendar.strip(),
-            timezone=self._settings.timezone,
+            timezone=zone.key,
             day=day,
             events=clipped,
             truncated=len(events) > MAX_EVENTS,
@@ -119,7 +119,7 @@ class CalendarClient:
     async def create(self, draft: CalendarDraft, *, stamp: datetime | None = None) -> str:
         """PUT one new event on the configured calendar. Returns a short confirmation."""
         _require_configured(self._settings)
-        zone = ZoneInfo(self._settings.timezone)
+        zone = ZoneInfo(_zone_name(self._settings))
         moment = stamp if stamp is not None else datetime.now(UTC)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=UTC)
@@ -330,6 +330,12 @@ def _require_configured(settings: Settings) -> None:
         or not settings.caldav_calendar.strip()
     ):
         raise CalendarError("calendar is not configured")
+
+
+def _zone_name(settings: Settings) -> str:
+    if settings.timezone is None:
+        raise CalendarError("the household timezone is not configured")
+    return settings.timezone
 
 
 def _auth(settings: Settings) -> httpx.BasicAuth:

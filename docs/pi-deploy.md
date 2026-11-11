@@ -22,7 +22,8 @@ These stay off the Pi image, off git, and out of chat.
 | Signal account | `.env` `ASSISTAI_SIGNAL_ACCOUNT` and the `signal-cli-config` volume | Keep the bot number already registered. The Pi links as a device. The Mac device is then removed. |
 | Operators and roster | `.env` `ASSISTAI_SIGNAL_ALLOW_FROM` and `config/assistai.toml` | Copy the live roster. The example file has placeholder numbers. |
 | SearXNG secret | `.env` `SEARXNG_SECRET` | Generate a new value. Compose's default is for a machine with no published ports during development. |
-| Calendar | `.env` username, calendar name, timezone. Password in `/var/lib/assistai/caldav-password` | The Mac reads the Keychain. The Pi reads only that file. |
+| Household time zone | `.env` `ASSISTAI_TIMEZONE`, for example `America/Chicago` | Required. The gateway refuses to start Signal without it. Copy the value from the Mac. |
+| Calendar | `.env` username and calendar name. Password in `/var/lib/assistai/caldav-password` | The Mac reads the Keychain. The Pi reads only that file. |
 | Gmail client | `.env` `ASSISTAI_GMAIL_CLIENT_ID` and `ASSISTAI_GMAIL_CLIENT_SECRET` | Same OAuth client. The consent screen has to leave Testing. |
 | Gmail sign-in | `assistai_gateway-state` volume, per agent | Copy the volume, or sign in again on the Pi. A Testing app's refresh token expires after 7 days. |
 
@@ -161,6 +162,54 @@ stays down. Starting it again would answer the same texts.
 
 ## Check, then turn SSH off
 
+### The clock
+
+The gateway logs the household zone, the local time, and the UTC offset as
+`clock.zone`. Before it starts Signal it waits up to two minutes for a
+believable clock: the kernel reports the clock synchronized, and the clock
+is not more than five minutes behind the newest time in the state volume.
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml logs gateway | grep '"clock\.'
+```
+
+`clock.zone` names `America/Chicago` and today's offset: `-06:00` in winter,
+`-05:00` in summer. Restart the gateway and run the same command. The new
+lines end with `clock.synced`.
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml restart gateway
+```
+
+Check that the zone data in the image knows the daylight saving changes. The
+second 1:30 AM on 1 November 2026 is CST; 3:30 AM on 14 March 2027 is CDT.
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml exec gateway python -c \
+  'from datetime import datetime as d; from zoneinfo import ZoneInfo as Z; z = Z("America/Chicago"); print(d(2026, 11, 1, 1, 30, tzinfo=z).strftime("%:z"), d(2026, 11, 1, 1, 30, fold=1, tzinfo=z).strftime("%:z"), d(2027, 3, 14, 3, 30, tzinfo=z).strftime("%:z"))'
+```
+
+It prints `-05:00 -06:00 -05:00`.
+
+After every restart, look for these warnings. `clock.unsynced` comes after
+two minutes on a clock that was never believed, and its `reason` says which
+case it was. If the kernel had not synchronized the clock but it was not
+behind the stored history, Signal started anyway. If the kernel did not say
+synchronized and the clock was still more than five minutes behind the
+stored history, the reason says Signal is not starting: the gateway exits
+with status 2 and Docker restarts it into another two-minute wait. A
+container that keeps restarting with that line has a Pi clock that NTP is
+not setting. Check NTP on the Pi (`timedatectl status`) in either case.
+`clock.sync_unknown` means the container could not
+ask the kernel, so only the stored history was checked. `clock.store_in_future`
+means the kernel said the clock was synchronized but a stored time is more
+than a day ahead of it; that row was ignored. If the Pi's clock really is
+that far behind, `timedatectl status` will show it. Without a synced kernel
+the row is not ignored: Signal waits the two minutes, then refuses to start
+until the kernel reports the clock synchronized.
+
+### Texts
+
 From each allowed phone, text the bot. Each assistant should still know the
 recent relay and digest that were in the copied state. Calendar and mail
 should answer. A stranger gets silence.
@@ -194,6 +243,11 @@ current image first, `docker load` the new tar, then:
 
 ```bash
 docker compose --env-file .env -f docker/docker-compose.yml up -d --no-build
+```
+
+Run the clock checks above, then:
+
+```bash
 sudo systemctl disable --now ssh
 ```
 

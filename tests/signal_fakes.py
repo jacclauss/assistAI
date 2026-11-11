@@ -21,6 +21,9 @@ def signal_settings(**overrides: Any) -> Settings:
         "signal_base_url": "http://signal.test",
         "signal_reconnect_seconds": 0.01,
         "signal_pairing_ttl_seconds": 60,
+        # Signal refuses to start without a zone. UTC keeps the times these
+        # tests assert on unchanged; tests about local time pass their own.
+        "timezone": "UTC",
     }
     values.update(overrides)
     return Settings(**values)

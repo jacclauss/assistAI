@@ -9,6 +9,7 @@ import pytest
 
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
+from assistai.jobs import Job
 from assistai.staging import Proposal
 from assistai.store import SCHEMA_VERSION, Store
 
@@ -863,3 +864,82 @@ def _proposal(
         created_at=created_at,
         expires_at=expires_at,
     )
+
+
+def test_a_backward_clock_step_expires_a_proposal(tmp_path: Path) -> None:
+    """A clock that moved back before the proposal was made cannot be trusted to time it out."""
+    store = _store(tmp_path)
+    made = 1_800_000_000.0
+    store.replace_proposal(_proposal("jacob", "{}", created_at=made, expires_at=made + 600))
+
+    live, expired = store.take_proposal("jacob", now=made - 3600)
+
+    assert live is None
+    assert expired is True
+    store.close()
+
+
+def test_a_proposal_made_up_to_a_minute_ahead_is_still_live(tmp_path: Path) -> None:
+    """NTP slews of a few seconds must not throw away a proposal the person is about to confirm."""
+    store = _store(tmp_path)
+    made = 1_800_000_000.0
+    store.replace_proposal(_proposal("jacob", "{}", created_at=made, expires_at=made + 600))
+
+    live, expired = store.take_proposal("jacob", now=made - 60)
+
+    assert live is not None
+    assert expired is False
+    store.close()
+
+
+def test_the_newest_event_is_none_on_a_new_install(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    assert store.newest_event_at() is None
+    store.close()
+
+
+def _event_job(*, created_at: float, last_run_at: float | None, next_run_at: float) -> Job:
+    return Job(
+        id="jabcd1234",
+        agent="jacob",
+        kind="schedule",
+        name="digest",
+        prompt="summarize",
+        every_seconds=86400,
+        ttl_seconds=None,
+        created_at=created_at,
+        expires_at=None,
+        next_run_at=next_run_at,
+        last_run_at=last_run_at,
+        cancelled_at=None,
+    )
+
+
+@pytest.mark.parametrize("newest", ["message", "proposal", "job_created", "job_run"])
+def test_the_newest_event_reads_every_past_event_column(tmp_path: Path, newest: str) -> None:
+    """Any one of the four can be the latest thing the household did before a restart."""
+    store = _store(tmp_path)
+    at = {name: 100.0 for name in ("message", "proposal", "job_created", "job_run")}
+    at[newest] = 500.0
+    store.save_history("jacob", [Message(role="user", content="hi", created_at=at["message"])])
+    store.replace_proposal(
+        _proposal("jacob", "{}", created_at=at["proposal"], expires_at=9_000_000_000)
+    )
+    store.save_job(
+        _event_job(
+            created_at=at["job_created"], last_run_at=at["job_run"], next_run_at=8_000_000_000
+        )
+    )
+
+    assert store.newest_event_at() == 500.0
+    store.close()
+
+
+def test_the_newest_event_ignores_future_schedule_columns_and_unrun_jobs(tmp_path: Path) -> None:
+    """next_run_at and expires_at are ahead by design and must not look like a fast clock."""
+    store = _store(tmp_path)
+    store.save_job(_event_job(created_at=200.0, last_run_at=None, next_run_at=8_000_000_000))
+
+    assert store.newest_event_at() == 200.0
+    store.close()

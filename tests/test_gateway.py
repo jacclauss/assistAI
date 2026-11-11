@@ -10,8 +10,12 @@ from pydantic import SecretStr
 from structlog.testing import capture_logs
 
 from assistai.config import Settings
-from assistai.errors import HouseholdConfigError, SignalUnavailableError
+from assistai.errors import AssistAIError, HouseholdConfigError, SignalUnavailableError
 from assistai.gateway import Gateway, install_signal_handlers
+from assistai.inference.types import Message
+from assistai.store import Store, store_path
+from assistai.sysclock import ClockState
+from tests.clock_fakes import FakeClock, FakeClockSync, chicago
 from tests.fakes import PRIMARY, QUARANTINE, catalog_response, client_for, manifest
 from tests.signal_fakes import FakeChannel, FakeSignal, signal_settings
 
@@ -313,3 +317,239 @@ async def test_sigterm_requests_a_graceful_shutdown() -> None:
     await asyncio.wait_for(task, timeout=1)
 
     assert gateway.beats == 1
+
+
+async def test_signal_does_not_start_without_a_timezone() -> None:
+    """Without a household zone every reminder time is wrong, so nobody gets an answer."""
+    channel = FakeChannel()
+    gateway = Gateway(
+        signal_settings(heartbeat_seconds=0.01, FIREWORKS_API_KEY=None, timezone=None),
+        signal=FakeSignal(),
+        channel=channel,
+    )
+
+    task = asyncio.create_task(gateway.run())
+    await asyncio.sleep(0.05)
+    gateway.request_shutdown("test")
+    outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+
+    assert channel.ran is False
+    # __main__ turns an AssistAIError into exit status 2.
+    assert isinstance(outcome, AssistAIError)
+
+
+async def test_a_missing_timezone_is_logged_for_the_operator() -> None:
+    gateway = Gateway(
+        signal_settings(heartbeat_seconds=0.01, FIREWORKS_API_KEY=None, timezone=None),
+        signal=FakeSignal(),
+        channel=FakeChannel(),
+    )
+
+    with capture_logs() as logs, pytest.raises(HouseholdConfigError, match="ASSISTAI_TIMEZONE"):
+        await gateway.run()
+
+    missing = next(entry for entry in logs if entry["event"] == "gateway.timezone_missing")
+    assert "ASSISTAI_TIMEZONE" in missing["reason"]
+
+
+async def test_the_zone_and_its_current_offset_are_logged_at_start() -> None:
+    """The second 1:30 on fall-back day is CST. The log line says which one the gateway is in."""
+    gateway = Gateway(
+        signal_settings(heartbeat_seconds=0.01, FIREWORKS_API_KEY=None, timezone="America/Chicago"),
+        signal=FakeSignal(),
+        channel=FakeChannel(),
+        now=FakeClock(chicago(2026, 11, 1, 1, 30, fold=1)),
+    )
+
+    with capture_logs() as logs:
+        await _run_briefly(gateway)
+
+    zone = next(entry for entry in logs if entry["event"] == "clock.zone")
+    assert zone["zone"] == "America/Chicago"
+    assert zone["local"] == "2026-11-01T01:30:00-06:00"
+    assert zone["utc_offset"] == "-06:00"
+
+
+async def test_signal_waits_for_a_synced_clock_then_starts() -> None:
+    kernel = FakeClockSync(ClockState.UNSYNCED)
+    channel = FakeChannel()
+    gateway = _clock_gateway(kernel=kernel, channel=channel)
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(gateway.run())
+        await asyncio.sleep(0.05)
+        assert channel.ran is False
+        kernel.current = ClockState.SYNCED
+        await asyncio.sleep(0.05)
+        assert channel.ran is True
+        gateway.request_shutdown("test")
+        await asyncio.wait_for(task, timeout=1)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == ["clock.zone", "clock.waiting_for_sync", "clock.synced"]
+    assert kernel.asked > 2
+
+
+async def test_an_unsynced_clock_starts_signal_after_the_wait() -> None:
+    """A household with no bot is worse than a bot on a doubtful clock that says so."""
+    channel = FakeChannel()
+    gateway = _clock_gateway(
+        kernel=FakeClockSync(ClockState.UNSYNCED), channel=channel, wait_seconds=0.05
+    )
+
+    with capture_logs() as logs:
+        await _run_briefly(gateway, seconds=0.15)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == ["clock.zone", "clock.waiting_for_sync", "clock.unsynced"]
+    assert channel.ran is True
+
+
+async def test_shutdown_during_the_clock_wait_starts_nothing() -> None:
+    """Docker kills ten seconds after SIGTERM; the two-minute wait must not outlast it."""
+    channel = FakeChannel()
+    gateway = _clock_gateway(kernel=FakeClockSync(ClockState.UNSYNCED), channel=channel)
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(gateway.run())
+        await asyncio.sleep(0.03)
+        gateway.request_shutdown("test")
+        await asyncio.wait_for(task, timeout=0.5)
+
+    assert channel.ran is False
+    assert gateway._channel_task is None
+    assert not any(entry["event"] == "gateway.signal_started" for entry in logs)
+
+
+async def test_a_clock_behind_the_store_holds_startup_until_it_catches_up(
+    tmp_path: Path,
+) -> None:
+    """With the kernel call refused, the store alone decides whether the clock is believable."""
+    last_seen = 1_800_000_000.0
+    _remember(tmp_path, at=last_seen)
+    wall = FakeClock(last_seen - 3600)
+    gateway = _clock_gateway(kernel=FakeClockSync(ClockState.UNKNOWN), tmp_path=tmp_path, now=wall)
+
+    with capture_logs() as logs:
+        task = asyncio.create_task(gateway.run())
+        await asyncio.sleep(0.05)
+        assert gateway._channel_task is None
+        wall.set(last_seen - 120)
+        await asyncio.sleep(0.05)
+        assert gateway._channel_task is not None
+        gateway.request_shutdown("test")
+        await asyncio.wait_for(task, timeout=1)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == ["clock.zone", "clock.sync_unknown", "clock.waiting_for_sync", "clock.synced"]
+    waiting = next(entry for entry in logs if entry["event"] == "clock.waiting_for_sync")
+    assert waiting["behind_store_seconds"] == 3600
+
+
+async def test_a_refused_kernel_call_and_an_empty_store_start_at_once(tmp_path: Path) -> None:
+    gateway = _clock_gateway(kernel=FakeClockSync(ClockState.UNKNOWN), tmp_path=tmp_path)
+
+    with capture_logs() as logs:
+        await _run_briefly(gateway)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == ["clock.zone", "clock.sync_unknown", "clock.synced"]
+    assert any(entry["event"] == "gateway.signal_started" for entry in logs)
+
+
+async def test_a_future_row_does_not_hold_startup(tmp_path: Path) -> None:
+    """A row stamped two days ahead is a bad row. It must not keep the bot down for good."""
+    now = 1_800_000_000.0
+    _remember(tmp_path, at=now + 2 * 86400)
+    gateway = _clock_gateway(
+        kernel=FakeClockSync(ClockState.SYNCED), tmp_path=tmp_path, now=FakeClock(now)
+    )
+
+    with capture_logs() as logs:
+        await _run_briefly(gateway)
+
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == ["clock.zone", "clock.store_in_future", "clock.synced"]
+    ahead = next(entry for entry in logs if entry["event"] == "clock.store_in_future")
+    assert ahead["ahead_seconds"] == 2 * 86400
+    assert any(entry["event"] == "gateway.signal_started" for entry in logs)
+
+
+async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Path) -> None:
+    """With no word from the kernel, a row 15 days ahead may mean the clock is 15 days behind.
+
+    Starting Signal on that clock, at once or after the wait, saves history
+    that is deleted when NTP later steps it forward past the 14-day window.
+    The gateway exits instead, and the container restart waits again.
+    """
+    now = 1_800_000_000.0
+    _remember(tmp_path, at=now + 15 * 86400)
+    gateway = _clock_gateway(
+        kernel=FakeClockSync(ClockState.UNKNOWN),
+        tmp_path=tmp_path,
+        now=FakeClock(now),
+        wait_seconds=0.1,
+    )
+
+    with (
+        capture_logs() as logs,
+        pytest.raises(HouseholdConfigError, match="Signal is not starting"),
+    ):
+        await asyncio.wait_for(gateway.run(), timeout=1)
+
+    assert gateway._channel_task is None
+    assert gateway._job_task is None
+    assert not any(entry["event"] == "gateway.signal_started" for entry in logs)
+    events = [entry["event"] for entry in logs if entry["event"].startswith("clock.")]
+    assert events == [
+        "clock.zone",
+        "clock.sync_unknown",
+        "clock.waiting_for_sync",
+        "clock.unsynced",
+    ]
+    waiting = next(entry for entry in logs if entry["event"] == "clock.waiting_for_sync")
+    assert waiting["behind_store_seconds"] == 15 * 86400
+    unsynced = next(entry for entry in logs if entry["event"] == "clock.unsynced")
+    assert "Signal is not starting" in unsynced["reason"]
+
+
+def _clock_gateway(
+    *,
+    kernel: FakeClockSync,
+    channel: FakeChannel | None = None,
+    tmp_path: Path | None = None,
+    now: FakeClock | None = None,
+    wait_seconds: float = 120.0,
+) -> Gateway:
+    """A Signal gateway with a fake kernel clock. With ``tmp_path`` it opens a real store."""
+    overrides: dict[str, object] = {}
+    if tmp_path is not None:
+        overrides = {"state_dir": tmp_path, "agents_config_path": _agents_toml(tmp_path)}
+    return Gateway(
+        signal_settings(
+            heartbeat_seconds=0.01,
+            FIREWORKS_API_KEY=None,
+            timezone="America/Chicago",
+            **overrides,
+        ),
+        signal=FakeSignal(),
+        channel=channel,
+        clock_sync=kernel,
+        now=now or FakeClock(1_800_000_000.0),
+        clock_wait_seconds=wait_seconds,
+        clock_poll_seconds=0.01,
+    )
+
+
+def _remember(state_dir: Path, *, at: float) -> None:
+    """Leave a message in the store, as a gateway that ran at ``at`` would have."""
+    store = Store(store_path(state_dir))
+    store.save_history("jacob", [Message(role="user", content="hi", created_at=at)])
+    store.close()
+
+
+async def _run_briefly(gateway: Gateway, *, seconds: float = 0.05) -> None:
+    task = asyncio.create_task(gateway.run())
+    await asyncio.sleep(seconds)
+    gateway.request_shutdown("test")
+    await asyncio.wait_for(task, timeout=1)

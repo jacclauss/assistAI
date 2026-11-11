@@ -163,6 +163,20 @@ durable rather than incidental.
 The file holds mail summaries, relayed documents, and provider tokens. It is
 not encrypted at rest; the Pi's disk is the trust boundary.
 
+Every time in the file is wall-clock time, and the history window, proposal
+expiry, and job schedules all read it. So Signal does not start on a clock
+it cannot believe. The gateway refuses to start Signal without
+`ASSISTAI_TIMEZONE`; there is no default zone. At start it logs the zone and
+its current UTC offset, then waits up to two minutes for the kernel to report
+a synchronized clock that is not more than five minutes behind the newest
+event in the store. When the wait runs out it logs `clock.unsynced`. If the
+kernel is not synchronized and the clock is still behind the store, Signal
+does not start: the process exits and the container restart waits again,
+because history saved on that clock is deleted once NTP steps it forward.
+Otherwise it starts anyway; a household with no bot is worse. With the kernel
+synchronized, a stored time more than a day ahead is a bad row and is
+ignored. The REPL needs neither the zone nor the wait.
+
 ## Staged actions
 
 Mail filing and relay are the same primitive.
@@ -179,7 +193,10 @@ Properties that matter:
 - One proposal may cover many items, so "archive these 6" costs one
   confirmation rather than six.
 - Proposals expire, and a newer proposal replaces an older one, so a stale yes
-  cannot fire something the user has forgotten about.
+  cannot fire something the user has forgotten about. A proposal made more
+  than a minute after the clock now reads also counts as expired: the clock
+  stepped back, and a yes must not outlive ten minutes by the size of the
+  step.
 - Under taint the proposal is labelled as having been suggested while untrusted
   content was in context. The human is the check, so they should know that a
   page or a mail is what asked for this.

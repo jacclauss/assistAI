@@ -26,6 +26,10 @@ log = structlog.get_logger(__name__)
 
 SCHEMA_VERSION = 14
 _DB_NAME = "assistai.sqlite"
+# A proposal stamped more than this far ahead of now was made before the
+# clock stepped back. Its ten minutes can no longer be measured, so it is
+# expired rather than left confirmable for as long as the step was.
+_BACKWARD_STEP_SECONDS = 60.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -201,8 +205,11 @@ class Store:
     ) -> tuple[Proposal | None, bool]:
         """Return the live proposal and whether an expired row was dropped.
 
-        An expired row is deleted so a later yes cannot fire it. Corrupt JSON
-        fails closed: executing garbage would be worse than asking again.
+        An expired row is deleted so a later yes cannot fire it. A row made
+        more than a minute in the future counts as expired: the clock stepped
+        back since, and a stale yes must not outlive its ten minutes by the
+        size of the step. Corrupt JSON fails closed: executing garbage would
+        be worse than asking again.
         """
         try:
             row = self._conn.execute(
@@ -214,14 +221,13 @@ class Store:
         if row is None:
             return None, False
         expires_at = row["expires_at"]
-        if not isinstance(expires_at, (int, float)):
+        created_at = row["created_at"]
+        if not isinstance(expires_at, (int, float)) or not isinstance(created_at, (int, float)):
             raise StoreError(f"proposal for {agent} is unreadable")
-        if float(expires_at) <= (now if now is not None else time.time()):
+        moment = now if now is not None else time.time()
+        if float(expires_at) <= moment or moment < float(created_at) - _BACKWARD_STEP_SECONDS:
             self.clear_proposal(agent)
             return None, True
-        created_at = row["created_at"]
-        if not isinstance(created_at, (int, float)):
-            raise StoreError(f"proposal for {agent} is unreadable")
         tainted = row["tainted"]
         if tainted not in (0, 1):
             raise StoreError(f"proposal for {agent} is unreadable")
@@ -236,6 +242,30 @@ class Store:
             ),
             False,
         )
+
+    def newest_event_at(self) -> float | None:
+        """The latest moment the store saw something happen, or None when it has nothing.
+
+        Only past events count: messages, proposals, job creations, and job
+        runs. ``next_run_at`` and ``expires_at`` are in the future by design
+        and would hold startup for no reason.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT MAX(moment) AS newest FROM ("
+                "SELECT MAX(created_at) AS moment FROM messages "
+                "UNION ALL SELECT MAX(created_at) FROM proposals "
+                "UNION ALL SELECT MAX(created_at) FROM jobs "
+                "UNION ALL SELECT MAX(last_run_at) FROM jobs)"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise StoreError("state database is unreadable") from exc
+        newest = row["newest"] if row is not None else None
+        if newest is None:
+            return None
+        if not isinstance(newest, (int, float)):
+            raise StoreError("state database is unreadable")
+        return float(newest)
 
     def replace_proposal(self, proposal: Proposal) -> None:
         try:

@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+import time
+from collections.abc import Callable
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -17,7 +20,9 @@ from assistai import __version__
 from assistai.agents import Household, load_household, resolve_household_path
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.calendar.tools import bind_calendar
-from assistai.config import Settings
+from assistai.clock import HouseholdClock, local_reading
+from assistai.config import TIMEZONE_REQUIRED, Settings
+from assistai.errors import HouseholdConfigError
 from assistai.inference.client import FireworksClient
 from assistai.mail.tools import bind_mail
 from assistai.manifest import Manifest, load_manifest, resolve_manifest_path
@@ -30,7 +35,27 @@ from assistai.signal.channel import SignalChannel
 from assistai.signal.client import SignalClient, SignalTransport
 from assistai.signal.policy import AccessPolicy
 from assistai.store import Store, store_path
+from assistai.sysclock import ClockState, ClockSync, KernelClockSync
 from assistai.updates.watcher import UpdateWatcher
+
+# How long Signal waits for a believable clock. After that an unsynced kernel
+# alone starts anyway, since a household with no bot is worse. A clock still
+# behind the store without a synced kernel refuses instead: history saved on
+# it is deleted once NTP steps it forward.
+CLOCK_WAIT_SECONDS = 120.0
+CLOCK_BEHIND_REFUSED = (
+    "the clock is behind the newest stored event and the kernel does not say it "
+    "is synchronized, so Signal is not starting; the container restart waits again"
+)
+# Docker kills ten seconds after SIGTERM, so the wait checks for shutdown
+# far more often than that.
+CLOCK_POLL_SECONDS = 1.0
+# NTP corrections and a slow shutdown are minutes at most. A clock further
+# behind the newest stored event than this has not been set yet.
+CLOCK_BEHIND_SECONDS = 300.0
+# A stored time this far ahead is a bad row, not a slow clock. Believing it
+# would hold the gateway down on every start.
+STORE_FUTURE_SECONDS = 24 * 3600.0
 
 
 class ChannelRunner(Protocol):
@@ -53,6 +78,10 @@ class Gateway:
         channel: ChannelRunner | None = None,
         household: Household | None = None,
         broker: ToolBroker | None = None,
+        clock_sync: ClockSync | None = None,
+        now: Callable[[], float] = time.time,
+        clock_wait_seconds: float = CLOCK_WAIT_SECONDS,
+        clock_poll_seconds: float = CLOCK_POLL_SECONDS,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -63,6 +92,11 @@ class Gateway:
         self._channel = channel
         self._household = household
         self._broker = broker
+        self._clock_sync: ClockSync = clock_sync or KernelClockSync()
+        self._now = now
+        self._clock_wait_seconds = clock_wait_seconds
+        self._clock_poll_seconds = clock_poll_seconds
+        self._clock: HouseholdClock | None = None
         self._store: Store | None = None
         self._owns_store = False
         self._channel_task: asyncio.Task[None] | None = None
@@ -120,6 +154,7 @@ class Gateway:
         if self._settings.signal_account is None:
             log.info("gateway.skip_signal", reason="no_account")
             return
+        self._clock = self._household_clock()
         if self._channel is None:
             # Keychain can wait on an Allow prompt. Run it off the event loop
             # so a shutdown signal is still delivered, and fail before Signal
@@ -189,12 +224,104 @@ class Gateway:
             self._jobs = JobRunner(store, household, self._channel, self._settings)
             if self._signal is not None:
                 self._updates = UpdateWatcher(self._settings, store, self._signal)
+        if not await self._wait_for_clock():
+            return
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         if self._jobs is not None:
             self._job_task = asyncio.create_task(self._jobs.run(self._shutdown))
         if self._updates is not None:
             self._update_task = asyncio.create_task(self._updates.run(self._shutdown))
         log.info("gateway.signal_started", account=self._settings.signal_account)
+
+    def _household_clock(self) -> HouseholdClock:
+        """The household zone, or a refusal to start Signal without one."""
+        name = self._settings.timezone
+        if name is None:
+            log.error("gateway.timezone_missing", reason=TIMEZONE_REQUIRED)
+            raise HouseholdConfigError(TIMEZONE_REQUIRED)
+        clock = HouseholdClock(zone=ZoneInfo(name), now=self._now)
+        local, offset = local_reading(clock.now(), clock=clock)
+        log.info("clock.zone", zone=name, local=local, utc_offset=offset)
+        return clock
+
+    async def _wait_for_clock(self) -> bool:
+        """Hold Signal until the clock is believable, at most the configured wait.
+
+        Times written on a clock that is behind stay wrong, and when NTP steps
+        it forward, fresh history looks old enough to delete. The clock is
+        believed when the kernel says it is synchronized (or cannot say) and
+        it is not more than five minutes behind the newest event in the store.
+        A row more than a day ahead is ignored only while the kernel says
+        synchronized, so a bad row cannot hold startup and a clock days behind
+        cannot pass as an empty store. When the wait runs out with the kernel
+        not synchronized and the clock still behind the store, it raises
+        HouseholdConfigError so the process exits and the restart waits again;
+        any other doubtful clock starts anyway, since a household with no bot is
+        worse. Returns False when shutdown arrives first.
+        """
+        newest = self._store.newest_event_at() if self._store is not None else None
+        loop = asyncio.get_running_loop()
+        # The wait is timed on the monotonic clock: the wall clock is the
+        # thing that may step while we wait.
+        started = loop.time()
+        deadline = started + self._clock_wait_seconds
+        waiting = False
+        unknown_logged = False
+        future_logged = False
+        while True:
+            state = self._clock_sync.state()
+            if state is ClockState.UNKNOWN and not unknown_logged:
+                log.warning("clock.sync_unknown", reason="the kernel did not report clock state")
+                unknown_logged = True
+            behind = newest - self._now() if newest is not None else 0.0
+            # Only a synced kernel can call a far-ahead row bad. Unsynced or
+            # unknown, the same row may mean the clock is days behind, and
+            # dropping it would let that clock through.
+            if state is ClockState.SYNCED and behind > STORE_FUTURE_SECONDS:
+                if not future_logged:
+                    log.warning("clock.store_in_future", ahead_seconds=round(behind))
+                    future_logged = True
+                behind = 0.0
+            kernel_ok = state is not ClockState.UNSYNCED
+            store_ok = behind <= CLOCK_BEHIND_SECONDS
+            if kernel_ok and store_ok:
+                log.info(
+                    "clock.synced",
+                    kernel=state.value,
+                    waited_seconds=round(loop.time() - started, 1),
+                )
+                return True
+            if not waiting:
+                log.info(
+                    "clock.waiting_for_sync",
+                    kernel=state.value,
+                    behind_store_seconds=round(max(behind, 0.0)),
+                    wait_seconds=self._clock_wait_seconds,
+                )
+                waiting = True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if state is not ClockState.SYNCED and not store_ok:
+                    log.error(
+                        "clock.unsynced",
+                        kernel=state.value,
+                        behind_store_seconds=round(behind),
+                        reason=CLOCK_BEHIND_REFUSED,
+                    )
+                    raise HouseholdConfigError(CLOCK_BEHIND_REFUSED)
+                log.warning(
+                    "clock.unsynced",
+                    kernel=state.value,
+                    behind_store_seconds=round(max(behind, 0.0)),
+                    reason="starting anyway on a clock that may be wrong",
+                )
+                return True
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._shutdown.wait(), timeout=min(self._clock_poll_seconds, remaining)
+                )
+            if self._shutdown.is_set():
+                return False
 
     async def _run_channel(self, channel: ChannelRunner) -> None:
         try:
