@@ -266,14 +266,23 @@ class Job:
 
 
 def schedule_from_seconds(
-    *, zone: ZoneInfo, first_run: float, every_seconds: int, once: bool
+    *,
+    zone: ZoneInfo,
+    first_run: float,
+    every_seconds: int,
+    once: bool,
+    at_local: str | None = None,
 ) -> Schedule:
     """The wall-clock schedule for a gap given in seconds.
 
-    A whole number of days keeps the local time of ``first_run``, so a daily
-    job holds its hour across daylight saving (decision 0002); any other gap
-    is elapsed time. Until ``job_create`` takes ``every_days`` itself, this is
-    how a tool call and a row written by an older build both get a schedule.
+    A whole number of days keeps a local time, so a daily job holds its hour
+    across daylight saving (decision 0002); any other gap is elapsed time.
+    That time is ``at_local`` when the person named one, and otherwise the
+    clock time of ``first_run``. A named time the spring change skips
+    resolves to an instant an hour later, and reading the hour back from
+    that instant would keep every later day on the shifted hour. Until
+    ``job_create`` takes ``every_days`` itself, this is how a tool call and
+    a row written by an older build both get a schedule.
     """
     if once:
         return Schedule(zone=zone, anchor_at=first_run)
@@ -282,7 +291,7 @@ def schedule_from_seconds(
             zone=zone,
             anchor_at=first_run,
             every_days=every_seconds // DAY_SECONDS,
-            at_local=at_local_of(first_run, zone),
+            at_local=at_local if at_local is not None else at_local_of(first_run, zone),
         )
     return Schedule(zone=zone, anchor_at=first_run, every_seconds=every_seconds)
 
@@ -557,17 +566,32 @@ def resolve_start_at(text: str, *, now: float, timezone: str) -> float:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError as exc:
         raise JobError("the household timezone is not configured") from exc
+    parsed = _parse_start_at(text).replace(tzinfo=zone)
+    when = parsed.timestamp()
+    if when < now - _START_SKEW_SECONDS:
+        raise JobError("start_at is in the past")
+    return when
+
+
+def start_at_clock(text: str) -> str:
+    """The "HH:MM" a local ISO-8601 start names, as the person wrote it.
+
+    A whole-day repeat keeps this hour. On the day the spring change skips
+    it, the first run is an hour later, and the days after return to it
+    (decision 0002).
+    """
+    parsed = _parse_start_at(text)
+    return f"{parsed.hour:02d}:{parsed.minute:02d}"
+
+
+def _parse_start_at(text: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
         raise JobError("start_at must be an ISO-8601 date and time") from exc
     if parsed.tzinfo is not None:
         raise JobError("start_at must not include a timezone suffix")
-    parsed = parsed.replace(tzinfo=zone)
-    when = parsed.timestamp()
-    if when < now - _START_SKEW_SECONDS:
-        raise JobError("start_at is in the past")
-    return when
+    return parsed
 
 
 def bind_jobs(
@@ -595,6 +619,7 @@ def bind_jobs(
             first_run=first_run,
             every_seconds=spec.every_seconds,
             once=spec.once,
+            at_local=start_at_clock(spec.start_at) if spec.start_at is not None else None,
         )
         expires_at = None
         if spec.ttl_seconds is not None:

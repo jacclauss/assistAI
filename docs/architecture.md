@@ -275,8 +275,11 @@ Each job row stores its schedule in the household zone
 ([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)): the
 zone, an anchor (the instant of the first scheduled run), and either a
 number of days with the local time `HH:MM`, or a gap in seconds. A gap of
-whole days is stored as days at the clock time of the first run, so it can
-keep that hour across daylight saving. Any other gap is elapsed time. A
+whole days is stored as days at the clock time the person named for the
+first run, or that run's clock time when they named none, so it can keep
+that hour across daylight saving. A named time the spring change skips
+resolves to an instant an hour later, and the stored time is still the
+named one, so only that first day runs late. Any other gap is elapsed time. A
 one-time job has an anchor and no repeat. `next_run_at` stays as the cached
 next run the runner polls, and `every_seconds` is still written, as days
 times 86,400 for a whole-day job, so the previous image can step a row
@@ -306,7 +309,14 @@ Rows written before schema 15, or by the previous image after a rollback,
 have no schedule. The gateway fills them on every start, after the clock
 wait and before the job runner starts, and logs
 `store.job_schedule_migrated` once per row, cancelled rows included, with
-the id, days, and local time, never the prompt. The slot the person chose
+the id, days, and local time, never the prompt. The previous image also
+steps and reschedules rows that do have one, writing only `every_seconds`
+and `next_run_at`. This build keeps those two in step with the schedule,
+a whole-day gap as days times 86,400 and the next run on the anchor or a
+slot, so on the same start any active row where they disagree is rebuilt
+from them by the same rules and logged as `store.job_schedule_rebuilt`. A
+row that still agrees is left alone, so a start never moves a healthy
+row. The slot the person chose
 is the stored next run for a row that never ran, and one gap before it for
 a row that did, because 0.1.8 stepped a daily row by 86,400 seconds and
 moved it an hour across a daylight saving change. A row that never ran
@@ -316,7 +326,7 @@ one. Any other row keeps its next run.
 
 `python -m assistai store` holds the operator's commands on the state file.
 They need no Fireworks or Signal secrets. `store jobs [--next N] [--from
-YYYY-MM-DD]` fills any unfilled row the way a start would, then prints each
+YYYY-MM-DD]` fills or rebuilds rows the way a start would, then prints each
 active job's id, agent, name, repeat, and next runs in household words. It
 prints no prompt text. `store downgrade --to 14` sets the schema version
 back to 14, and only when the file is exactly version 15 with the same

@@ -1633,6 +1633,74 @@ def test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it(
     assert mgmplus.at_local == "08:00"
 
 
+def test_a_reschedule_made_while_rolled_back_is_what_runs(tmp_path: Path) -> None:
+    """0.1.8 moves only every_seconds and next_run_at. Forward again, its interval runs.
+
+    A row it did not touch keeps its schedule and its next run, and a second
+    start changes nothing.
+    """
+    path = tmp_path / "assistai.sqlite"
+    _v14_db(
+        path,
+        _mgmplus_row(),
+        _v14_row("j00000002", "morning email", next_run_at=chicago(2026, 11, 10, 8)),
+        _v14_row(
+            "j00000003",
+            "bins",
+            every_seconds=7 * 86400,
+            next_run_at=chicago(2026, 11, 2, 19),
+            prompt="Take the bins in.",
+        ),
+    )
+    store = Store(path)
+    store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 12))
+    assert store.advance_job("j00000003", now=chicago(2026, 11, 9, 12))
+    bins_before = store.find_job("jacob", name="bins")
+    store.close()
+
+    downgrade(path, to=14)
+    # 0.1.8's reschedule_job: "every other day", asked at 9:12 PM.
+    asked = chicago(2026, 11, 9, 21, 12)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE jobs SET every_seconds = ?, next_run_at = ? WHERE id = ? AND cancelled_at IS NULL",
+        (2 * 86400, asked + 2 * 86400, "j00000002"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    with capture_logs() as logs:
+        filled = store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 22))
+    with capture_logs() as later:
+        again = store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 23))
+    rescheduled = store.find_job("jacob", name="morning email")
+    assert rescheduled is not None
+    assert store.advance_job("j00000002", now=rescheduled.next_run_at + 30)
+    after_run = store.find_job("jacob", name="morning email")
+    bins = store.find_job("jacob", name="bins")
+    mgmplus = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert filled == 1
+    assert [entry["job"] for entry in logs if entry["event"] == "store.job_schedule_rebuilt"] == [
+        "j00000002"
+    ]
+    assert again == 0
+    assert not any(entry["event"].startswith("store.job_schedule") for entry in later)
+    assert rescheduled.every_seconds == 2 * 86400
+    assert rescheduled.every_days == 2
+    assert rescheduled.at_local == "21:12"
+    assert wall(rescheduled.next_run_at) == "2026-11-11 21:12:00 CST"
+    assert after_run is not None
+    assert wall(after_run.next_run_at) == "2026-11-13 21:12:00 CST"
+    assert bins_before is not None
+    assert bins == bins_before
+    assert mgmplus is not None
+    assert mgmplus.next_run_at == mgmplus.anchor_at == _MGMPLUS_FIRST
+    assert mgmplus.at_local == "08:00"
+
+
 def test_a_fresh_file_can_be_downgraded(tmp_path: Path) -> None:
     """A fresh file and a migrated one differ in their CREATE text, not in their shape."""
     path = tmp_path / "assistai.sqlite"

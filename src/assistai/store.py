@@ -8,6 +8,7 @@ conversation, silently clear taint, skip a confirmation, or drop a schedule.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -28,7 +29,7 @@ from assistai.clock import (
 )
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolCall
-from assistai.jobs import Job, JobKind, schedule_from_seconds
+from assistai.jobs import DAY_SECONDS, Job, JobKind, schedule_from_seconds
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
 from assistai.staging import Proposal
 
@@ -554,40 +555,63 @@ class Store:
     def backfill_job_schedules(self, zone: str, *, now: float | None = None) -> int:
         """Give every row an older build wrote its wall-clock schedule. Returns how many.
 
-        Cancelled rows are filled too, so a row is never half migrated. The
-        slot the person chose is the stored next run for a row that never
-        ran, and one gap before it for a row that did: 0.1.8 stepped a daily
-        row by 86,400 seconds, so across a daylight saving change its stored
-        next run is an hour off and only the slot before it holds the hour
-        they named. A row that never ran keeps its next run, even when it is
-        already past, because nothing has moved it. A whole-day row that ran
-        drops the drifted instant for its next local slot, so it does not
-        text at the wrong hour and again at the right one the same morning.
-        Any other row keeps its next run. A row that cannot be read is
-        logged and left for the next start rather than stopping the gateway.
+        That is every row with no zone, and every active row whose schedule
+        no longer agrees with the ``every_seconds`` and next run beside it.
+        This build writes the three together, so a disagreement means a
+        version 14 image stepped or rescheduled the row after a rollback,
+        and the schedule is rebuilt from what that image wrote. A row that
+        still agrees is left alone, so a start does not move a healthy row.
+
+        Cancelled rows with no zone are filled too, so a row is never half
+        migrated. The slot the person chose is the stored next run for a row
+        that never ran, and one gap before it for a row that did: 0.1.8
+        stepped a daily row by 86,400 seconds, so across a daylight saving
+        change its stored next run is an hour off and only the slot before
+        it holds the hour they named. A row that never ran keeps its next
+        run, even when it is already past, because nothing has moved it. A
+        whole-day row that ran drops the drifted instant for its next local
+        slot, so it does not text at the wrong hour and again at the right
+        one the same morning. Any other row keeps its next run. A row that
+        cannot be read is logged and left for the next start rather than
+        stopping the gateway.
         """
         moment = time.time() if now is None else now
         household = ZoneInfo(zone)
-        migrated: list[tuple[str, int | None, str | None, bool]] = []
+        migrated: list[tuple[str, str, int | None, str | None, bool]] = []
         try:
             with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
                 rows = self._conn.execute(
-                    "SELECT id, every_seconds, next_run_at, last_run_at, cancelled_at, once "
-                    "FROM jobs WHERE zone IS NULL"
+                    "SELECT * FROM jobs WHERE zone IS NULL OR cancelled_at IS NULL"
                 ).fetchall()
                 for row in rows:
+                    rebuilt = row["zone"] is not None
+                    if rebuilt:
+                        try:
+                            job = _job_from_row(row)
+                        except StoreError:
+                            log.warning("store.job_schedule_unreadable", job=row["id"])
+                            continue
+                        if _schedule_holds(job):
+                            continue
                     filled = _legacy_schedule(row, household, now=moment)
                     if filled is None:
                         log.warning("store.job_schedule_unreadable", job=row["id"])
                         continue
                     schedule, next_run_at = filled
+                    values = (*_schedule_values(schedule), next_run_at)
+                    if rebuilt and values == _stored_values(row):
+                        continue
                     self._conn.execute(
                         "UPDATE jobs SET zone = ?, anchor_at = ?, every_days = ?, at_local = ?, "
-                        "next_run_at = ? WHERE id = ? AND zone IS NULL",
-                        (*_schedule_values(schedule), next_run_at, row["id"]),
+                        "next_run_at = ? WHERE id = ?",
+                        (*values, row["id"]),
                     )
                     migrated.append(
                         (
+                            "store.job_schedule_rebuilt"
+                            if rebuilt
+                            else "store.job_schedule_migrated",
                             str(row["id"]),
                             schedule.every_days,
                             schedule.at_local,
@@ -597,9 +621,9 @@ class Store:
         except sqlite3.Error as exc:
             raise StoreError("job schedules could not be migrated") from exc
         # Logged after the commit so a rolled-back fill is not reported as done.
-        for job_id, every_days, at_local, cancelled in migrated:
+        for event, job_id, every_days, at_local, cancelled in migrated:
             log.info(
-                "store.job_schedule_migrated",
+                event,
                 job=job_id,
                 every_days=every_days,
                 at_local=at_local,
@@ -1163,6 +1187,40 @@ def _stored_schedule(job: Job) -> Schedule:
 
 def _schedule_values(schedule: Schedule) -> tuple[str, float, int | None, str | None]:
     return schedule.zone.key, schedule.anchor_at, schedule.every_days, schedule.at_local
+
+
+def _schedule_holds(job: Job) -> bool:
+    """True when a row's schedule still describes its ``every_seconds`` and next run.
+
+    Every write this build makes keeps the stored next run on the schedule:
+    the first run is the anchor, and every later one is a slot. A version
+    14 image writes only ``every_seconds`` and ``next_run_at``, so after a
+    rollback its step or reschedule shows up here as a gap that is not the
+    day count, or a next run that is off the grid. A schedule that cannot
+    be read does not hold either, so it is rebuilt.
+    """
+    try:
+        schedule = job.schedule()
+    except JobError:
+        return False
+    if schedule is None:
+        return False
+    if schedule.every_days is not None and job.every_seconds != schedule.every_days * DAY_SECONDS:
+        return False
+    if job.next_run_at == schedule.anchor_at:
+        return True
+    if not schedule.repeats:
+        return False
+    try:
+        return next_slot(schedule, after=math.nextafter(job.next_run_at, -math.inf)) == (
+            job.next_run_at
+        )
+    except JobError:
+        return False
+
+
+def _stored_values(row: sqlite3.Row) -> tuple[object, ...]:
+    return (row["zone"], row["anchor_at"], row["every_days"], row["at_local"], row["next_run_at"])
 
 
 def _legacy_schedule(

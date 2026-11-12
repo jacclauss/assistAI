@@ -340,5 +340,6 @@ something the previous image may misread: do not load the older image. Start
 the newer one again with `up -d --no-build`.
 
 While rolled back, the previous image runs jobs the old way. Installing the
-newer image again fills in a schedule for any job created in between; check
-it with `store jobs`.
+newer image again fills in a schedule for any job created in between, and
+rebuilds the schedule of any job the previous image ran or rescheduled
+(`store.job_schedule_rebuilt` in the log); check them with `store jobs`.

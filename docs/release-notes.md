@@ -24,7 +24,9 @@
   local time and logs `store.job_schedule_migrated` once per job. For the
   operator, `python -m assistai store jobs` lists each job's next runs in
   household time, and `store downgrade --to 14` hands the file back to the
-  previous image for a rollback ([pi-deploy.md](pi-deploy.md)).
+  previous image for a rollback ([pi-deploy.md](pi-deploy.md)). Coming
+  forward again rebuilds any job the previous image ran or rescheduled, so
+  a change made while rolled back is kept and a daily job keeps its hour.
 
 ## 0.1.8 — 24 October 2026
 

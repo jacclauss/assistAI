@@ -181,8 +181,19 @@ still step a row after a rollback.
 - Migration. `_init_schema` adds the columns with the existing
   `_ensure_*` pattern, which is idempotent. The store does not know the
   zone, so `Store.backfill_job_schedules(zone) -> int` fills every row
-  whose `zone` is NULL, active and cancelled alike. The gateway calls it on
-  every start, before the runner. For each row:
+  whose `zone` is NULL, active and cancelled alike, and rebuilds every
+  active row whose schedule no longer agrees with the columns beside it.
+  This build writes `every_seconds`, `next_run_at`, and the schedule
+  together, so a stored next run is always the anchor or a slot of the
+  schedule, and a whole-day row's `every_seconds` is `every_days * 86400`.
+  A version 14 image after a rollback writes only `every_seconds` and
+  `next_run_at`, so its step or reschedule shows up as a gap that is not
+  the day count or a next run off the grid. Such a row is rebuilt from
+  those columns by the rules below and logged as
+  `store.job_schedule_rebuilt`. A row that still agrees is not touched, so
+  a start never moves a healthy row, and the mgmplus row, which has never
+  run, stays on its stored first fire. The gateway calls it on every
+  start, before the runner. For each row:
   - `zone` is the household zone. The chosen slot is `next_run_at` when
     the job has never run (`last_run_at IS NULL`), and
     `next_run_at - every_seconds` when it has. That earlier instant is the
@@ -219,7 +230,8 @@ still step a row after a rollback.
   `python -m assistai store downgrade --to 14` sets it, and only
   when the file is exactly version 15 with the four columns and nothing
   else changed. Going forward again re-runs the idempotent migration and
-  the backfill picks up any job the older image created.
+  the backfill picks up any job the older image created, and rebuilds any
+  job it stepped or rescheduled.
 - New command `python -m assistai store jobs [--next N] [--from DATE]`
   prints each active job's id, name, next N runs through `say_when`, and
   `say_repeat`. It prints no prompt text. It is the operator's check before
@@ -507,13 +519,22 @@ image tag, and a version 14 image refuses version 15.
   `test_store.py::test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it`
   runs the command, inserts a row with 0.1.8's exact column list, reopens
   with this version, and asserts the row is backfilled.
+- `test_store.py::test_a_reschedule_made_while_rolled_back_is_what_runs`
+  runs 0.1.8's reschedule SQL on a daily row after the downgrade and
+  asserts that, forward again, the row repeats every two days at the hour
+  it was asked, while a row 0.1.8 did not touch and the mgmplus row keep
+  their schedule and next run, and a second start changes nothing.
 - `test_store.py::test_downgrade_refuses_a_file_it_does_not_recognise`.
 - During the deploy B rehearsal the operator also runs the rollback on the
   copy and opens it with the 0.1.8 image
   (`python -c "from assistai.store import Store ..."` listing jobs). Deploy
   B does not go ahead until that works.
-- While rolled back, 0.1.8 steps jobs the old way. On return, the first
-  advance puts them back on their slot.
+- While rolled back, 0.1.8 steps jobs the old way. On return, the backfill
+  rebuilds each row it stepped from the slot that ran, so a daily row 0.1.8
+  stepped across Nov 1 texts once, at 8:00, not at 7:00 and again at 8:00.
+  `test_jobs.py::test_a_daily_row_stepped_across_fall_back_while_rolled_back_texts_once_at_its_hour`
+  runs 0.1.8's advance SQL across the fall-back and ticks the runner
+  through Nov 1.
 
 **The model handles the new arguments badly.** Reminders could fail more
 often for a few days, and old `start_at` calls in history invite copying.
@@ -571,9 +592,13 @@ What was the complaint in 0.1.8 is intended behaviour now.
   The owner tells his spouse himself.
 - Until commit 6 ships, deploy B still runs the 0.1.8 prompt and maps a
   whole-day `every_seconds` with no `start_at` to the hour of the request,
-  as 0.1.8 does. No daily job is expected to be created in that window. If
-  one is, `store jobs` shows its hour, and it can be rescheduled after
-  deploy C.
+  as 0.1.8 does. A whole-day `start_at` keeps the clock time it names as
+  `at_local`, not the clock time of the instant it resolves to, so a start
+  the spring change skips (2:30 AM on 2027-03-14) runs at 3:30 that day
+  only and at 2:30 the next, per decision 0002
+  (`test_jobs.py::test_a_daily_start_in_the_spring_gap_returns_to_its_hour_the_next_day`).
+  No daily job is expected to be created in that window. If one is,
+  `store jobs` shows its hour, and it can be rescheduled after deploy C.
 
 **Rewriting the staged call weakens "what you approved is what runs".**
 
@@ -841,11 +866,15 @@ the same schema. Closed after the phone checks pass, the next morning's
   December 10 at 8:00 AM, not December 11. A stepped row's `next_run_at`
   is the next correct local slot, not the drifted instant, so it texts
   once that day. Rollback to 14 and forward again backfills a row the
-  older version wrote.
+  older version wrote, and rebuilds a row it stepped or rescheduled, so the
+  new interval runs and a row stepped across fall-back texts once at its
+  hour. A row it did not touch is not moved.
   (`tests/test_store.py::test_schema_v14_gains_wall_clock_schedules_and_keeps_rows`,
   `tests/test_store.py::test_a_legacy_row_that_never_ran_keeps_its_first_fire`,
   `tests/test_store.py::test_a_legacy_daily_row_that_ran_keeps_its_hour`,
   `tests/test_store.py::test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it`,
+  `tests/test_store.py::test_a_reschedule_made_while_rolled_back_is_what_runs`,
+  `tests/test_jobs.py::test_a_daily_row_stepped_across_fall_back_while_rolled_back_texts_once_at_its_hour`,
   `tests/test_store.py::test_downgrade_refuses_a_file_it_does_not_recognise`)
 - [ ] AC16 — Household local times are formatted only in `clock.py`.
   (`tests/test_invariants.py::test_local_times_are_formatted_in_one_place`)

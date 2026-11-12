@@ -320,6 +320,7 @@ def bind_relay(
             require_representable,
             resolve_start_at,
             schedule_from_seconds,
+            start_at_clock,
         )
 
         now = current_time()
@@ -339,6 +340,7 @@ def bind_relay(
                 first_run=first_run,
                 every_seconds=when.every_seconds,
                 once=when.once,
+                at_local=start_at_clock(when.start_at) if when.start_at is not None else None,
             )
         except JobError as exc:
             raise RelayError(str(exc)) from exc
