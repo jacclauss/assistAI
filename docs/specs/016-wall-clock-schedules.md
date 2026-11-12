@@ -188,8 +188,14 @@ still step a row after a rollback.
   schedule, and a whole-day row's `every_seconds` is `every_days * 86400`.
   A version 14 image after a rollback writes only `every_seconds` and
   `next_run_at`, so its step or reschedule shows up as a gap that is not
-  the day count or a next run off the grid. Such a row is rebuilt from
-  those columns by the rules below and logged as
+  the day count or a next run off the grid. A whole-day row whose
+  `every_seconds` is still `every_days * 86400` was only stepped, so it
+  keeps its stored `at_local`, zone, and anchor, and its `next_run_at`
+  becomes `next_slot(schedule, after=max(now, next_run_at - every_seconds))`.
+  The hour is not re-derived from the step, because after a daylight
+  saving change or a spring-gap run that instant is the shifted hour. A
+  row whose gap changed was rescheduled by that image and is rebuilt from
+  its columns by the rules below. Either is logged as
   `store.job_schedule_rebuilt`. A row that still agrees is not touched, so
   a start never moves a healthy row, and the mgmplus row, which has never
   run, stays on its stored first fire. The gateway calls it on every

@@ -1701,6 +1701,58 @@ def test_a_reschedule_made_while_rolled_back_is_what_runs(tmp_path: Path) -> Non
     assert mgmplus.at_local == "08:00"
 
 
+def test_a_spring_gap_run_stepped_while_rolled_back_keeps_its_stored_hour(
+    tmp_path: Path,
+) -> None:
+    """2:30 AM does not exist on 2027-03-14, so that run was at 3:30 CDT.
+
+    0.1.8 stepped it 86,400 seconds to Monday 3:30. One gap back is the
+    shifted 3:30, so forward again the stored 2:30 is what Monday keeps.
+    """
+    path = tmp_path / "assistai.sqlite"
+    store = Store(path)
+    store.save_job(_scheduled(chicago(2027, 3, 13, 2, 30), every_seconds=86400))
+    assert store.advance_job("jabcd1234", now=chicago(2027, 3, 13, 2, 31))
+    sunday = store.find_job("jacob", name="price check")
+    store.close()
+    assert sunday is not None
+    assert wall(sunday.next_run_at) == "2027-03-14 03:30:00 CDT"
+
+    downgrade(path, to=14)
+    # 0.1.8's advance_job, four seconds after the 3:30 AM CDT run.
+    finished = sunday.next_run_at + 4
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ? "
+        "WHERE id = ? AND cancelled_at IS NULL",
+        (finished, finished, "jabcd1234"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    with capture_logs() as logs:
+        filled = store.backfill_job_schedules("America/Chicago", now=chicago(2027, 3, 14, 12))
+    again = store.backfill_job_schedules("America/Chicago", now=chicago(2027, 3, 14, 13))
+    monday = store.find_job("jacob", name="price check")
+    assert monday is not None
+    assert store.advance_job("jabcd1234", now=monday.next_run_at + 30)
+    tuesday = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert filled == 1
+    assert [entry["job"] for entry in logs if entry["event"] == "store.job_schedule_rebuilt"] == [
+        "jabcd1234"
+    ]
+    assert again == 0
+    assert monday.at_local == "02:30"
+    assert monday.every_days == 1
+    assert monday.anchor_at == sunday.anchor_at
+    assert wall(monday.next_run_at) == "2027-03-15 02:30:00 CDT"
+    assert tuesday is not None
+    assert wall(tuesday.next_run_at) == "2027-03-16 02:30:00 CDT"
+
+
 def test_a_fresh_file_can_be_downgraded(tmp_path: Path) -> None:
     """A fresh file and a migrated one differ in their CREATE text, not in their shape."""
     path = tmp_path / "assistai.sqlite"

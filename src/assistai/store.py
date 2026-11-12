@@ -558,9 +558,12 @@ class Store:
         That is every row with no zone, and every active row whose schedule
         no longer agrees with the ``every_seconds`` and next run beside it.
         This build writes the three together, so a disagreement means a
-        version 14 image stepped or rescheduled the row after a rollback,
-        and the schedule is rebuilt from what that image wrote. A row that
-        still agrees is left alone, so a start does not move a healthy row.
+        version 14 image stepped or rescheduled the row after a rollback.
+        A whole-day row whose gap is still its day count was only stepped,
+        so it keeps its stored local hour and goes back on its next slot;
+        any other disagreement is rebuilt from what that image wrote. A row
+        that still agrees is left alone, so a start does not move a healthy
+        row.
 
         Cancelled rows with no zone are filled too, so a row is never half
         migrated. The slot the person chose is the stored next run for a row
@@ -586,6 +589,7 @@ class Store:
                 ).fetchall()
                 for row in rows:
                     rebuilt = row["zone"] is not None
+                    filled: tuple[Schedule, float] | None = None
                     if rebuilt:
                         try:
                             job = _job_from_row(row)
@@ -594,7 +598,9 @@ class Store:
                             continue
                         if _schedule_holds(job):
                             continue
-                    filled = _legacy_schedule(row, household, now=moment)
+                        filled = _realigned(job, now=moment)
+                    if filled is None:
+                        filled = _legacy_schedule(row, household, now=moment)
                     if filled is None:
                         log.warning("store.job_schedule_unreadable", job=row["id"])
                         continue
@@ -1217,6 +1223,31 @@ def _schedule_holds(job: Job) -> bool:
         )
     except JobError:
         return False
+
+
+def _realigned(job: Job, *, now: float) -> tuple[Schedule, float] | None:
+    """The stored whole-day schedule and its next slot, when only the next run left the grid.
+
+    A version 14 image that stepped the row by ``every_seconds`` moved the
+    next run off the hour after a daylight saving change or a spring-gap
+    run, and the instant one gap back is that shifted hour, not the one the
+    person named. The stored ``at_local`` is the named hour, so it is kept.
+    None when the gap no longer matches the day count, because then the
+    old image rescheduled the row and its columns say what runs.
+    """
+    try:
+        schedule = job.schedule()
+    except JobError:
+        return None
+    if schedule is None or schedule.every_days is None:
+        return None
+    if job.every_seconds != schedule.every_days * DAY_SECONDS:
+        return None
+    stepped_from = job.next_run_at - job.every_seconds
+    try:
+        return schedule, next_slot(schedule, after=max(now, stepped_from))
+    except JobError:
+        return None
 
 
 def _stored_values(row: sqlite3.Row) -> tuple[object, ...]:
