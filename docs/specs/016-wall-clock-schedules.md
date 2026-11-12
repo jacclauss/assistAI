@@ -191,7 +191,12 @@ still step a row after a rollback.
   the day count or a next run off the grid. A whole-day row whose
   `every_seconds` is still `every_days * 86400` was only stepped, so it
   keeps its stored `at_local`, zone, and anchor, and its `next_run_at`
-  becomes `next_slot(schedule, after=max(now, next_run_at - every_seconds))`.
+  becomes `next_slot(schedule, after=next_run_at - every_seconds)`, the
+  slot the stepped run stands for. That slot is not measured from `now`:
+  version 14's `next_run_at` sits a few seconds past it, or a spring hour
+  past it, so a start in that gap still finds today's run due and the
+  runner sends it. A slot already past runs once and `advance_job` returns
+  the row to its slot, as for any missed run.
   The hour is not re-derived from the step, because after a daylight
   saving change or a spring-gap run that instant is the shifted hour. A
   row whose gap changed was rescheduled by that image and is rebuilt from

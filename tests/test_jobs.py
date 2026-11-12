@@ -2268,6 +2268,65 @@ async def test_a_daily_row_stepped_across_fall_back_while_rolled_back_texts_once
     store.close()
 
 
+async def test_a_start_just_before_a_stepped_run_still_sends_it_today(tmp_path: Path) -> None:
+    """0.1.8 stepped the 8:00 AM row from 8:00:04 yesterday to 8:00:04 today.
+
+    Forward again at 8:00:02, today's 8:00 run is still due and goes out
+    once. The never-run December 10 reminder keeps its first fire.
+    """
+    path = tmp_path / "assistai.sqlite"
+    store = Store(path)
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    store.save_job(
+        _daily_reminder(
+            chicago(2026, 11, 19, 8), id="j00000002", name="weigh in", prompt="Weigh in."
+        )
+    )
+    mgmplus_before = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+    downgrade(path, to=14)
+    # 0.1.8's advance_job, four seconds after the 8:00 AM run.
+    finished = chicago(2026, 11, 19, 8) + 4
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
+        "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
+        "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
+        "WHERE id = ? AND cancelled_at IS NULL",
+        (finished, finished, "j00000002"),
+    )
+    conn.commit()
+    conn.close()
+    store = Store(path)
+    stepped = store.find_job("jacob", name="weigh in")
+    assert stepped is not None
+    assert wall(stepped.next_run_at) == "2026-11-20 08:00:04 CST"
+
+    clock = FakeClock(chicago(2026, 11, 20, 8) + 2)
+    filled = store.backfill_job_schedules("America/Chicago", now=clock())
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+    texted_at: list[str] = []
+    while clock() < chicago(2026, 11, 21, 0):
+        sent = len(channel.notified)
+        await runner._tick()
+        texted_at += [wall(clock())] * (len(channel.notified) - sent)
+        clock.advance(60)
+    after = store.find_job("jacob", name="weigh in")
+    mgmplus = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert filled == 1
+    assert texted_at == ["2026-11-20 08:00:02 CST"]
+    assert [text for _agent, text, _untrusted in channel.notified] == ["Weigh in."]
+    assert after is not None
+    assert after.at_local == "08:00"
+    assert wall(after.next_run_at) == "2026-11-21 08:00:00 CST"
+    assert mgmplus == mgmplus_before
+    assert mgmplus is not None
+    assert wall(mgmplus.next_run_at) == "2026-12-10 08:00:00 CST"
+
+
 async def test_a_daily_start_in_the_spring_gap_returns_to_its_hour_the_next_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
