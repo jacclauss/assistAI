@@ -220,11 +220,16 @@ still step a row after a rollback.
     passed, the row is due and runs once at the next tick, and
     `advance_job` then puts it on its slot, as for any missed run.
   - A row that has run, and is whole-day, has its `next_run_at` replaced
-    with `next_slot(schedule, after=max(now, chosen))`. The chosen slot
-    already ran, so the next fire is strictly after it. The drifted
-    instant is discarded. The job's next fire is the next correct local
-    slot, once. It does not fire at the drifted hour and again at 8:00 the
-    same morning.
+    with `next_slot(schedule, after=chosen)`. The chosen slot already ran,
+    so the next fire is strictly after it. The drifted instant is
+    discarded. The job's next fire is the next correct local slot, once.
+    It does not fire at the drifted hour and again at 8:00 the same
+    morning. That slot is not measured from `now`: 0.1.8 stepped from when
+    the run finished, so its `next_run_at` sits a few seconds past the
+    named hour, and a first start in those seconds, at 8:00:02 against a
+    stored 8:00:04, must still send today's reminder rather than move it
+    to tomorrow. A slot already past is due, runs once, and `advance_job`
+    returns the row to its schedule, as for any missed run.
   - A row whose `every_seconds` is not a whole number of days stays
     elapsed with its `every_seconds`, and `next_run_at` is left as stored.
   - Each row is logged as `store.job_schedule_migrated` with the job id,

@@ -574,13 +574,15 @@ class Store:
         change its stored next run is an hour off and only the slot before
         it holds the hour they named. A row that never ran keeps its next
         run, even when it is already past, because nothing has moved it. A
-        whole-day row that ran drops the drifted instant for its next local
-        slot, so it does not text at the wrong hour and again at the right
-        one the same morning. Any other row keeps its next run. A row that
+        whole-day row that ran drops the drifted instant for the first local
+        slot after the one it chose, so it does not text at the wrong hour
+        and again at the right one the same morning. That slot is not
+        measured from ``now``, so a start in the seconds between the named
+        hour and the stepped run still sends today's. Any other row keeps
+        its next run. A row that
         cannot be read is logged and left for the next start rather than
         stopping the gateway.
         """
-        moment = time.time() if now is None else now
         household = ZoneInfo(zone)
         migrated: list[tuple[str, str, int | None, str | None, bool]] = []
         try:
@@ -602,7 +604,7 @@ class Store:
                             continue
                         filled = _realigned(job)
                     if filled is None:
-                        filled = _legacy_schedule(row, household, now=moment)
+                        filled = _legacy_schedule(row, household)
                     if filled is None:
                         log.warning("store.job_schedule_unreadable", job=row["id"])
                         continue
@@ -1261,10 +1263,15 @@ def _stored_values(row: sqlite3.Row) -> tuple[object, ...]:
     return (row["zone"], row["anchor_at"], row["every_days"], row["at_local"], row["next_run_at"])
 
 
-def _legacy_schedule(
-    row: sqlite3.Row, zone: ZoneInfo, *, now: float
-) -> tuple[Schedule, float] | None:
-    """The schedule and next run an older build's row stands for, or None if unreadable."""
+def _legacy_schedule(row: sqlite3.Row, zone: ZoneInfo) -> tuple[Schedule, float] | None:
+    """The schedule and next run an older build's row stands for, or None if unreadable.
+
+    A whole-day row that ran goes on the first slot after the one the person
+    chose, not the first after the start: the old build stepped it to a few
+    seconds past that slot, so a start in those seconds must still find
+    today's run due. A slot already past runs once and ``advance_job`` puts
+    the row back on its schedule, as for any missed run.
+    """
     every = row["every_seconds"]
     stored = row["next_run_at"]
     last_run_at = row["last_run_at"]
@@ -1282,7 +1289,7 @@ def _legacy_schedule(
         )
         next_run_at = float(stored)
         if ran and schedule.every_days is not None:
-            next_run_at = next_slot(schedule, after=max(now, chosen))
+            next_run_at = next_slot(schedule, after=chosen)
     except (JobError, OverflowError, OSError, ValueError):
         return None
     return schedule, next_run_at

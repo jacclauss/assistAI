@@ -2327,6 +2327,75 @@ async def test_a_start_just_before_a_stepped_run_still_sends_it_today(tmp_path: 
     assert wall(mgmplus.next_run_at) == "2026-12-10 08:00:00 CST"
 
 
+async def test_a_first_start_just_before_a_stepped_run_still_sends_it_today(
+    tmp_path: Path,
+) -> None:
+    """A 0.1.8 file has no zone on any row, and it stepped 8:00 AM to 8:00:04 today.
+
+    The first start of this build, at 8:00:02, fills the zone and still
+    sends today's 8:00 run once, rather than moving it to tomorrow. The
+    never-run December 10 reminder keeps its first fire.
+    """
+    path = tmp_path / "assistai.sqlite"
+    store = Store(path)
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    store.save_job(
+        _daily_reminder(
+            chicago(2026, 11, 19, 8), id="j00000002", name="weigh in", prompt="Weigh in."
+        )
+    )
+    store.close()
+    downgrade(path, to=14)
+    # 0.1.8's advance_job, four seconds after the 8:00 AM run, on a file
+    # 0.1.8 wrote, so no row carries a schedule yet.
+    finished = chicago(2026, 11, 19, 8) + 4
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
+        "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
+        "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
+        "WHERE id = ? AND cancelled_at IS NULL",
+        (finished, finished, "j00000002"),
+    )
+    conn.execute(
+        "UPDATE jobs SET zone = NULL, anchor_at = NULL, every_days = NULL, at_local = NULL"
+    )
+    conn.commit()
+    conn.close()
+    store = Store(path)
+    stepped = store.find_job("jacob", name="weigh in")
+    assert stepped is not None
+    assert stepped.zone is None
+    assert wall(stepped.next_run_at) == "2026-11-20 08:00:04 CST"
+
+    clock = FakeClock(chicago(2026, 11, 20, 8) + 2)
+    with capture_logs() as logs:
+        filled = store.backfill_job_schedules("America/Chicago", now=clock())
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+    texted_at: list[str] = []
+    while clock() < chicago(2026, 11, 21, 0):
+        sent = len(channel.notified)
+        await runner._tick()
+        texted_at += [wall(clock())] * (len(channel.notified) - sent)
+        clock.advance(60)
+    after = store.find_job("jacob", name="weigh in")
+    mgmplus = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert filled == 2
+    migrated = [entry for entry in logs if entry["event"] == "store.job_schedule_migrated"]
+    assert len(migrated) == 2
+    assert texted_at == ["2026-11-20 08:00:02 CST"]
+    assert [text for _agent, text, _untrusted in channel.notified] == ["Weigh in."]
+    assert after is not None
+    assert after.at_local == "08:00"
+    assert wall(after.next_run_at) == "2026-11-21 08:00:00 CST"
+    assert mgmplus is not None
+    assert mgmplus.at_local == "08:00"
+    assert wall(mgmplus.next_run_at) == "2026-12-10 08:00:00 CST"
+
+
 async def test_a_daily_start_in_the_spring_gap_returns_to_its_hour_the_next_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

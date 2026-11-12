@@ -1294,7 +1294,7 @@ def test_a_legacy_row_that_never_ran_keeps_its_first_fire(tmp_path: Path, now: f
         pytest.param(chicago(2026, 10, 31, 20), "2026-11-01 08:00:00 CST", id="the evening before"),
         pytest.param(chicago(2026, 11, 1, 6, 30), "2026-11-01 08:00:00 CST", id="before 7"),
         pytest.param(chicago(2026, 11, 1, 7, 30), "2026-11-01 08:00:00 CST", id="between 7 and 8"),
-        pytest.param(chicago(2026, 11, 9, 12), "2026-11-10 08:00:00 CST", id="days later"),
+        pytest.param(chicago(2026, 11, 9, 12), "2026-11-01 08:00:00 CST", id="days later"),
     ],
 )
 def test_a_legacy_daily_row_that_ran_keeps_its_hour(
@@ -1303,7 +1303,9 @@ def test_a_legacy_daily_row_that_ran_keeps_its_hour(
     """0.1.8 stepped 8:00 AM CDT by 86,400 seconds to 7:00 AM CST on Nov 1.
 
     The slot before the stored one is the hour the person chose. The drifted
-    7:00 is dropped, so the row texts once that morning, at 8:00.
+    7:00 is dropped, so the row texts once that morning, at 8:00. Days
+    later that 8:00 is a missed run: it is due, runs once, and
+    ``advance_job`` returns the row to its slot.
     """
     path = tmp_path / "assistai.sqlite"
     ran = chicago(2026, 10, 31, 8)
@@ -1323,7 +1325,7 @@ def test_a_legacy_daily_row_that_ran_keeps_its_hour(
     assert loaded.every_days == 1
     assert loaded.anchor_at == ran
     assert wall(loaded.next_run_at) == expected
-    assert loaded.next_run_at > now
+    assert loaded.next_run_at > ran
 
 
 def test_an_elapsed_legacy_row_keeps_its_next_run_and_backfill_runs_once(tmp_path: Path) -> None:
