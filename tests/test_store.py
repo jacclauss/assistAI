@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
+from structlog.testing import capture_logs
 
+from assistai.clock import Schedule
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
 from assistai.jobs import Job
 from assistai.staging import Proposal
-from assistai.store import SCHEMA_VERSION, Store
+from assistai.store import SCHEMA_VERSION, Store, downgrade
+from tests.clock_fakes import CHICAGO, chicago, wall
+
+# What job_reschedule stores for "every 600 seconds" when the next run is at 610.
+_ten_minutes = Schedule(zone=CHICAGO, anchor_at=610.0, every_seconds=600)
 
 
 def _store(tmp_path: Path) -> Store:
@@ -350,7 +358,9 @@ def test_reschedule_does_not_restore_a_cleared_outbox(tmp_path: Path) -> None:
         )
     )
     assert store.advance_job("jabcd1234", now=10.0)
-    assert store.reschedule_job("jabcd1234", every_seconds=600, next_run_at=610.0)
+    assert store.reschedule_job(
+        "jabcd1234", every_seconds=600, next_run_at=610.0, schedule=_ten_minutes
+    )
 
     loaded = store.find_job("jacob", name="morning email")
     assert loaded is not None
@@ -785,7 +795,7 @@ def test_schema_v13_gains_job_taint_and_keeps_rows(tmp_path: Path) -> None:
     assert saved.tainted
     store.close()
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 15
     conn.close()
 
 
@@ -943,3 +953,610 @@ def test_the_newest_event_ignores_future_schedule_columns_and_unrun_jobs(tmp_pat
 
     assert store.newest_event_at() == 200.0
     store.close()
+
+
+# The schema 0.1.8 writes, copied from bbd205e. A real file shaped like the
+# Pi's is the only fair test of the migration and of the downgrade back.
+_V14_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    untrusted INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    UNIQUE(agent, seq)
+);
+CREATE INDEX IF NOT EXISTS messages_agent_seq ON messages(agent, seq);
+
+CREATE TABLE IF NOT EXISTS allowlist (
+    number TEXT PRIMARY KEY NOT NULL,
+    admitted_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    agent TEXT PRIMARY KEY NOT NULL,
+    calls TEXT NOT NULL,
+    tainted INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY NOT NULL,
+    agent TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    every_seconds INTEGER NOT NULL,
+    ttl_seconds INTEGER,
+    created_at REAL NOT NULL,
+    expires_at REAL,
+    next_run_at REAL NOT NULL,
+    last_run_at REAL,
+    cancelled_at REAL,
+    pending_text TEXT,
+    pending_untrusted INTEGER NOT NULL DEFAULT 0,
+    pending_after TEXT,
+    pending_delivered INTEGER NOT NULL DEFAULT 0,
+    once INTEGER NOT NULL DEFAULT 0,
+    verbatim INTEGER NOT NULL DEFAULT 0,
+    relay INTEGER NOT NULL DEFAULT 0,
+    relay_sent INTEGER NOT NULL DEFAULT 0,
+    relay_recorded INTEGER NOT NULL DEFAULT 0,
+    tainted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
+CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
+
+CREATE TABLE IF NOT EXISTS gmail_tokens (
+    agent TEXT PRIMARY KEY NOT NULL,
+    refresh_token TEXT NOT NULL,
+    access_token TEXT,
+    expires_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_agent_active_name
+    ON jobs(agent, lower(name)) WHERE cancelled_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS shared_lists (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    owner TEXT,
+    created_by TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_shared_name
+    ON shared_lists(lower(name)) WHERE owner IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS shared_lists_private_name
+    ON shared_lists(owner, lower(name)) WHERE owner IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS shared_items (
+    id TEXT PRIMARY KEY NOT NULL,
+    list_id TEXT NOT NULL REFERENCES shared_lists(id),
+    text TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS update_notices (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    report TEXT NOT NULL,
+    sent_at REAL NOT NULL
+);
+"""
+
+# 0.1.8's save_job column list, exactly. A row written after a downgrade has
+# no schedule columns.
+_V14_JOB_INSERT = (
+    "INSERT INTO jobs (id, agent, kind, name, prompt, every_seconds, "
+    "ttl_seconds, created_at, expires_at, next_run_at, last_run_at, "
+    "cancelled_at, pending_text, pending_untrusted, pending_after, "
+    "pending_delivered, once, verbatim, relay, relay_sent, relay_recorded, "
+    "tainted) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_MGMPLUS_PROMPT = "Cancel MGM+ before the rate goes up."
+_MGMPLUS_FIRST = chicago(2026, 12, 10, 8)
+
+
+def _v14_row(
+    job_id: str,
+    name: str,
+    *,
+    every_seconds: int = 86400,
+    next_run_at: float,
+    last_run_at: float | None = None,
+    cancelled_at: float | None = None,
+    prompt: str = "summarize unread mail",
+    kind: str = "schedule",
+    ttl_seconds: int | None = None,
+    expires_at: float | None = None,
+    pending_text: str | None = None,
+    pending_after: str | None = None,
+    pending_delivered: int = 0,
+    once: int = 0,
+    verbatim: int = 0,
+    relay: int = 0,
+) -> tuple[object, ...]:
+    """One row in 0.1.8's column order."""
+    return (
+        job_id,
+        "jacob",
+        kind,
+        name,
+        prompt,
+        every_seconds,
+        ttl_seconds,
+        chicago(2026, 10, 18, 20, 0),
+        expires_at,
+        next_run_at,
+        last_run_at,
+        cancelled_at,
+        pending_text,
+        0,
+        pending_after,
+        pending_delivered,
+        once,
+        verbatim,
+        relay,
+        0,
+        0,
+        0,
+    )
+
+
+def _mgmplus_row() -> tuple[object, ...]:
+    """The one live job on the Pi: daily, never run, first fire Dec 10 at 8:00 AM CST."""
+    return _v14_row(
+        "j00000001",
+        "mgmplus cancel reminder",
+        next_run_at=_MGMPLUS_FIRST,
+        prompt=_MGMPLUS_PROMPT,
+        verbatim=1,
+    )
+
+
+def _v14_db(path: Path, *rows: tuple[object, ...]) -> None:
+    """A version 14 file, as 0.1.8 leaves it, holding ``rows``."""
+    conn = sqlite3.connect(path)
+    conn.executescript(_V14_SCHEMA)
+    conn.executemany(_V14_JOB_INSERT, rows)
+    conn.execute("PRAGMA user_version = 14")
+    conn.commit()
+    conn.close()
+
+
+def _job_row(path: Path, job_id: str) -> sqlite3.Row:
+    """A row read without the store, so cancelled rows and raw columns are visible."""
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+    assert row is not None
+    return cast(sqlite3.Row, row)
+
+
+def _user_version(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    conn.close()
+    return version
+
+
+def test_schema_v14_gains_wall_clock_schedules_and_keeps_rows(tmp_path: Path) -> None:
+    """The Pi's file upgrades with every row, and the mgmplus reminder still fires Dec 10 at 8."""
+    path = tmp_path / "assistai.sqlite"
+    email_ran = chicago(2026, 10, 30, 21, 12)
+    watch_ran = chicago(2026, 11, 8, 9, 0)
+    relay_at = chicago(2026, 11, 9, 18, 30)
+    _v14_db(
+        path,
+        _mgmplus_row(),
+        _v14_row(
+            "j00000002",
+            "morning email",
+            next_run_at=email_ran + 86400,
+            last_run_at=email_ran,
+            cancelled_at=chicago(2026, 10, 30, 21, 40),
+        ),
+        _v14_row(
+            "j00000003",
+            "pool reminder",
+            next_run_at=chicago(2026, 10, 25, 9),
+            cancelled_at=chicago(2026, 10, 25, 9, 1),
+            prompt="Put the cleaner in the pool.",
+            pending_text="[job: pool reminder]\nPut the cleaner in the pool.",
+            pending_after="cancel",
+            pending_delivered=1,
+            once=1,
+            verbatim=1,
+        ),
+        _v14_row(
+            "j00000004",
+            "flight watch",
+            kind="watch",
+            every_seconds=60,
+            ttl_seconds=86400,
+            expires_at=watch_ran + 86400,
+            next_run_at=watch_ran + 60,
+            last_run_at=watch_ran,
+            prompt="Denver fares under $200",
+        ),
+        _v14_row(
+            "j00000005",
+            "message to spouse",
+            next_run_at=relay_at,
+            prompt="pick up milk",
+            once=1,
+            verbatim=1,
+            relay=1,
+        ),
+    )
+
+    store = Store(path)
+    with capture_logs() as logs:
+        filled = store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 12))
+    store.close()
+
+    assert filled == 5
+    assert _user_version(path) == SCHEMA_VERSION == 15
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 5
+    assert conn.execute("SELECT COUNT(*) FROM jobs WHERE zone IS NULL").fetchone()[0] == 0
+    conn.close()
+
+    mgmplus = _job_row(path, "j00000001")
+    assert mgmplus["every_days"] == 1
+    assert mgmplus["at_local"] == "08:00"
+    assert mgmplus["every_seconds"] == 86400
+    assert mgmplus["next_run_at"] == _MGMPLUS_FIRST
+    assert wall(mgmplus["next_run_at"]) == "2026-12-10 08:00:00 CST"
+    assert mgmplus["anchor_at"] == _MGMPLUS_FIRST
+    assert mgmplus["cancelled_at"] is None
+
+    email = _job_row(path, "j00000002")
+    assert email["cancelled_at"] == chicago(2026, 10, 30, 21, 40)
+    assert email["zone"] == "America/Chicago"
+    assert email["every_days"] == 1
+    assert email["at_local"] == "21:12"
+
+    pool = _job_row(path, "j00000003")
+    assert pool["cancelled_at"] == chicago(2026, 10, 25, 9, 1)
+    assert pool["zone"] == "America/Chicago"
+    assert pool["pending_text"] == "[job: pool reminder]\nPut the cleaner in the pool."
+    assert pool["pending_after"] == "cancel"
+    assert pool["pending_delivered"] == 1
+    assert pool["every_days"] is None
+
+    watch = _job_row(path, "j00000004")
+    assert watch["every_days"] is None
+    assert watch["at_local"] is None
+    assert watch["every_seconds"] == 60
+    assert watch["next_run_at"] == watch_ran + 60
+    assert watch["anchor_at"] == watch_ran
+
+    relay = _job_row(path, "j00000005")
+    assert relay["zone"] == "America/Chicago"
+    assert relay["every_days"] is None
+    assert relay["at_local"] is None
+    assert relay["next_run_at"] == relay_at
+    assert relay["anchor_at"] == relay_at
+
+    migrated = [entry for entry in logs if entry["event"] == "store.job_schedule_migrated"]
+    assert sorted(entry["job"] for entry in migrated) == [f"j0000000{n}" for n in range(1, 6)]
+    by_job = {entry["job"]: entry for entry in migrated}
+    assert by_job["j00000001"]["every_days"] == 1
+    assert by_job["j00000001"]["at_local"] == "08:00"
+    assert by_job["j00000001"]["cancelled"] is False
+    assert by_job["j00000002"]["cancelled"] is True
+    for prompt in (_MGMPLUS_PROMPT, "pick up milk", "Put the cleaner", "Denver"):
+        assert prompt not in repr(migrated)
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        pytest.param(_MGMPLUS_FIRST - 86400, id="a day before"),
+        pytest.param(_MGMPLUS_FIRST - 60, id="a minute before"),
+        pytest.param(_MGMPLUS_FIRST + 3600, id="an hour after"),
+    ],
+)
+def test_a_legacy_row_that_never_ran_keeps_its_first_fire(tmp_path: Path, now: float) -> None:
+    """Nothing stepped it, so the stored first fire is the slot the person chose.
+
+    An hour late it is simply due and runs at the next tick; it is never
+    moved to the following day.
+    """
+    path = tmp_path / "assistai.sqlite"
+    _v14_db(path, _mgmplus_row())
+    store = Store(path)
+
+    assert store.backfill_job_schedules("America/Chicago", now=now) == 1
+    loaded = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert loaded is not None
+    assert loaded.next_run_at == _MGMPLUS_FIRST
+    assert loaded.anchor_at == _MGMPLUS_FIRST
+    assert loaded.every_days == 1
+    assert loaded.at_local == "08:00"
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        pytest.param(chicago(2026, 10, 31, 20), "2026-11-01 08:00:00 CST", id="the evening before"),
+        pytest.param(chicago(2026, 11, 1, 6, 30), "2026-11-01 08:00:00 CST", id="before 7"),
+        pytest.param(chicago(2026, 11, 1, 7, 30), "2026-11-01 08:00:00 CST", id="between 7 and 8"),
+        pytest.param(chicago(2026, 11, 9, 12), "2026-11-10 08:00:00 CST", id="days later"),
+    ],
+)
+def test_a_legacy_daily_row_that_ran_keeps_its_hour(
+    tmp_path: Path, now: float, expected: str
+) -> None:
+    """0.1.8 stepped 8:00 AM CDT by 86,400 seconds to 7:00 AM CST on Nov 1.
+
+    The slot before the stored one is the hour the person chose. The drifted
+    7:00 is dropped, so the row texts once that morning, at 8:00.
+    """
+    path = tmp_path / "assistai.sqlite"
+    ran = chicago(2026, 10, 31, 8)
+    _v14_db(
+        path,
+        _v14_row("j00000001", "morning email", next_run_at=ran + 86400, last_run_at=ran),
+    )
+    assert wall(ran + 86400) == "2026-11-01 07:00:00 CST"
+    store = Store(path)
+
+    store.backfill_job_schedules("America/Chicago", now=now)
+    loaded = store.find_job("jacob", name="morning email")
+    store.close()
+
+    assert loaded is not None
+    assert loaded.at_local == "08:00"
+    assert loaded.every_days == 1
+    assert loaded.anchor_at == ran
+    assert wall(loaded.next_run_at) == expected
+    assert loaded.next_run_at > now
+
+
+def test_an_elapsed_legacy_row_keeps_its_next_run_and_backfill_runs_once(tmp_path: Path) -> None:
+    """A 90-minute gap is not tied to the clock face, and a second start changes nothing."""
+    path = tmp_path / "assistai.sqlite"
+    ran = chicago(2026, 11, 9, 9, 0)
+    drifted = ran + 5400 + 17
+    _v14_db(
+        path,
+        _v14_row(
+            "j00000001", "price check", every_seconds=5400, next_run_at=drifted, last_run_at=ran
+        ),
+    )
+    store = Store(path)
+
+    assert store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 10)) == 1
+    first = store.find_job("jacob", name="price check")
+    with capture_logs() as logs:
+        again = store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 11))
+    second = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert first is not None
+    assert first.next_run_at == drifted
+    assert first.every_seconds == 5400
+    assert first.every_days is None
+    assert first.at_local is None
+    assert first.anchor_at == drifted - 5400
+    assert again == 0
+    assert second == first
+    assert not any(entry["event"] == "store.job_schedule_migrated" for entry in logs)
+
+
+def test_a_new_job_round_trips_its_schedule(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="bins",
+            prompt="Take the bins in.",
+            every_seconds=7 * 86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=chicago(2026, 12, 7, 19),
+            last_run_at=None,
+            cancelled_at=None,
+            zone="America/Chicago",
+            anchor_at=chicago(2026, 12, 7, 19),
+            every_days=7,
+            at_local="19:00",
+        )
+    )
+
+    loaded = store.find_job("jacob", name="bins")
+    store.close()
+
+    assert loaded is not None
+    assert loaded.schedule() == Schedule(
+        zone=CHICAGO, anchor_at=chicago(2026, 12, 7, 19), every_days=7, at_local="19:00"
+    )
+
+
+def test_reschedule_writes_the_schedule_with_the_next_run(tmp_path: Path) -> None:
+    """A whole-day row moved to minutes must not keep repeating on its old clock time."""
+    store = _store(tmp_path)
+    start = chicago(2026, 12, 7, 8)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="bins",
+            prompt="Take the bins in.",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=1.0,
+            expires_at=None,
+            next_run_at=start,
+            last_run_at=None,
+            cancelled_at=None,
+            zone="America/Chicago",
+            anchor_at=start,
+            every_days=1,
+            at_local="08:00",
+        )
+    )
+
+    assert store.reschedule_job(
+        "jabcd1234",
+        every_seconds=5400,
+        next_run_at=start + 5400,
+        schedule=Schedule(zone=CHICAGO, anchor_at=start + 5400, every_seconds=5400),
+    )
+    loaded = store.find_job("jacob", name="bins")
+    store.close()
+
+    assert loaded is not None
+    assert loaded.every_seconds == 5400
+    assert loaded.next_run_at == start + 5400
+    assert loaded.anchor_at == start + 5400
+    assert loaded.every_days is None
+    assert loaded.at_local is None
+    assert loaded.zone == "America/Chicago"
+
+
+def test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it(
+    tmp_path: Path,
+) -> None:
+    """Rollback is the previous image. A job it creates is filled in on the way back."""
+    path = tmp_path / "assistai.sqlite"
+    _v14_db(path, _mgmplus_row())
+    store = Store(path)
+    store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 9, 12))
+    store.close()
+
+    downgrade(path, to=14)
+
+    assert _user_version(path) == 14
+    # 0.1.8 opens a version 14 file without touching it, then writes its own columns.
+    conn = sqlite3.connect(path)
+    conn.execute(
+        _V14_JOB_INSERT,
+        _v14_row(
+            "j00000009",
+            "bins",
+            every_seconds=7 * 86400,
+            next_run_at=chicago(2026, 11, 12, 19),
+            prompt="Take the bins in.",
+            verbatim=1,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    assert _user_version(path) == 15
+    with capture_logs() as logs:
+        filled = store.backfill_job_schedules("America/Chicago", now=chicago(2026, 11, 10, 12))
+    bins = store.find_job("jacob", name="bins")
+    mgmplus = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert filled == 1
+    assert [entry["job"] for entry in logs if entry["event"] == "store.job_schedule_migrated"] == [
+        "j00000009"
+    ]
+    assert bins is not None
+    assert bins.zone == "America/Chicago"
+    assert bins.every_days == 7
+    assert bins.at_local == "19:00"
+    assert bins.next_run_at == chicago(2026, 11, 12, 19)
+    assert mgmplus is not None
+    assert mgmplus.next_run_at == _MGMPLUS_FIRST
+    assert mgmplus.at_local == "08:00"
+
+
+def test_a_fresh_file_can_be_downgraded(tmp_path: Path) -> None:
+    """A fresh file and a migrated one differ in their CREATE text, not in their shape."""
+    path = tmp_path / "assistai.sqlite"
+    _store(tmp_path).close()
+
+    downgrade(path, to=14)
+
+    assert _user_version(path) == 14
+
+
+def _extra_column(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs ADD COLUMN surprise TEXT")
+
+
+def _extra_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE surprise (id INTEGER PRIMARY KEY)")
+
+
+def _extra_index(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE INDEX jobs_kind ON jobs(kind)")
+
+
+def _missing_column(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs DROP COLUMN at_local")
+
+
+def _retyped_column(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs DROP COLUMN at_local")
+    conn.execute("ALTER TABLE jobs ADD COLUMN at_local INTEGER")
+
+
+def _version(number: int) -> Callable[[sqlite3.Connection], None]:
+    def change(conn: sqlite3.Connection) -> None:
+        conn.execute(f"PRAGMA user_version = {number}")
+
+    return change
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(_extra_column, id="extra column"),
+        pytest.param(_extra_table, id="extra table"),
+        pytest.param(_extra_index, id="extra index"),
+        pytest.param(_missing_column, id="missing column"),
+        pytest.param(_retyped_column, id="retyped column"),
+        pytest.param(_version(14), id="already 14"),
+        pytest.param(_version(16), id="newer"),
+    ],
+)
+def test_downgrade_refuses_a_file_it_does_not_recognise(
+    tmp_path: Path, change: Callable[[sqlite3.Connection], None]
+) -> None:
+    """An older build could misread a change it never made, so the file is left as it is."""
+    path = tmp_path / "assistai.sqlite"
+    _store(tmp_path).close()
+    conn = sqlite3.connect(path)
+    change(conn)
+    conn.commit()
+    before = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    conn.close()
+
+    with pytest.raises(StoreError, match="refusing to downgrade"):
+        downgrade(path, to=14)
+
+    assert _user_version(path) == before
+
+
+def test_downgrade_refuses_an_unknown_target_and_a_missing_file(tmp_path: Path) -> None:
+    path = tmp_path / "assistai.sqlite"
+
+    with pytest.raises(StoreError, match="no state database"):
+        downgrade(path, to=14)
+    assert not path.exists()
+
+    _store(tmp_path).close()
+    with pytest.raises(StoreError, match="cannot downgrade to version 13"):
+        downgrade(path, to=13)
+    assert _user_version(path) == 15

@@ -13,6 +13,7 @@ import pytest
 
 from assistai.agents import AgentSpec, Household
 from assistai.broker import ToolBroker, builtin_catalog
+from assistai.clock import Schedule
 from assistai.config import Settings
 from assistai.errors import InferenceError, JobError, SignalError, StoreError
 from assistai.inference.types import Message, ToolCall, ToolSpec
@@ -22,7 +23,7 @@ from assistai.scheduler import JobRunner, NotifyStatus
 from assistai.store import Store
 from tests.agent_fakes import agent, household
 from tests.channel_fakes import channel_for
-from tests.clock_fakes import FakeClock, chicago, wall
+from tests.clock_fakes import CHICAGO, FakeClock, chicago, wall
 from tests.fakes import (
     Handler,
     body,
@@ -34,6 +35,9 @@ from tests.fakes import (
     tool_event,
 )
 from tests.signal_fakes import FakeSignal, inbound
+
+# What job_reschedule stores for "every 600 seconds" when the next run is at 610.
+_ten_minutes = Schedule(zone=CHICAGO, anchor_at=610.0, every_seconds=600)
 
 
 def test_watch_without_ttl_is_rejected() -> None:
@@ -1029,7 +1033,9 @@ async def test_reschedule_does_not_hide_a_pending_report(tmp_path: Path) -> None
     runner = JobRunner(store, home, channel, _settings(tmp_path), clock=lambda: clock[0])
 
     await runner._tick()
-    assert store.reschedule_job("jabcd1234", every_seconds=600, next_run_at=610.0)
+    assert store.reschedule_job(
+        "jabcd1234", every_seconds=600, next_run_at=610.0, schedule=_ten_minutes
+    )
 
     clock[0] = 45.0
     channel.notify = "sent"
@@ -1230,7 +1236,9 @@ async def test_reschedule_during_delivery_is_not_reverted(tmp_path: Path) -> Non
     store.save_job(_job(next_run_at=1.0, every_seconds=60))
 
     def slow_down() -> None:
-        store.reschedule_job("jabcd1234", every_seconds=600, next_run_at=610.0)
+        store.reschedule_job(
+            "jabcd1234", every_seconds=600, next_run_at=610.0, schedule=_ten_minutes
+        )
 
     channel = _FakeJobChannel(
         JobOutcome(text="inbox is quiet", found=True, untrusted=False),
@@ -2273,6 +2281,145 @@ async def test_a_reminder_at_one_forty_after_fall_back_is_twenty_minutes_away(
     assert created is not None
     assert created.next_run_at == now + 1200
     store.close()
+
+
+async def test_a_whole_day_gap_is_stored_as_days_at_the_first_run_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Until job_create takes every_days, whole days of seconds keep the named start's hour."""
+    store = Store(tmp_path / "assistai.sqlite")
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    create = bind_jobs(store, timezone="America/Chicago")["job_create"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await create(
+            {
+                "kind": "schedule",
+                "name": "bins",
+                "prompt": "Take the bins in.",
+                "every_seconds": 2 * 86400,
+                "start_at": "2026-12-07T08:00:00",
+                "verbatim": True,
+            }
+        )
+
+    created = store.find_job("jacob", name="bins")
+    store.close()
+    assert created is not None
+    assert created.zone == "America/Chicago"
+    assert created.every_days == 2
+    assert created.at_local == "08:00"
+    assert created.every_seconds == 2 * 86400
+    assert created.anchor_at == created.next_run_at == chicago(2026, 12, 7, 8)
+
+
+async def test_a_daily_job_with_no_start_keeps_the_hour_it_was_asked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.1.8's behaviour until the time arguments change: the first run is a day after the ask."""
+    store = Store(tmp_path / "assistai.sqlite")
+    asked = chicago(2026, 10, 30, 21, 12)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(asked))
+    create = bind_jobs(store, timezone="America/Chicago")["job_create"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await create(
+            {
+                "kind": "schedule",
+                "name": "morning email",
+                "prompt": "Summarize unread mail.",
+                "every_seconds": 86400,
+            }
+        )
+
+    created = store.find_job("jacob", name="morning email")
+    store.close()
+    assert created is not None
+    assert created.next_run_at == asked + 86400
+    assert created.anchor_at == created.next_run_at
+    assert created.every_days == 1
+    assert created.at_local == "21:12"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "every_seconds"),
+    [
+        pytest.param({"every_seconds": 5400, "in_seconds": 600}, 5400, id="every 90 minutes"),
+        pytest.param(
+            {"every_seconds": 86400, "in_seconds": 600, "once": True}, None, id="one time"
+        ),
+    ],
+)
+async def test_a_minute_repeat_or_a_one_time_job_keeps_no_clock_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, object],
+    every_seconds: int | None,
+) -> None:
+    store = Store(tmp_path / "assistai.sqlite")
+    now = chicago(2026, 11, 9, 12)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(now))
+    create = bind_jobs(store, timezone="America/Chicago")["job_create"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await create(
+            {
+                "kind": "schedule",
+                "name": "nudge",
+                "prompt": "Stretch.",
+                "verbatim": True,
+                **arguments,
+            }
+        )
+
+    created = store.find_job("jacob", name="nudge")
+    store.close()
+    assert created is not None
+    assert created.zone == "America/Chicago"
+    assert created.anchor_at == created.next_run_at == now + 600
+    assert created.every_days is None
+    assert created.at_local is None
+    assert created.schedule() == Schedule(
+        zone=CHICAGO, anchor_at=now + 600, every_seconds=every_seconds
+    )
+
+
+async def test_reschedule_keeps_the_schedule_columns_in_step_with_the_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next run is still now plus the gap; the stored clock time follows it."""
+    store = Store(tmp_path / "assistai.sqlite")
+    first = chicago(2026, 12, 7, 8)
+    store.save_job(
+        _daily_reminder(
+            first, zone="America/Chicago", anchor_at=first, every_days=1, at_local="08:00"
+        )
+    )
+    now = chicago(2026, 11, 9, 21, 12)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(now))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+    jacob = agent("jacob", "+15555550101")
+
+    with using_agent(jacob):
+        await reschedule({"name": "mgmplus cancel reminder", "every_seconds": 2 * 86400})
+    every_other_day = store.find_job("jacob", name="mgmplus cancel reminder")
+    with using_agent(jacob):
+        await reschedule({"name": "mgmplus cancel reminder", "every_seconds": 3600})
+    hourly = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert every_other_day is not None
+    assert wall(every_other_day.next_run_at) == "2026-11-11 21:12:00 CST"
+    assert every_other_day.anchor_at == every_other_day.next_run_at
+    assert every_other_day.every_days == 2
+    assert every_other_day.at_local == "21:12"
+    assert hourly is not None
+    assert hourly.next_run_at == now + 3600
+    assert hourly.anchor_at == now + 3600
+    assert hourly.every_seconds == 3600
+    assert hourly.every_days is None
+    assert hourly.at_local is None
+    assert hourly.zone == "America/Chicago"
 
 
 def _home() -> Household:

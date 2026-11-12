@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from assistai.agents import AgentSpec, Household
 from assistai.errors import JobError, StoreError
@@ -318,6 +319,7 @@ def bind_relay(
             new_job_id,
             require_representable,
             resolve_start_at,
+            schedule_from_seconds,
         )
 
         now = current_time()
@@ -332,6 +334,12 @@ def bind_relay(
             raise RelayError("a future relay needs in_seconds or start_at")
         try:
             require_representable(first_run, timezone)
+            schedule = schedule_from_seconds(
+                zone=ZoneInfo(timezone),
+                first_run=first_run,
+                every_seconds=when.every_seconds,
+                once=when.once,
+            )
         except JobError as exc:
             raise RelayError(str(exc)) from exc
         job_name = _relay_job_name(
@@ -357,6 +365,10 @@ def bind_relay(
             verbatim=True,
             relay=True,
             tainted=active_taint(),
+            zone=schedule.zone.key,
+            anchor_at=schedule.anchor_at,
+            every_days=schedule.every_days,
+            at_local=schedule.at_local,
         )
         try:
             store.save_job(job)

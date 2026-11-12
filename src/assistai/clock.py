@@ -295,6 +295,24 @@ def local_reading(instant: float, *, clock: HouseholdClock) -> tuple[str, str]:
     return local.isoformat(timespec="seconds"), f"{sign}{hours:02d}:{rest:02d}"
 
 
+def at_local_of(instant: float, zone: ZoneInfo) -> str:
+    """The "HH:MM" clock time ``instant`` shows in ``zone``.
+
+    A whole-day repeat is stored as this text, so the hour it keeps is the
+    one on the household's wall, not a count of seconds from UTC.
+    """
+    try:
+        local = _local(instant, zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise JobError("that time is too far out to schedule") from exc
+    return f"{local.hour:02d}:{local.minute:02d}"
+
+
+def start_of_day(day: dt.date, zone: ZoneInfo) -> float:
+    """The instant ``day`` begins in ``zone``, so a listing from a date is the household's date."""
+    return dt.datetime.combine(day, dt.time(0, 0), tzinfo=zone).timestamp()
+
+
 def _check_at(at: LocalAt) -> None:
     if not 0 <= at.hour <= 23:
         raise JobError("hour must be 0 to 23")

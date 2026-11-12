@@ -11,20 +11,23 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo
 
 import structlog
 
-from assistai.errors import StoreError
+from assistai.clock import Schedule, next_slot
+from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolCall
-from assistai.jobs import Job, JobKind
+from assistai.jobs import Job, JobKind, schedule_from_seconds
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
 from assistai.staging import Proposal
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _DB_NAME = "assistai.sqlite"
 # A proposal stamped more than this far ahead of now was made before the
 # clock stepped back. Its ten minutes can no longer be measured, so it is
@@ -81,7 +84,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     relay INTEGER NOT NULL DEFAULT 0,
     relay_sent INTEGER NOT NULL DEFAULT 0,
     relay_recorded INTEGER NOT NULL DEFAULT 0,
-    tainted INTEGER NOT NULL DEFAULT 0
+    tainted INTEGER NOT NULL DEFAULT 0,
+    zone TEXT,
+    anchor_at REAL,
+    every_days INTEGER,
+    at_local TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(cancelled_at, next_run_at);
 CREATE INDEX IF NOT EXISTS jobs_agent_name ON jobs(agent, name);
@@ -124,6 +131,14 @@ CREATE TABLE IF NOT EXISTS update_notices (
 """
 
 _PERSISTED_ROLES = frozenset({"user", "assistant", "tool"})
+# Added in version 15. Every one is nullable and no version 14 query names
+# it, which is what makes ``downgrade(path, to=14)`` safe.
+_SCHEDULE_COLUMNS = (
+    ("zone", "TEXT"),
+    ("anchor_at", "REAL"),
+    ("every_days", "INTEGER"),
+    ("at_local", "TEXT"),
+)
 
 
 def store_path(state_dir: Path) -> Path:
@@ -340,8 +355,9 @@ class Store:
                     "ttl_seconds, created_at, expires_at, next_run_at, last_run_at, "
                     "cancelled_at, pending_text, pending_untrusted, pending_after, "
                     "pending_delivered, once, verbatim, relay, relay_sent, relay_recorded, "
-                    "tainted) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "tainted, zone, anchor_at, every_days, at_local) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?)",
                     (
                         job.id,
                         job.agent,
@@ -365,6 +381,10 @@ class Store:
                         1 if job.relay_sent else 0,
                         1 if job.relay_recorded else 0,
                         1 if job.tainted else 0,
+                        job.zone,
+                        job.anchor_at,
+                        job.every_days,
+                        job.at_local,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -467,19 +487,89 @@ class Store:
             job_id,
         )
 
-    def reschedule_job(self, job_id: str, *, every_seconds: int, next_run_at: float) -> bool:
-        """Change the interval without touching the outbox.
+    def reschedule_job(
+        self, job_id: str, *, every_seconds: int, next_run_at: float, schedule: Schedule
+    ) -> bool:
+        """Change the schedule and the next run together, without touching the outbox.
 
         A full-row write from a snapshot taken before the runner queued or
         cleared a report would hide a pending send, or put one back after it
-        had already gone out.
+        had already gone out. The schedule columns and ``every_seconds`` move
+        in one statement so the row never repeats by one rule and steps by
+        another.
         """
         return self._touch_job(
-            "UPDATE jobs SET every_seconds = ?, next_run_at = ? "
-            "WHERE id = ? AND cancelled_at IS NULL",
-            (every_seconds, next_run_at),
+            "UPDATE jobs SET every_seconds = ?, next_run_at = ?, zone = ?, anchor_at = ?, "
+            "every_days = ?, at_local = ? WHERE id = ? AND cancelled_at IS NULL",
+            (every_seconds, next_run_at, *_schedule_values(schedule)),
             job_id,
         )
+
+    def backfill_job_schedules(self, zone: str, *, now: float | None = None) -> int:
+        """Give every row an older build wrote its wall-clock schedule. Returns how many.
+
+        Cancelled rows are filled too, so a row is never half migrated. The
+        slot the person chose is the stored next run for a row that never
+        ran, and one gap before it for a row that did: 0.1.8 stepped a daily
+        row by 86,400 seconds, so across a daylight saving change its stored
+        next run is an hour off and only the slot before it holds the hour
+        they named. A row that never ran keeps its next run, even when it is
+        already past, because nothing has moved it. A whole-day row that ran
+        drops the drifted instant for its next local slot, so it does not
+        text at the wrong hour and again at the right one the same morning.
+        Any other row keeps its next run. A row that cannot be read is
+        logged and left for the next start rather than stopping the gateway.
+        """
+        moment = time.time() if now is None else now
+        household = ZoneInfo(zone)
+        migrated: list[tuple[str, int | None, str | None, bool]] = []
+        try:
+            with self._conn:
+                rows = self._conn.execute(
+                    "SELECT id, every_seconds, next_run_at, last_run_at, cancelled_at, once "
+                    "FROM jobs WHERE zone IS NULL"
+                ).fetchall()
+                for row in rows:
+                    filled = _legacy_schedule(row, household, now=moment)
+                    if filled is None:
+                        log.warning("store.job_schedule_unreadable", job=row["id"])
+                        continue
+                    schedule, next_run_at = filled
+                    self._conn.execute(
+                        "UPDATE jobs SET zone = ?, anchor_at = ?, every_days = ?, at_local = ?, "
+                        "next_run_at = ? WHERE id = ? AND zone IS NULL",
+                        (*_schedule_values(schedule), next_run_at, row["id"]),
+                    )
+                    migrated.append(
+                        (
+                            str(row["id"]),
+                            schedule.every_days,
+                            schedule.at_local,
+                            row["cancelled_at"] is not None,
+                        )
+                    )
+        except sqlite3.Error as exc:
+            raise StoreError("job schedules could not be migrated") from exc
+        # Logged after the commit so a rolled-back fill is not reported as done.
+        for job_id, every_days, at_local, cancelled in migrated:
+            log.info(
+                "store.job_schedule_migrated",
+                job=job_id,
+                every_days=every_days,
+                at_local=at_local,
+                cancelled=cancelled,
+            )
+        return len(migrated)
+
+    def active_jobs(self) -> list[Job]:
+        """Every agent's active jobs, soonest first. For the operator, not the model."""
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE cancelled_at IS NULL ORDER BY next_run_at ASC, id ASC"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StoreError("jobs are unreadable") from exc
+        return _jobs_from_rows(rows)
 
     def mark_relay_sent(self, job_id: str) -> bool:
         """The other phone already has this send. A retry must not deliver it again."""
@@ -702,6 +792,7 @@ class Store:
             self._ensure_job_relay_sent_column()
             self._ensure_job_relay_recorded_column()
             self._ensure_job_tainted_column()
+            self._ensure_job_schedule_columns()
             self._ensure_shared_list_owner()
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -755,6 +846,16 @@ class Store:
             return
         # Rows saved before this column were treated as trusted; keep that.
         self._conn.execute("ALTER TABLE jobs ADD COLUMN tainted INTEGER NOT NULL DEFAULT 0")
+
+    def _ensure_job_schedule_columns(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if not cols:
+            return
+        # Nullable, so a version 14 build can still write rows after a
+        # downgrade; backfill_job_schedules fills them on the next start.
+        for name, decl in _SCHEDULE_COLUMNS:
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
 
     def _ensure_shared_list_owner(self) -> None:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(shared_lists)")}
@@ -958,6 +1059,10 @@ def _job_from_row(row: sqlite3.Row) -> Job:
             _flag(row["relay_recorded"], job_id) if "relay_recorded" in row.keys() else False
         ),
         tainted=_flag(row["tainted"], job_id) if "tainted" in row.keys() else False,
+        zone=_optional_str(_column(row, "zone"), job_id),
+        anchor_at=_optional_float(_column(row, "anchor_at"), job_id),
+        every_days=_optional_days(_column(row, "every_days"), job_id),
+        at_local=_optional_str(_column(row, "at_local"), job_id),
     )
 
 
@@ -979,6 +1084,178 @@ def _optional_str(raw: object, job_id: str) -> str | None:
     if not isinstance(raw, str):
         raise StoreError(f"job {job_id} is unreadable")
     return raw
+
+
+def _column(row: sqlite3.Row, name: str) -> object:
+    """A column an older file may not have yet reads as NULL."""
+    return row[name] if name in row.keys() else None
+
+
+def _optional_float(raw: object, job_id: str) -> float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise StoreError(f"job {job_id} is unreadable")
+    return float(raw)
+
+
+def _optional_days(raw: object, job_id: str) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise StoreError(f"job {job_id} is unreadable")
+    return raw
+
+
+def _schedule_values(schedule: Schedule) -> tuple[str, float, int | None, str | None]:
+    return schedule.zone.key, schedule.anchor_at, schedule.every_days, schedule.at_local
+
+
+def _legacy_schedule(
+    row: sqlite3.Row, zone: ZoneInfo, *, now: float
+) -> tuple[Schedule, float] | None:
+    """The schedule and next run an older build's row stands for, or None if unreadable."""
+    every = row["every_seconds"]
+    stored = row["next_run_at"]
+    last_run_at = row["last_run_at"]
+    if isinstance(every, bool) or not isinstance(every, int) or every <= 0:
+        return None
+    if isinstance(stored, bool) or not isinstance(stored, (int, float)):
+        return None
+    if last_run_at is not None and not isinstance(last_run_at, (int, float)):
+        return None
+    ran = last_run_at is not None
+    chosen = float(stored) - every if ran else float(stored)
+    try:
+        schedule = schedule_from_seconds(
+            zone=zone, first_run=chosen, every_seconds=every, once=row["once"] == 1
+        )
+        next_run_at = float(stored)
+        if ran and schedule.every_days is not None:
+            next_run_at = next_slot(schedule, after=max(now, chosen))
+    except (JobError, OverflowError, OSError, ValueError):
+        return None
+    return schedule, next_run_at
+
+
+def downgrade(path: Path, *, to: int) -> None:
+    """Hand the state file back to the build one schema older, or refuse and change nothing.
+
+    The file must be at ``to + 1``, and the step for ``to`` must recognise
+    it. A file it does not recognise may hold a change the older build would
+    misread, so nothing is written. The check and the version write happen
+    under one lock, so the gateway cannot change the file between them.
+    """
+    step = _DOWNGRADE_STEPS.get(to)
+    if step is None:
+        allowed = ", ".join(str(target) for target in sorted(_DOWNGRADE_STEPS))
+        raise StoreError(f"cannot downgrade to version {to}; this build can go to {allowed}")
+    if not path.is_file():
+        raise StoreError(f"no state database at {path}")
+    try:
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=5.0
+        )
+    except sqlite3.Error as exc:
+        raise StoreError(f"state database unreadable: {path}") from exc
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version != to + 1:
+            raise StoreError(
+                f"state database is version {version}, and the step to {to} starts "
+                f"from {to + 1}; refusing to downgrade"
+            )
+        step(conn)
+        conn.execute(f"PRAGMA user_version = {to}")
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        raise StoreError(f"state database unreadable: {path}") from exc
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
+    log.info("store.downgraded", version=to, previous=to + 1)
+
+
+def _down_to_14(conn: sqlite3.Connection) -> None:
+    """Version 15 only added nullable job columns no version 14 query names.
+
+    So the file goes back unchanged, but only if it is exactly what this
+    build writes: the same tables, columns, and indexes as a fresh file.
+    The shapes are compared through SQLite's own description of each table,
+    not the CREATE text, because a migrated file and a fresh one say the
+    same thing in different words. When the schema moves past 15, the
+    version 15 shape this compares against has to be frozen here.
+    """
+    differs = _shape_differences(_shape(conn), _expected_shape())
+    if differs:
+        raise StoreError(
+            f"state database does not match schema 15 ({', '.join(differs)} differ); "
+            "refusing to downgrade"
+        )
+
+
+# Each step hands a file at ``to + 1`` back to ``to``. A later schema change
+# that keeps the previous image working adds its own.
+_DOWNGRADE_STEPS: dict[int, Callable[[sqlite3.Connection], None]] = {14: _down_to_14}
+
+
+_Shape = dict[str, object]
+
+
+def _shape(conn: sqlite3.Connection) -> _Shape:
+    """Tables, columns, indexes, and foreign keys as SQLite reports them."""
+    shape: _Shape = {}
+    objects = conn.execute(
+        "SELECT type, name FROM sqlite_master WHERE substr(name, 1, 7) != 'sqlite_'"
+    ).fetchall()
+    for kind, name in objects:
+        if kind == "index":
+            # Read below through the table it belongs to.
+            continue
+        if kind != "table":
+            shape[f"{kind} {name}"] = kind
+            continue
+        columns = frozenset(
+            (col[1], str(col[2]).upper(), col[3], col[4], col[5])
+            for col in conn.execute("SELECT * FROM pragma_table_info(?)", (name,))
+        )
+        indexes = frozenset(
+            (
+                index[1],
+                index[2],
+                index[3],
+                index[4],
+                tuple(
+                    (key[1], key[2], key[3], key[4])
+                    for key in conn.execute("SELECT * FROM pragma_index_xinfo(?)", (index[1],))
+                    if key[5]
+                ),
+            )
+            for index in conn.execute("SELECT * FROM pragma_index_list(?)", (name,))
+        )
+        foreign = frozenset(
+            tuple(key[2:])
+            for key in conn.execute("SELECT * FROM pragma_foreign_key_list(?)", (name,))
+        )
+        shape[f"table {name}"] = (columns, indexes, foreign)
+    return shape
+
+
+def _expected_shape() -> _Shape:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return _shape(conn)
+    finally:
+        conn.close()
+
+
+def _shape_differences(actual: _Shape, expected: _Shape) -> list[str]:
+    return sorted(
+        name for name in actual.keys() | expected.keys() if actual.get(name) != expected.get(name)
+    )
 
 
 def _flag(raw: object, job_id: str) -> bool:

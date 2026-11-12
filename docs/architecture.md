@@ -271,6 +271,41 @@ restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
 
+Each job row stores its schedule in the household zone
+([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)): the
+zone, an anchor (the instant of the first scheduled run), and either a
+number of days with the local time `HH:MM`, or a gap in seconds. A gap of
+whole days is stored as days at the clock time of the first run, so it can
+keep that hour across daylight saving. Any other gap is elapsed time. A
+one-time job has an anchor and no repeat. `next_run_at` stays as the cached
+next run the runner polls, and `every_seconds` is still written, as days
+times 86,400 for a whole-day job, so the previous image can step a row
+after a rollback. Every path that creates or changes a job writes the
+schedule with it. The runner still steps the next run by `every_seconds`;
+moving it onto the stored schedule is spec 016's next change.
+
+Rows written before schema 15, or by the previous image after a rollback,
+have no schedule. The gateway fills them on every start, after the clock
+wait and before the job runner starts, and logs
+`store.job_schedule_migrated` once per row, cancelled rows included, with
+the id, days, and local time, never the prompt. The slot the person chose
+is the stored next run for a row that never ran, and one gap before it for
+a row that did, because 0.1.8 stepped a daily row by 86,400 seconds and
+moved it an hour across a daylight saving change. A row that never ran
+keeps its next run. A whole-day row that ran moves to its next local slot
+after now, so it does not text at the drifted hour and again at the right
+one. Any other row keeps its next run.
+
+`python -m assistai store` holds the operator's commands on the state file.
+They need no Fireworks or Signal secrets. `store jobs [--next N] [--from
+YYYY-MM-DD]` fills any unfilled row the way a start would, then prints each
+active job's id, agent, name, repeat, and next runs in household words. It
+prints no prompt text. `store downgrade --to 14` sets the schema version
+back to 14, and only when the file is exactly version 15 with the same
+tables, columns, and indexes this build creates. Version 15 only added
+nullable columns that no version 14 query names, so the previous image runs
+on that file. Anything else is refused and the file is left as it was.
+
 Job output is appended to the owner's conversation history, so "what was in the
 digest?" works without re-fetching.
 

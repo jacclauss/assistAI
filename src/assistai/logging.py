@@ -7,14 +7,21 @@ for local development.
 from __future__ import annotations
 
 import logging
+from typing import TextIO
 
 import structlog
 
 from assistai.config import LogLevel
 
 
-def configure_logging(level: LogLevel = "info", console: bool = False) -> None:
-    """Install a structlog pipeline and align the stdlib root logger with it."""
+def configure_logging(
+    level: LogLevel = "info", console: bool = False, *, stream: TextIO | None = None
+) -> None:
+    """Install a structlog pipeline and align the stdlib root logger with it.
+
+    ``stream`` defaults to stdout. A command whose stdout is its answer logs
+    to stderr so the two do not interleave.
+    """
     numeric_level = getattr(logging, level.upper())
     logging.basicConfig(format="%(message)s", level=numeric_level, force=True)
     # httpx logs every request at INFO; that is noise in the REPL and on the Pi.
@@ -36,6 +43,6 @@ def configure_logging(level: LogLevel = "info", console: bool = False) -> None:
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=stream),
         cache_logger_on_first_use=True,
     )

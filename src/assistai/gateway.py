@@ -226,6 +226,12 @@ class Gateway:
                 self._updates = UpdateWatcher(self._settings, store, self._signal)
         if not await self._wait_for_clock():
             return
+        if self._store is not None and self._clock is not None:
+            # Every start, before the runner reads a row: a row written by an
+            # older build, before an upgrade or during a rollback, has no
+            # schedule yet. After the clock wait, because a stepped row's next
+            # run is chosen from now.
+            self._store.backfill_job_schedules(self._clock.zone.key, now=self._clock.now())
         self._channel_task = asyncio.create_task(self._run_channel(self._channel))
         if self._jobs is not None:
             self._job_task = asyncio.create_task(self._jobs.run(self._shutdown))

@@ -208,6 +208,28 @@ that far behind, `timedatectl status` will show it. Without a synced kernel
 the row is not ignored: Signal waits the two minutes, then refuses to start
 until the kernel reports the clock synchronized.
 
+### Jobs
+
+`store jobs` lists each active job with its next runs in household time. It
+prints names and times, never a job's prompt.
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml exec gateway \
+  python -m assistai store jobs --next 3
+```
+
+Each daily job shows the hour it was asked for. `--from 2027-03-12 --next 4`
+starts the list at midnight on that date, which shows a daily job across the
+spring daylight saving change on March 14, 2027.
+
+The first start of a schema 15 image fills in a schedule for every job row,
+cancelled ones included, and logs one line per row:
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml logs gateway \
+  | grep store.job_schedule_migrated
+```
+
 ### Texts
 
 From each allowed phone, text the bot. Each assistant should still know the
@@ -239,13 +261,54 @@ sudo systemctl enable --now ssh
 ```
 
 On the Mac, `make build-pi`, save a tar, and copy it. On the Pi, save the
-current image first, `docker load` the new tar, then:
+current image first, and keep a tag on it so it can still be run after the
+new one is loaded:
+
+```bash
+docker save assistai/gateway:local -o ~/assistai-gateway-previous.tar
+docker tag assistai/gateway:local assistai/gateway:previous
+docker load -i ~/assistai-gateway-arm64.tar
+```
+
+If the release notes say the image changes the state database schema,
+rehearse on a copy first. Wait until no proposal is waiting for a yes, then
+copy the volume while the stack runs:
+
+```bash
+docker volume create assistai_state-rehearsal
+docker run --rm -v assistai_gateway-state:/from:ro -v assistai_state-rehearsal:/to \
+  alpine sh -c 'cp -a /from/. /to/'
+docker run --rm -e ASSISTAI_TIMEZONE=America/Chicago -e ASSISTAI_STATE_DIR=/app/state \
+  -v assistai_state-rehearsal:/app/state assistai/gateway:local store jobs --next 3
+docker run --rm -e ASSISTAI_TIMEZONE=America/Chicago -e ASSISTAI_STATE_DIR=/app/state \
+  -v assistai_state-rehearsal:/app/state assistai/gateway:local \
+  store jobs --from 2027-03-12 --next 4
+```
+
+These need only the zone, so `.env` and its secrets stay out of them. Use
+the zone `.env` names.
+
+Every job shows the hour it was asked for, including March 14 and 15, 2027.
+Then rehearse the rollback on the same copy, and open it with the previous
+image:
+
+```bash
+docker run --rm -e ASSISTAI_STATE_DIR=/app/state \
+  -v assistai_state-rehearsal:/app/state assistai/gateway:local store downgrade --to 14
+docker run --rm -v assistai_state-rehearsal:/app/state --entrypoint python \
+  assistai/gateway:previous -c \
+  'from pathlib import Path; from assistai.store import Store; s = Store(Path("/app/state/assistai.sqlite")); print([j.name for a in ("jacob", "spouse") for j in s.list_jobs(a)])'
+docker volume rm assistai_state-rehearsal
+```
+
+The last command prints the job names. Do not install the new image until
+it does. Then:
 
 ```bash
 docker compose --env-file .env -f docker/docker-compose.yml up -d --no-build
 ```
 
-Run the clock checks above, then:
+Run the clock and jobs checks above, then:
 
 ```bash
 sudo systemctl disable --now ssh
@@ -254,3 +317,28 @@ sudo systemctl disable --now ssh
 `.env`, `config/assistai.toml`, `/var/lib/assistai/caldav-password`, and the
 `assistai_gateway-state` volume stay on the Pi. A new image does not replace
 them.
+
+## Roll back a schema change
+
+The previous image is the rollback, but an image refuses a state file newer
+than its own schema: the gateway exits with "state database is newer than
+this build". Step the file back with the newer image first, while it is
+still loaded:
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml stop gateway
+docker compose --env-file .env -f docker/docker-compose.yml run --rm --no-deps gateway \
+  store downgrade --to 14
+docker load -i ~/assistai-gateway-previous.tar
+docker compose --env-file .env -f docker/docker-compose.yml up -d --no-build
+```
+
+`store downgrade --to 14` changes only the schema version, and only when the
+file is exactly what the newer image writes. Schema 15 added nullable
+columns the previous image never reads. If the command refuses, the file has
+something the previous image may misread: do not load the older image. Start
+the newer one again with `up -d --no-build`.
+
+While rolled back, the previous image runs jobs the old way. Installing the
+newer image again fills in a schedule for any job created in between; check
+it with `store jobs`.
