@@ -334,6 +334,11 @@ def at_local_of(instant: float, zone: ZoneInfo) -> str:
     return f"{local.hour:02d}:{local.minute:02d}"
 
 
+def local_day(instant: float, zone: ZoneInfo) -> dt.date:
+    """The date ``instant`` falls on in ``zone``, which is not the UTC date in the evening."""
+    return _local(instant, zone).date()
+
+
 def start_of_day(day: dt.date, zone: ZoneInfo) -> float:
     """The instant ``day`` begins in ``zone``, so a listing from a date is the household's date."""
     return dt.datetime.combine(day, dt.time(0, 0), tzinfo=zone).timestamp()

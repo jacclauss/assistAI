@@ -22,6 +22,7 @@ import structlog
 from assistai.clock import (
     HouseholdClock,
     Schedule,
+    local_day,
     local_reading,
     next_slot,
     shifted_by_spring_gap,
@@ -562,8 +563,8 @@ class Store:
         A whole-day row whose gap is still its day count was only stepped,
         so it keeps its stored local hour and goes back on the slot its
         stepped run stands for, which stays due when a start lands just
-        before that stepped run; any other disagreement is rebuilt from what
-        that image wrote. A row
+        before that stepped run, unless that local day already got its run;
+        any other disagreement is rebuilt from what that image wrote. A row
         that still agrees is left alone, so a start does not move a healthy
         row.
 
@@ -1239,7 +1240,9 @@ def _realigned(job: Job) -> tuple[Schedule, float] | None:
     The slot is the first one after the run that image stepped from, not
     the first after the start: its next run is a few seconds, or a spring
     hour, past that slot, and a start in between must not push a pending
-    run to the next day. A slot already past is due, so the runner sends
+    run to the next day. A local day that already got its run is not sent
+    again, so a drifted fall-back run that went out at 7:00 is not followed
+    by the slot at 8:00. A slot already past is due, so the runner sends
     it once and puts the row back on its schedule. None when the gap no
     longer matches the day count, because then the old image rescheduled
     the row and its columns say what runs.
@@ -1254,9 +1257,27 @@ def _realigned(job: Job) -> tuple[Schedule, float] | None:
         return None
     stepped_from = job.next_run_at - job.every_seconds
     try:
-        return schedule, next_slot(schedule, after=stepped_from)
-    except JobError:
+        slot = next_slot(schedule, after=stepped_from)
+        return schedule, _unless_its_day_ran(schedule, slot, job.last_run_at)
+    except (JobError, OverflowError, OSError, ValueError):
         return None
+
+
+def _unless_its_day_ran(schedule: Schedule, slot: float, last_run_at: float | None) -> float:
+    """``slot``, or the first slot after it when its local day already got its run.
+
+    A version 14 image steps by elapsed seconds, so after a fall-back change
+    it sends a daily row an hour early. That send is the day's run: putting
+    the row on the named hour of the same day would text the person twice.
+    A row whose run is still pending ran on an earlier day, so its slot
+    stands. The slot after is not measured from the start either, so a
+    start days later still finds one missed run due.
+    """
+    if last_run_at is None or local_day(last_run_at, schedule.zone) < local_day(
+        slot, schedule.zone
+    ):
+        return slot
+    return next_slot(schedule, after=max(slot, last_run_at))
 
 
 def _stored_values(row: sqlite3.Row) -> tuple[object, ...]:

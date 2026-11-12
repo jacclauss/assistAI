@@ -2396,6 +2396,103 @@ async def test_a_first_start_just_before_a_stepped_run_still_sends_it_today(
     assert wall(mgmplus.next_run_at) == "2026-12-10 08:00:00 CST"
 
 
+def _sent_the_drifted_fall_back_run(path: Path) -> None:
+    """A version 14 image runs the 8:00 AM weigh-in on Oct 31, then at 7:00 AM CST on Nov 1.
+
+    0.1.8 steps by 86,400 seconds from when each run finished, so the Nov 1
+    run goes out an hour early and the row moves on to 7:00 AM Nov 2.
+    """
+    store = Store(path)
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    store.save_job(
+        _daily_reminder(
+            chicago(2026, 10, 31, 8), id="j00000002", name="weigh in", prompt="Weigh in."
+        )
+    )
+    store.close()
+    downgrade(path, to=14)
+    conn = sqlite3.connect(path)
+    for finished in (chicago(2026, 10, 31, 8) + 4, chicago(2026, 11, 1, 7) + 8):
+        conn.execute(
+            "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
+            "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
+            "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
+            "WHERE id = ? AND cancelled_at IS NULL",
+            (finished, finished, "j00000002"),
+        )
+    conn.commit()
+    conn.close()
+
+
+async def test_a_rolled_back_fall_back_run_already_sent_at_the_drifted_hour_is_not_sent_again(
+    tmp_path: Path,
+) -> None:
+    """0.1.8 already texted the 8:00 AM weigh-in at 7:00 AM CST on Nov 1.
+
+    Forward again at 9:00 AM that morning, Nov 1 already got its run, so
+    nothing goes out until 8:00 AM Nov 2. The never-run December 10
+    reminder keeps its first fire.
+    """
+    path = tmp_path / "assistai.sqlite"
+    _sent_the_drifted_fall_back_run(path)
+    store = Store(path)
+    sent = store.find_job("jacob", name="weigh in")
+    assert sent is not None
+    assert sent.last_run_at is not None
+    assert wall(sent.last_run_at) == "2026-11-01 07:00:08 CST"
+    assert wall(sent.next_run_at) == "2026-11-02 07:00:08 CST"
+
+    clock = FakeClock(chicago(2026, 11, 1, 9))
+    store.backfill_job_schedules("America/Chicago", now=clock())
+    filled = store.find_job("jacob", name="weigh in")
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+    texted_at: list[str] = []
+    while clock() < chicago(2026, 11, 2, 12):
+        before = len(channel.notified)
+        await runner._tick()
+        texted_at += [wall(clock())] * (len(channel.notified) - before)
+        clock.advance(60)
+    after = store.find_job("jacob", name="weigh in")
+    mgmplus = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+
+    assert filled is not None
+    assert filled.at_local == "08:00"
+    assert wall(filled.next_run_at) == "2026-11-02 08:00:00 CST"
+    assert texted_at == ["2026-11-02 08:00:00 CST"]
+    assert after is not None
+    assert wall(after.next_run_at) == "2026-11-03 08:00:00 CST"
+    assert mgmplus is not None
+    assert mgmplus.at_local == "08:00"
+    assert wall(mgmplus.next_run_at) == "2026-12-10 08:00:00 CST"
+
+
+async def test_a_start_days_after_a_rolled_back_fall_back_run_sends_one_missed_reminder(
+    tmp_path: Path,
+) -> None:
+    """Forward again at noon on Nov 5: one text for the missed days, then 8:00 AM Nov 6."""
+    path = tmp_path / "assistai.sqlite"
+    _sent_the_drifted_fall_back_run(path)
+    store = Store(path)
+    clock = FakeClock(chicago(2026, 11, 5, 12))
+    store.backfill_job_schedules("America/Chicago", now=clock())
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+    texted_at: list[str] = []
+    while clock() < chicago(2026, 11, 6, 12):
+        before = len(channel.notified)
+        await runner._tick()
+        texted_at += [wall(clock())] * (len(channel.notified) - before)
+        clock.advance(60)
+    after = store.find_job("jacob", name="weigh in")
+    store.close()
+
+    assert texted_at == ["2026-11-05 12:00:00 CST", "2026-11-06 08:00:00 CST"]
+    assert after is not None
+    assert wall(after.next_run_at) == "2026-11-07 08:00:00 CST"
+
+
 async def test_a_daily_start_in_the_spring_gap_returns_to_its_hour_the_next_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

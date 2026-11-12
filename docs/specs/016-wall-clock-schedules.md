@@ -195,8 +195,12 @@ still step a row after a rollback.
   slot the stepped run stands for. That slot is not measured from `now`:
   version 14's `next_run_at` sits a few seconds past it, or a spring hour
   past it, so a start in that gap still finds today's run due and the
-  runner sends it. A slot already past runs once and `advance_job` returns
-  the row to its slot, as for any missed run.
+  runner sends it. A local day that already got its run is not sent
+  again: when `last_run_at` falls on that slot's local day, as when the
+  version 14 image sent the fall-back morning's run at the drifted 7:00,
+  the row goes on the next slot after it. Otherwise a slot already past
+  runs once and `advance_job` returns the row to its slot, as for any
+  missed run.
   The hour is not re-derived from the step, because after a daylight
   saving change or a spring-gap run that instant is the shifted hour. A
   row whose gap changed was rescheduled by that image and is rebuilt from
