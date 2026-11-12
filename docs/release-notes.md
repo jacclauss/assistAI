@@ -13,6 +13,20 @@
   the gateway exits and Docker runs the wait again.
 - A proposal is dropped if the clock steps back to before it was made.
   Say the request again.
+- A daily or weekly job keeps its local time across daylight saving: the
+  8:00 AM reminder is still 8:00 AM after March 14, 2027. A slow run or a
+  retried send no longer pushes later runs. A time the clocks skip in
+  spring runs an hour later that day only.
+- A job that missed its time while the gateway was down runs once when it
+  comes back, then returns to its time. It does not catch up on every
+  missed run.
+- The state file is schema 15. On start the gateway gives each job its
+  local time and logs `store.job_schedule_migrated` once per job. For the
+  operator, `python -m assistai store jobs` lists each job's next runs in
+  household time, and `store downgrade --to 14` hands the file back to the
+  previous image for a rollback ([pi-deploy.md](pi-deploy.md)). Coming
+  forward again rebuilds any job the previous image ran or rescheduled, so
+  a change made while rolled back is kept and a daily job keeps its hour.
 
 ## 0.1.8 — 24 October 2026
 

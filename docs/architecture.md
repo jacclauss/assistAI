@@ -271,6 +271,69 @@ restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
 
+Each job row stores its schedule in the household zone
+([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)): the
+zone, an anchor (the instant of the first scheduled run), and either a
+number of days with the local time `HH:MM`, or a gap in seconds. A gap of
+whole days is stored as days at the clock time the person named for the
+first run, or that run's clock time when they named none, so it can keep
+that hour across daylight saving. A named time the spring change skips
+resolves to an instant an hour later, and the stored time is still the
+named one, so only that first day runs late. Any other gap is elapsed time. A
+one-time job has an anchor and no repeat. `next_run_at` stays as the cached
+next run the runner polls, and `every_seconds` is still written, as days
+times 86,400 for a whole-day job, so the previous image can step a row
+after a rollback. Every path that creates or changes a job writes the
+schedule with it.
+
+When a run is over, the next run is the first slot of the stored schedule
+after that moment, read from the row in the same transaction as the write.
+It is never the finish time plus the gap, so a slow run, a late finish, or
+a send retried with backoff does not move later runs. The retry wait lives
+in the runner's memory and never touches `next_run_at`. A job that missed
+slots while the gateway was down, or whose run outlasted its next slot,
+runs once and then returns to its slot. The slots it passed are not run;
+`jobs.slots_skipped` logs the job id and how many. A whole-day slot the
+spring change skips (2:30 AM on 2027-03-14 in Chicago) is read with the
+offset before the change, so it runs one clock hour later that day only,
+at 3:30 AM CDT, and `jobs.dst_shifted` logs the job id and that local
+slot. A slot in the repeated fall-back hour runs once, at its first
+occurrence. A stored next run already after that moment is a reschedule
+confirmed during the run, and it stands. A one-time job has no next slot,
+so advancing one ends it. The runner skips a row with no schedule, which
+only exists between a rollback and the next start, and logs
+`jobs.unscheduled_row` once for it. The runner reads the household
+clock's `now`.
+
+Rows written before schema 15, or by the previous image after a rollback,
+have no schedule. The gateway fills them on every start, after the clock
+wait and before the job runner starts, and logs
+`store.job_schedule_migrated` once per row, cancelled rows included, with
+the id, days, and local time, never the prompt. The previous image also
+steps and reschedules rows that do have one, writing only `every_seconds`
+and `next_run_at`. This build keeps those two in step with the schedule,
+a whole-day gap as days times 86,400 and the next run on the anchor or a
+slot, so on the same start any active row where they disagree is rebuilt
+from them by the same rules and logged as `store.job_schedule_rebuilt`. A
+row that still agrees is left alone, so a start never moves a healthy
+row. The slot the person chose
+is the stored next run for a row that never ran, and one gap before it for
+a row that did, because 0.1.8 stepped a daily row by 86,400 seconds and
+moved it an hour across a daylight saving change. A row that never ran
+keeps its next run. A whole-day row that ran moves to its next local slot
+after now, so it does not text at the drifted hour and again at the right
+one. Any other row keeps its next run.
+
+`python -m assistai store` holds the operator's commands on the state file.
+They need no Fireworks or Signal secrets. `store jobs [--next N] [--from
+YYYY-MM-DD]` fills or rebuilds rows the way a start would, then prints each
+active job's id, agent, name, repeat, and next runs in household words. It
+prints no prompt text. `store downgrade --to 14` sets the schema version
+back to 14, and only when the file is exactly version 15 with the same
+tables, columns, and indexes this build creates. Version 15 only added
+nullable columns that no version 14 query names, so the previous image runs
+on that file. Anything else is refused and the file is left as it was.
+
 Job output is appended to the owner's conversation history, so "what was in the
 digest?" works without re-fetching.
 

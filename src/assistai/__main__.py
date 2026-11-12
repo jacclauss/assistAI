@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import re
 import sys
+import time
+from pathlib import Path
 
 from assistai.chat import chat_once, chat_repl
 from assistai.compare import compare_models, format_report
@@ -67,6 +70,27 @@ def main(argv: list[str] | None = None) -> None:
     login.add_argument("agent", help="agent name, jacob or spouse")
     login.add_argument("--code", default=None, help="code from the browser redirect URL")
 
+    store = sub.add_parser("store", help="read and step back the state database")
+    store_sub = store.add_subparsers(dest="store_command", required=True)
+    jobs = store_sub.add_parser(
+        "jobs", help="each active job's next runs and repeat, without its prompt"
+    )
+    jobs.add_argument(
+        "--next", dest="runs", type=_positive_int, default=3, metavar="N", help="runs per job"
+    )
+    jobs.add_argument(
+        "--from",
+        dest="start",
+        type=_iso_date,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="list runs after the household's midnight starting that date",
+    )
+    downgrade = store_sub.add_parser(
+        "downgrade", help="hand the state file back to the previous image for a rollback"
+    )
+    downgrade.add_argument("--to", dest="to", type=int, required=True, help="schema version")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "chat":
@@ -79,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(_extract())
         elif args.command == "mail":
             asyncio.run(_mail(args))
+        elif args.command == "store":
+            _store(args)
         else:
             asyncio.run(_gateway())
     except AssistAIError as exc:
@@ -197,6 +223,78 @@ async def _mail(args: argparse.Namespace) -> None:
     finally:
         await client.aclose()
         store.close()
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _iso_date(text: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a date, YYYY-MM-DD") from exc
+
+
+def _wall_now() -> float:
+    return time.time()
+
+
+def _store(args: argparse.Namespace) -> None:
+    """Operator commands on the state file. They need no Fireworks or Signal secrets."""
+    from assistai.store import downgrade, store_path
+
+    settings = Settings()
+    configure_logging(level=settings.log_level, console=True, stream=sys.stderr)
+    path = store_path(settings.state_dir)
+    if args.store_command == "downgrade":
+        downgrade(path, to=args.to)
+        print(f"state database is now version {args.to}: {path}")
+        return
+    if args.store_command == "jobs":
+        print(_job_listing(path, settings.timezone, runs=args.runs, start=args.start))
+        return
+    raise AssistAIError(f"unknown store command: {args.store_command}")
+
+
+def _job_listing(path: Path, timezone: str | None, *, runs: int, start: dt.date | None) -> str:
+    """Names and times only. A prompt can hold mail or a relay body and stays in the store."""
+    from zoneinfo import ZoneInfo
+
+    from assistai.clock import HouseholdClock, say_repeat, say_when, start_of_day
+    from assistai.config import TIMEZONE_REQUIRED
+    from assistai.jobs import upcoming_runs
+    from assistai.store import Store
+
+    if timezone is None:
+        raise AssistAIError(TIMEZONE_REQUIRED)
+    if not path.is_file():
+        # Opening would create an empty file and list nothing, which reads
+        # as "no jobs" when the state directory is simply wrong.
+        raise AssistAIError(f"no state database at {path}")
+    clock = HouseholdClock(zone=ZoneInfo(timezone), now=_wall_now)
+    after = start_of_day(start, clock.zone) if start is not None else None
+    store = Store(path)
+    try:
+        # The same fill the gateway does on start, so a copy of the Pi's file
+        # shows what the new image will run.
+        store.backfill_job_schedules(clock.zone.key, now=clock.now())
+        jobs = store.active_jobs()
+    finally:
+        store.close()
+    if not jobs:
+        return "no active jobs"
+    lines: list[str] = []
+    for job in jobs:
+        schedule = job.schedule()
+        repeat = say_repeat(schedule, clock=clock) if schedule is not None else "not migrated"
+        lines.append(f"{job.id}  {job.agent}  {job.name}  ({repeat})")
+        for moment in upcoming_runs(job, count=runs, after=after):
+            lines.append(f"  {say_when(moment, clock=clock)}")
+    return "\n".join(lines)
 
 
 async def _models(args: argparse.Namespace) -> None:

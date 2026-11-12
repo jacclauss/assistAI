@@ -74,6 +74,9 @@ class JobRunner:
         self._clock = clock or time.time
         self._running: set[str] = set()
         self._unknown_warned: set[str] = set()
+        self._unscheduled_warned: set[str] = set()
+        # A retry waits here, in memory. It never moves the stored next run,
+        # so a send that took three tries still leaves tomorrow on its slot.
         self._retry_at: dict[str, float] = {}
         self._retry_delay: dict[str, float] = {}
         # Side effects that happened but whose row mark may not have stuck.
@@ -101,6 +104,15 @@ class JobRunner:
         for job in due:
             if job.id in self._running or now < self._retry_at.get(job.id, 0.0):
                 continue
+            if job.zone is None or job.anchor_at is None:
+                # Only a row an older build wrote after a rollback: with no
+                # schedule there is no slot to advance to, and the next start
+                # fills it in.
+                if job.id not in self._unscheduled_warned:
+                    log.warning("jobs.unscheduled_row", job=job.id)
+                    self._unscheduled_warned.add(job.id)
+                continue
+            self._unscheduled_warned.discard(job.id)
             if self._channel.holds_job(job.id):
                 continue
             agent = self._agent(job.agent)
@@ -336,6 +348,8 @@ class JobRunner:
             self._forget(job.id)
             log.info("jobs.expired", job=job.id, name=job.name)
             return
+        # The store puts the next run on the job's grid after this moment, so
+        # a slow run or a late retry cannot leave it due again or move it.
         advanced = self._store.advance_job(job.id, now=finished)
         self._forget(job.id)
         if not advanced:

@@ -13,6 +13,8 @@ from assistai.config import Settings
 from assistai.errors import AssistAIError, HouseholdConfigError, SignalUnavailableError
 from assistai.gateway import Gateway, install_signal_handlers
 from assistai.inference.types import Message
+from assistai.jobs import Job
+from assistai.scheduler import JobRunner
 from assistai.store import Store, store_path
 from assistai.sysclock import ClockState
 from tests.clock_fakes import FakeClock, FakeClockSync, chicago
@@ -511,6 +513,52 @@ async def test_a_refused_kernel_call_does_not_drop_a_far_ahead_row(tmp_path: Pat
     assert waiting["behind_store_seconds"] == 15 * 86400
     unsynced = next(entry for entry in logs if entry["event"] == "clock.unsynced")
     assert "Signal is not starting" in unsynced["reason"]
+
+
+async def test_rows_from_an_older_build_get_a_schedule_before_the_runner_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner never reads a row with no schedule, after an upgrade or after a rollback."""
+    now = 1_800_000_000.0
+    store = Store(store_path(tmp_path))
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="mgmplus cancel reminder",
+            prompt="Cancel MGM+ before the rate goes up.",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=now - 86400,
+            expires_at=None,
+            next_run_at=now + 3600,
+            last_run_at=None,
+            cancelled_at=None,
+            verbatim=True,
+        )
+    )
+    store.close()
+    seen: list[str | None] = []
+
+    async def runner_starts(self: JobRunner, stop: asyncio.Event) -> None:
+        job = self._store.find_job("jacob", name="mgmplus cancel reminder")
+        seen.append(job.zone if job is not None else "missing")
+        await stop.wait()
+
+    monkeypatch.setattr(JobRunner, "run", runner_starts)
+    gateway = _clock_gateway(
+        kernel=FakeClockSync(ClockState.SYNCED), tmp_path=tmp_path, now=FakeClock(now)
+    )
+
+    with capture_logs() as logs:
+        await _run_briefly(gateway)
+
+    assert seen == ["America/Chicago"]
+    migrated = [entry for entry in logs if entry["event"] == "store.job_schedule_migrated"]
+    assert [entry["job"] for entry in migrated] == ["jabcd1234"]
+    events = [entry["event"] for entry in logs]
+    assert events.index("store.job_schedule_migrated") < events.index("gateway.signal_started")
 
 
 def _clock_gateway(

@@ -206,6 +206,32 @@ def next_slot(schedule: Schedule, *, after: float) -> float:
         raise JobError("the next run is too far out to schedule") from exc
 
 
+def slots_between(schedule: Schedule, *, after: float, upto: float) -> int:
+    """How many slots fall strictly after ``after`` and no later than ``upto``.
+
+    Counted from slot numbers, not by walking, so a job idle for a year
+    costs the same as one idle for a minute.
+    """
+    if upto <= after:
+        return 0
+    first = next_slot(schedule, after=after)
+    if first > upto:
+        return 0
+    beyond = next_slot(schedule, after=upto)
+    return _slot_number(schedule, beyond) - _slot_number(schedule, first)
+
+
+def shifted_by_spring_gap(schedule: Schedule, slot: float) -> bool:
+    """True when a whole-day slot runs off its clock time because the spring change skipped it.
+
+    That is the one day decision 0002 lets a daily job run an hour late,
+    and the operator should be able to see it happened.
+    """
+    if schedule.every_days is None or schedule.at_local is None:
+        return False
+    return at_local_of(slot, schedule.zone) != schedule.at_local
+
+
 def say_when(instant: float, *, clock: HouseholdClock) -> str:
     """An instant as a person reads it, relative to the household's today.
 
@@ -295,6 +321,29 @@ def local_reading(instant: float, *, clock: HouseholdClock) -> tuple[str, str]:
     return local.isoformat(timespec="seconds"), f"{sign}{hours:02d}:{rest:02d}"
 
 
+def at_local_of(instant: float, zone: ZoneInfo) -> str:
+    """The "HH:MM" clock time ``instant`` shows in ``zone``.
+
+    A whole-day repeat is stored as this text, so the hour it keeps is the
+    one on the household's wall, not a count of seconds from UTC.
+    """
+    try:
+        local = _local(instant, zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise JobError("that time is too far out to schedule") from exc
+    return f"{local.hour:02d}:{local.minute:02d}"
+
+
+def local_day(instant: float, zone: ZoneInfo) -> dt.date:
+    """The date ``instant`` falls on in ``zone``, which is not the UTC date in the evening."""
+    return _local(instant, zone).date()
+
+
+def start_of_day(day: dt.date, zone: ZoneInfo) -> float:
+    """The instant ``day`` begins in ``zone``, so a listing from a date is the household's date."""
+    return dt.datetime.combine(day, dt.time(0, 0), tzinfo=zone).timestamp()
+
+
 def _check_at(at: LocalAt) -> None:
     if not 0 <= at.hour <= 23:
         raise JobError("hour must be 0 to 23")
@@ -379,6 +428,15 @@ def _jump(
             high = middle
     change = dt.datetime.fromtimestamp(high, dt.UTC).replace(tzinfo=None)
     return _bare_clock(change + before), _bare_clock(change + after)
+
+
+def _slot_number(schedule: Schedule, slot: float) -> int:
+    """The ``k`` of a slot ``next_slot`` returned. A shifted spring slot keeps its date."""
+    if schedule.every_seconds is not None:
+        return round((slot - schedule.anchor_at) / schedule.every_seconds)
+    every = schedule.every_days or 1
+    anchor_date = _local(schedule.anchor_at, schedule.zone).date()
+    return (_local(slot, schedule.zone).date() - anchor_date).days // every
 
 
 def _settle(slot: Callable[[int], float], k: int, after: float) -> int:

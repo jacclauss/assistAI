@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from assistai.clock import Schedule, at_local_of, next_slot
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
 from assistai.relay import active_agent, active_taint
@@ -32,6 +33,7 @@ JOB_RESCHEDULE = "job_reschedule"
 JOB_TOOLS = (JOB_CREATE, JOB_LIST, JOB_CANCEL, JOB_RESCHEDULE)
 
 MIN_EVERY_SECONDS = 60
+DAY_SECONDS = 86400
 MAX_TTL_SECONDS = 30 * 24 * 3600
 _START_SKEW_SECONDS = 60.0
 MAX_NAME_CHARS = 80
@@ -232,6 +234,87 @@ class Job:
     pending_untrusted: bool = False
     pending_after: Literal["advance", "cancel"] | None = None
     pending_delivered: bool = False
+    # The wall-clock schedule (schema 15). None only on a row an older build
+    # wrote, until the gateway's next start fills it in.
+    zone: str | None = None
+    anchor_at: float | None = None
+    every_days: int | None = None
+    at_local: str | None = None
+
+    def schedule(self) -> Schedule | None:
+        """The stored schedule, or None for a row no schema 15 build has filled yet.
+
+        A one-time job has no repeat even though ``every_seconds`` is set:
+        the column is required, and an older build reads it after a rollback.
+        """
+        if self.zone is None or self.anchor_at is None:
+            return None
+        try:
+            zone = ZoneInfo(self.zone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise JobError(f"job {self.id} names an unknown zone") from exc
+        if self.once:
+            return Schedule(zone=zone, anchor_at=self.anchor_at)
+        if self.every_days is not None:
+            return Schedule(
+                zone=zone,
+                anchor_at=self.anchor_at,
+                every_days=self.every_days,
+                at_local=self.at_local,
+            )
+        return Schedule(zone=zone, anchor_at=self.anchor_at, every_seconds=self.every_seconds)
+
+
+def schedule_from_seconds(
+    *,
+    zone: ZoneInfo,
+    first_run: float,
+    every_seconds: int,
+    once: bool,
+    at_local: str | None = None,
+) -> Schedule:
+    """The wall-clock schedule for a gap given in seconds.
+
+    A whole number of days keeps a local time, so a daily job holds its hour
+    across daylight saving (decision 0002); any other gap is elapsed time.
+    That time is ``at_local`` when the person named one, and otherwise the
+    clock time of ``first_run``. A named time the spring change skips
+    resolves to an instant an hour later, and reading the hour back from
+    that instant would keep every later day on the shifted hour. Until
+    ``job_create`` takes ``every_days`` itself, this is how a tool call and
+    a row written by an older build both get a schedule.
+    """
+    if once:
+        return Schedule(zone=zone, anchor_at=first_run)
+    if every_seconds % DAY_SECONDS == 0:
+        return Schedule(
+            zone=zone,
+            anchor_at=first_run,
+            every_days=every_seconds // DAY_SECONDS,
+            at_local=at_local if at_local is not None else at_local_of(first_run, zone),
+        )
+    return Schedule(zone=zone, anchor_at=first_run, every_seconds=every_seconds)
+
+
+def upcoming_runs(job: Job, *, count: int, after: float | None = None) -> list[float]:
+    """The next ``count`` runs of ``job``, strictly after ``after`` when it is given.
+
+    The stored ``next_run_at`` comes first, even when it is due now, because
+    that is the run the runner will fire; the schedule supplies the rest.
+    """
+    schedule = job.schedule()
+    runs: list[float] = []
+    cursor = job.next_run_at
+    if after is None or job.next_run_at > after:
+        runs.append(job.next_run_at)
+    else:
+        cursor = after
+    if schedule is None or not schedule.repeats:
+        return runs[:count]
+    while len(runs) < count:
+        cursor = next_slot(schedule, after=cursor)
+        runs.append(cursor)
+    return runs[:count]
 
 
 @dataclass(frozen=True)
@@ -483,17 +566,32 @@ def resolve_start_at(text: str, *, now: float, timezone: str) -> float:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError as exc:
         raise JobError("the household timezone is not configured") from exc
+    parsed = _parse_start_at(text).replace(tzinfo=zone)
+    when = parsed.timestamp()
+    if when < now - _START_SKEW_SECONDS:
+        raise JobError("start_at is in the past")
+    return when
+
+
+def start_at_clock(text: str) -> str:
+    """The "HH:MM" a local ISO-8601 start names, as the person wrote it.
+
+    A whole-day repeat keeps this hour. On the day the spring change skips
+    it, the first run is an hour later, and the days after return to it
+    (decision 0002).
+    """
+    parsed = _parse_start_at(text)
+    return f"{parsed.hour:02d}:{parsed.minute:02d}"
+
+
+def _parse_start_at(text: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
         raise JobError("start_at must be an ISO-8601 date and time") from exc
     if parsed.tzinfo is not None:
         raise JobError("start_at must not include a timezone suffix")
-    parsed = parsed.replace(tzinfo=zone)
-    when = parsed.timestamp()
-    if when < now - _START_SKEW_SECONDS:
-        raise JobError("start_at is in the past")
-    return when
+    return parsed
 
 
 def bind_jobs(
@@ -516,6 +614,13 @@ def bind_jobs(
         # Reject a delay the clock cannot represent before the row exists.
         # Saving first and then failing the reply leaves an armed reminder.
         require_representable(first_run, timezone)
+        schedule = schedule_from_seconds(
+            zone=ZoneInfo(timezone),
+            first_run=first_run,
+            every_seconds=spec.every_seconds,
+            once=spec.once,
+            at_local=start_at_clock(spec.start_at) if spec.start_at is not None else None,
+        )
         expires_at = None
         if spec.ttl_seconds is not None:
             origin = first_run if spec.start_at is not None or spec.in_seconds is not None else now
@@ -539,6 +644,10 @@ def bind_jobs(
                 once=spec.once,
                 verbatim=spec.verbatim,
                 tainted=active_taint(),
+                zone=schedule.zone.key,
+                anchor_at=schedule.anchor_at,
+                every_days=schedule.every_days,
+                at_local=schedule.at_local,
             )
             try:
                 store.save_job(job)
@@ -616,8 +725,18 @@ def bind_jobs(
             raise JobError("every_seconds is longer than the watch TTL")
         now = _now()
         next_run_at = now + spec.every_seconds
+        require_representable(next_run_at, timezone)
+        schedule = schedule_from_seconds(
+            zone=ZoneInfo(timezone),
+            first_run=next_run_at,
+            every_seconds=spec.every_seconds,
+            once=job.once,
+        )
         if not store.reschedule_job(
-            job.id, every_seconds=spec.every_seconds, next_run_at=next_run_at
+            job.id,
+            every_seconds=spec.every_seconds,
+            next_run_at=next_run_at,
+            schedule=schedule,
         ):
             raise JobError("no matching job")
         return json.dumps(

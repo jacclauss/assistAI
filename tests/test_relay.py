@@ -115,7 +115,50 @@ async def test_a_future_relay_waits_instead_of_sending(
     assert saved.once is True
     assert saved.prompt == "pick up milk"
     assert saved.next_run_at == pytest.approx(now.timestamp() + 120)
+    assert saved.zone == "America/Chicago"
+    assert saved.anchor_at == saved.next_run_at
+    assert saved.every_days is None
+    assert saved.at_local is None
     store.close()
+
+
+async def test_a_daily_future_relay_keeps_the_hour_it_first_sends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeating relay of whole days is stored on the clock, like any daily job."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 11, 9, 7, 0, tzinfo=ZoneInfo("America/Chicago"))
+    monkeypatch.setattr("assistai.jobs._now", lambda: now.timestamp())
+    store = Store(tmp_path / "assistai.sqlite")
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    home = household(jacob, agent("spouse", "+15555550102", tools=("relay",)))
+
+    async def inject(_recipient: AgentSpec, _record: str) -> None:
+        raise AssertionError("a future relay must not inject yet")
+
+    handler = bind_relay(
+        household=home,
+        signal=FakeSignal(),
+        inject=inject,
+        store=store,
+        timezone="America/Chicago",
+    )
+    with using_agent(jacob):
+        await handler(
+            {"body": "vitamins", "in_seconds": 3600, "once": False, "every_seconds": 86400}
+        )
+
+    saved = store.find_job("jacob", name="message to spouse")
+    store.close()
+    assert saved is not None
+    assert saved.relay is True
+    assert saved.zone == "America/Chicago"
+    assert saved.every_days == 1
+    assert saved.at_local == "08:00"
+    assert saved.every_seconds == 86400
+    assert saved.anchor_at == saved.next_run_at == pytest.approx(now.timestamp() + 3600)
 
 
 async def test_a_second_future_relay_gets_its_own_name(
