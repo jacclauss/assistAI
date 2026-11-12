@@ -13,7 +13,7 @@ from structlog.testing import capture_logs
 from assistai.clock import Schedule
 from assistai.errors import StoreError
 from assistai.inference.types import Message, ToolCall
-from assistai.jobs import Job
+from assistai.jobs import Job, schedule_from_seconds
 from assistai.staging import Proposal
 from assistai.store import SCHEMA_VERSION, Store, downgrade
 from tests.clock_fakes import CHICAGO, chicago, wall
@@ -355,6 +355,8 @@ def test_reschedule_does_not_restore_a_cleared_outbox(tmp_path: Path) -> None:
             pending_text="[job: morning email]\nalready sent",
             pending_after="advance",
             pending_delivered=True,
+            zone="America/Chicago",
+            anchor_at=10.0,
         )
     )
     assert store.advance_job("jabcd1234", now=10.0)
@@ -1428,6 +1430,156 @@ def test_reschedule_writes_the_schedule_with_the_next_run(tmp_path: Path) -> Non
     assert loaded.every_days is None
     assert loaded.at_local is None
     assert loaded.zone == "America/Chicago"
+
+
+def _scheduled(first: float, *, every_seconds: int, once: bool = False) -> Job:
+    """A row as this build saves it: the schedule is anchored on the first run, in Chicago."""
+    schedule = schedule_from_seconds(
+        zone=CHICAGO, first_run=first, every_seconds=every_seconds, once=once
+    )
+    return Job(
+        id="jabcd1234",
+        agent="jacob",
+        kind="schedule",
+        name="price check",
+        prompt="Check the fare to Denver.",
+        every_seconds=every_seconds,
+        ttl_seconds=None,
+        created_at=first - 3600,
+        expires_at=None,
+        next_run_at=first,
+        last_run_at=None,
+        cancelled_at=None,
+        once=once,
+        verbatim=once,
+        zone=schedule.zone.key,
+        anchor_at=schedule.anchor_at,
+        every_days=schedule.every_days,
+        at_local=schedule.at_local,
+        pending_text="[job: price check]\nsent",
+        pending_after="advance",
+        pending_delivered=True,
+    )
+
+
+def test_advance_keeps_a_reschedule_that_landed_during_the_run(tmp_path: Path) -> None:
+    """A yes to "every ten minutes" while the report was sending is what the person wants next."""
+    store = _store(tmp_path)
+    store.save_job(_scheduled(1.0, every_seconds=60))
+    assert store.reschedule_job(
+        "jabcd1234", every_seconds=600, next_run_at=610.0, schedule=_ten_minutes
+    )
+
+    assert store.advance_job("jabcd1234", now=45.0)
+    loaded = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert loaded is not None
+    assert loaded.next_run_at == 610.0
+    assert loaded.last_run_at == 45.0
+    assert loaded.pending_text is None
+    assert loaded.pending_delivered is False
+
+
+def test_a_ninety_minute_job_stays_on_its_grid_after_a_slow_run(tmp_path: Path) -> None:
+    """A minute gap is elapsed time from the first run; how long a run took never moves it."""
+    store = _store(tmp_path)
+    first = chicago(2026, 11, 9, 12)
+    store.save_job(_scheduled(first, every_seconds=5400))
+
+    # Due at 12:00 and finished at 12:20: the next run is 1:30, not 1:50.
+    assert store.advance_job("jabcd1234", now=first + 1200)
+    after_slow = store.find_job("jacob", name="price check")
+    # Due at 1:30 and finished at 3:10: 3:00 went by during the run.
+    with capture_logs() as logs:
+        assert store.advance_job("jabcd1234", now=first + 5400 + 6000)
+    after_overrun = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert after_slow is not None
+    assert after_slow.next_run_at == first + 5400
+    assert after_overrun is not None
+    assert after_overrun.next_run_at == first + 3 * 5400
+    assert wall(after_overrun.next_run_at) == "2026-11-09 16:30:00 CST"
+    assert [entry for entry in logs if entry["event"] == "jobs.slots_skipped"] == [
+        {"event": "jobs.slots_skipped", "log_level": "info", "job": "jabcd1234", "count": 1}
+    ]
+
+
+def test_a_daily_slot_in_the_spring_gap_runs_an_hour_later_that_day_only(
+    tmp_path: Path,
+) -> None:
+    """2:30 AM does not exist on 2027-03-14. The run is at 3:30 AM CDT, and 2:30 again on Monday."""
+    store = _store(tmp_path)
+    store.save_job(_scheduled(chicago(2027, 3, 13, 2, 30), every_seconds=86400))
+
+    with capture_logs() as logs:
+        assert store.advance_job("jabcd1234", now=chicago(2027, 3, 13, 2, 31))
+    sunday = store.find_job("jacob", name="price check")
+    with capture_logs() as later:
+        assert store.advance_job("jabcd1234", now=chicago(2027, 3, 14, 3, 31))
+    monday = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert sunday is not None
+    assert wall(sunday.next_run_at) == "2027-03-14 03:30:00 CDT"
+    assert [entry for entry in logs if entry["event"] == "jobs.dst_shifted"] == [
+        {
+            "event": "jobs.dst_shifted",
+            "log_level": "info",
+            "job": "jabcd1234",
+            "slot": "2027-03-14T03:30:00-05:00",
+        }
+    ]
+    assert monday is not None
+    assert wall(monday.next_run_at) == "2027-03-15 02:30:00 CDT"
+    assert [entry["event"] for entry in later if entry["event"].startswith("jobs.")] == []
+
+
+def test_advancing_a_one_time_job_ends_it(tmp_path: Path) -> None:
+    """It has no next slot. Left due, it would text again on every poll."""
+    store = _store(tmp_path)
+    store.save_job(_scheduled(chicago(2026, 12, 7, 8), every_seconds=86400, once=True))
+
+    assert store.advance_job("jabcd1234", now=chicago(2026, 12, 7, 8, 1))
+    gone = store.find_job("jacob", name="price check")
+    due = store.due_jobs(chicago(2027, 1, 1))
+    store.close()
+
+    assert gone is None
+    assert due == []
+
+
+def test_a_row_without_a_schedule_is_not_advanced(tmp_path: Path) -> None:
+    """Only an older build's row lacks one; the runner skips it until the next start fills it."""
+    store = _store(tmp_path)
+    store.save_job(
+        replace(
+            _scheduled(10.0, every_seconds=60),
+            zone=None,
+            anchor_at=None,
+            every_days=None,
+            at_local=None,
+        )
+    )
+
+    with pytest.raises(StoreError, match="no schedule"):
+        store.advance_job("jabcd1234", now=20.0)
+    kept = store.find_job("jacob", name="price check")
+    store.close()
+
+    assert kept is not None
+    assert kept.next_run_at == 10.0
+    assert kept.pending_text is not None
+
+
+def test_advance_reports_a_cancelled_job(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.save_job(_scheduled(10.0, every_seconds=60))
+    store.cancel_job("jabcd1234", at=15.0)
+
+    assert store.advance_job("jabcd1234", now=20.0) is False
+    store.close()
 
 
 def test_downgrade_lets_a_v14_writer_add_a_job_and_forward_again_backfills_it(

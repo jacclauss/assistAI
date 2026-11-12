@@ -221,7 +221,9 @@ class Gateway:
                 broker.bind(name, handler)
             for name, handler in bind_shared(Organizer(store)).items():
                 broker.bind(name, handler)
-            self._jobs = JobRunner(store, household, self._channel, self._settings)
+            self._jobs = JobRunner(
+                store, household, self._channel, self._settings, clock=self._clock.now
+            )
             if self._signal is not None:
                 self._updates = UpdateWatcher(self._settings, store, self._signal)
         if not await self._wait_for_clock():

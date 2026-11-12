@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from assistai.agents import AgentSpec, Household
 from assistai.broker import ToolBroker, builtin_catalog
@@ -17,7 +18,15 @@ from assistai.clock import Schedule
 from assistai.config import Settings
 from assistai.errors import InferenceError, JobError, SignalError, StoreError
 from assistai.inference.types import Message, ToolCall, ToolSpec
-from assistai.jobs import JOB_CANCEL_SPEC, Job, JobOutcome, bind_jobs, is_nothing, parse_create
+from assistai.jobs import (
+    JOB_CANCEL_SPEC,
+    Job,
+    JobOutcome,
+    bind_jobs,
+    is_nothing,
+    parse_create,
+    schedule_from_seconds,
+)
 from assistai.relay import using_agent
 from assistai.scheduler import JobRunner, NotifyStatus
 from assistai.store import Store
@@ -615,7 +624,8 @@ async def test_a_repeating_reminder_texts_the_prompt_and_stays(tmp_path: Path) -
     assert channel.runs == 0
     kept = store.find_job("jacob", name="pool")
     assert kept is not None
-    assert kept.next_run_at == pytest.approx(10.0 + 86400)
+    # The first run (1.0) showed 6:00 PM CST, so the next is the following day at 6:00 PM.
+    assert wall(kept.next_run_at) == "1970-01-01 18:00:00 CST"
     store.close()
 
 
@@ -813,6 +823,12 @@ class _FakeJobChannel:
 
 
 def _job(**overrides: object) -> Job:
+    """A row as this build saves it: the schedule is anchored on its first run, in Chicago.
+
+    So a 60-second job first due at 1.0 has slots 1, 61, 121, ... and a
+    daily one keeps the clock time of its first run. Pass ``zone`` to write
+    the schedule columns yourself, ``zone=None`` for an older build's row.
+    """
     values: dict[str, object] = {
         "id": "jabcd1234",
         "agent": "jacob",
@@ -828,6 +844,18 @@ def _job(**overrides: object) -> Job:
         "cancelled_at": None,
     }
     values.update(overrides)
+    if "zone" not in overrides:
+        first, every, once = values["next_run_at"], values["every_seconds"], values.get("once")
+        assert isinstance(first, (int, float)) and isinstance(every, int)
+        schedule = schedule_from_seconds(
+            zone=CHICAGO, first_run=float(first), every_seconds=every, once=once is True
+        )
+        values.update(
+            zone=schedule.zone.key,
+            anchor_at=schedule.anchor_at,
+            every_days=schedule.every_days,
+            at_local=schedule.at_local,
+        )
     return Job(**values)  # type: ignore[arg-type]
 
 
@@ -844,7 +872,7 @@ async def test_schedule_sends_even_when_empty(tmp_path: Path) -> None:
     assert "Nothing to report." in channel.notified[0][1]
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 70.0
+    assert saved.next_run_at == 61.0
     store.close()
 
 
@@ -866,11 +894,13 @@ async def test_an_unchecked_schedule_is_a_failed_check(tmp_path: Path) -> None:
 
 
 async def test_a_slow_run_does_not_make_the_job_immediately_due(tmp_path: Path) -> None:
-    """The next fire is counted from when this run finished, not from poll start.
+    """The next fire is the first slot after this run finished, not after poll start.
 
-    A 60-second job can spend a minute talking to Fireworks. Measuring the
-    interval from the tick's start timestamp would leave next_run_at in the
-    past, and the following poll would fire again immediately.
+    A 60-second job can spend a minute talking to Fireworks. Choosing the
+    slot from the tick's start timestamp would leave next_run_at in the
+    past, and the following poll would fire again immediately. The slot is
+    on the job's grid (1, 61, 121, ...), so the run length does not move
+    later runs either; the 61 the slow run overlapped is skipped.
     """
     store = Store(tmp_path / "assistai.sqlite")
     store.save_job(_job(next_run_at=1.0, every_seconds=60))
@@ -886,7 +916,7 @@ async def test_a_slow_run_does_not_make_the_job_immediately_due(tmp_path: Path) 
 
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 140.0
+    assert saved.next_run_at == 121.0
     store.close()
 
 
@@ -964,7 +994,7 @@ async def test_notify_failure_retries_without_rerunning(tmp_path: Path) -> None:
 
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 105.0
+    assert saved.next_run_at == 61.0
     assert channel.runs == 1
     assert "inbox is quiet" in channel.notified[0][1]
     store.close()
@@ -1016,7 +1046,7 @@ async def test_a_failed_send_backs_off_instead_of_retrying_every_poll(tmp_path: 
     assert channel.runs == 1
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 105.0
+    assert saved.next_run_at == 61.0
     store.close()
 
 
@@ -1045,7 +1075,8 @@ async def test_reschedule_does_not_hide_a_pending_report(tmp_path: Path) -> None
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
     assert saved.every_seconds == 600
-    assert saved.next_run_at == 645.0
+    # The reschedule landed while the send waited to retry, so its next run stands.
+    assert saved.next_run_at == 610.0
     assert saved.pending_text is None
     store.close()
 
@@ -1272,7 +1303,7 @@ async def test_quiet_watch_runs_when_the_send_budget_is_gone(tmp_path: Path) -> 
     assert channel.notified == []
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 70.0
+    assert saved.next_run_at == 61.0
     store.close()
 
 
@@ -1330,7 +1361,7 @@ async def test_pending_notify_survives_reopen(tmp_path: Path) -> None:
     assert "saved across reboot" in channel.notified[0][1]
     saved = reopened.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 70.0
+    assert saved.next_run_at == 61.0
     assert saved.pending_text is None
     reopened.close()
 
@@ -1362,7 +1393,7 @@ async def test_unpersisted_notify_retries_history_only(tmp_path: Path) -> None:
 
     saved = store.find_job("jacob", name="morning email")
     assert saved is not None
-    assert saved.next_run_at == 105.0
+    assert saved.next_run_at == 61.0
     assert channel.runs == 1
     assert channel.persists == 2
     store.close()
@@ -2106,13 +2137,6 @@ def _next_run(store: Store) -> str:
     return wall(saved.next_run_at)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C-1: a daily repeat adds 86400 s to the finish time, so 8:00 AM CDT "
-        "becomes 7:00 AM CST; fixed by spec 016 commit 5"
-    ),
-)
 async def test_a_daily_eight_am_job_stays_eight_am_across_fall_back(tmp_path: Path) -> None:
     """A daily job keeps its local hour when Chicago leaves daylight saving on 2026-11-01."""
     store = Store(tmp_path / "assistai.sqlite")
@@ -2130,13 +2154,6 @@ async def test_a_daily_eight_am_job_stays_eight_am_across_fall_back(tmp_path: Pa
     store.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C-1: a daily repeat adds 86400 s to the finish time, so 8:00 AM CST "
-        "becomes 9:00 AM CDT; fixed by spec 016 commit 5"
-    ),
-)
 async def test_a_daily_eight_am_job_stays_eight_am_across_spring_forward(
     tmp_path: Path,
 ) -> None:
@@ -2156,13 +2173,6 @@ async def test_a_daily_eight_am_job_stays_eight_am_across_spring_forward(
     store.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C-1: the next run is counted from when the retried send finished, so it "
-        "drifts to 8:03 AM; fixed by spec 016 commit 5"
-    ),
-)
 async def test_a_late_run_and_a_retry_do_not_move_the_next_run(tmp_path: Path) -> None:
     """A slow digest and a failed send still leave tomorrow's run at 8:00 AM."""
     store = Store(tmp_path / "assistai.sqlite")
@@ -2183,6 +2193,61 @@ async def test_a_late_run_and_a_retry_do_not_move_the_next_run(tmp_path: Path) -
     assert channel.runs == 1
     assert "two new invoices" in channel.notified[0][1]
     assert _next_run(store) == "2026-12-08 08:00:00 CST"
+    store.close()
+
+
+async def test_a_job_missed_while_down_runs_once_then_returns_to_its_slot(
+    tmp_path: Path,
+) -> None:
+    """Down from Dec 9 to Dec 12 at 10:00 AM: one text, not three, and Dec 13 is at 8:00 AM."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    clock = FakeClock(chicago(2026, 12, 12, 10))
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+
+    with capture_logs() as logs:
+        await runner._tick()
+        clock.advance(60)
+        await runner._tick()
+
+    assert [text for _agent, text, _untrusted in channel.notified] == [
+        "Cancel MGM+ before the rate goes up."
+    ]
+    assert _next_run(store) == "2026-12-13 08:00:00 CST"
+    skipped = [entry for entry in logs if entry["event"] == "jobs.slots_skipped"]
+    # December 11 and 12 at 8:00 AM went by while it was down.
+    assert skipped == [
+        {"event": "jobs.slots_skipped", "log_level": "info", "job": "jabcd1234", "count": 2}
+    ]
+    store.close()
+
+
+async def test_a_row_an_older_build_wrote_waits_for_its_schedule(tmp_path: Path) -> None:
+    """Added during a rollback to 14, then forward again: no slot to advance to until filled."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8), zone=None))
+    clock = FakeClock(chicago(2026, 12, 10, 8))
+    channel = _FakeJobChannel(JobOutcome(text="unused", found=True, untrusted=False))
+    runner = JobRunner(store, _home(), channel, _settings(tmp_path), clock=clock)
+
+    with capture_logs() as logs:
+        await runner._tick()
+        clock.advance(1)
+        await runner._tick()
+
+    assert channel.notified == []
+    assert [entry for entry in logs if entry["event"] == "jobs.unscheduled_row"] == [
+        {"event": "jobs.unscheduled_row", "log_level": "warning", "job": "jabcd1234"}
+    ]
+
+    store.backfill_job_schedules("America/Chicago", now=clock())
+    await runner._tick()
+
+    assert [text for _agent, text, _untrusted in channel.notified] == [
+        "Cancel MGM+ before the rate goes up."
+    ]
+    assert _next_run(store) == "2026-12-11 08:00:00 CST"
     store.close()
 
 

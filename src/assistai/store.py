@@ -18,7 +18,14 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from assistai.clock import Schedule, next_slot
+from assistai.clock import (
+    HouseholdClock,
+    Schedule,
+    local_reading,
+    next_slot,
+    shifted_by_spring_gap,
+    slots_between,
+)
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolCall
 from assistai.jobs import Job, JobKind, schedule_from_seconds
@@ -473,19 +480,58 @@ class Store:
         )
 
     def advance_job(self, job_id: str, *, now: float) -> bool:
-        """Schedule the next run and clear the outbox. False if cancelled meanwhile.
+        """Put the next run on the job's next slot and clear the outbox. False if cancelled.
 
-        The interval comes from the stored row, not from the runner's copy, so a
-        reschedule confirmed during the run is what takes effect.
+        The next run is the first slot of the stored schedule after ``now``,
+        so how long the run took, when it finished, and how often its send
+        was retried never move it, and a daily job keeps its hour (decision
+        0002). A job that missed slots while the gateway was down runs once
+        and then returns to its slot; the slots it skipped are logged, not
+        run. The row is read in the same transaction as the write, and a
+        stored next run already after ``now`` is a reschedule confirmed
+        during the run, which stands. A one-time job has no next slot, so
+        advancing one ends it rather than leaving it due on every poll.
         """
-        return self._touch_job(
-            "UPDATE jobs SET next_run_at = ? + every_seconds, last_run_at = ?, "
-            "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
-            "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
-            "WHERE id = ? AND cancelled_at IS NULL",
-            (now, now),
-            job_id,
-        )
+        skipped = 0
+        shifted: str | None = None
+        try:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND cancelled_at IS NULL", (job_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+                job = _job_from_row(row)
+                ended: float | None = None
+                next_run_at = job.next_run_at
+                if next_run_at <= now:
+                    schedule = _stored_schedule(job)
+                    if schedule.repeats:
+                        next_run_at = next_slot(schedule, after=now)
+                        skipped = slots_between(schedule, after=job.next_run_at, upto=now)
+                        if shifted_by_spring_gap(schedule, next_run_at):
+                            zone = HouseholdClock(zone=schedule.zone)
+                            shifted, _offset = local_reading(next_run_at, clock=zone)
+                    else:
+                        ended = now
+                self._conn.execute(
+                    "UPDATE jobs SET next_run_at = ?, last_run_at = ?, cancelled_at = ?, "
+                    "pending_text = NULL, pending_untrusted = 0, pending_after = NULL, "
+                    "pending_delivered = 0, relay_sent = 0, relay_recorded = 0 "
+                    "WHERE id = ? AND cancelled_at IS NULL",
+                    (next_run_at, now, ended, job_id),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(f"job {job_id} could not be saved") from exc
+        except JobError as exc:
+            raise StoreError(f"job {job_id} has no next run") from exc
+        # Logged after the commit so a rolled-back advance is not reported.
+        if skipped:
+            log.info("jobs.slots_skipped", job=job_id, count=skipped)
+        if shifted is not None:
+            log.info("jobs.dst_shifted", job=job_id, slot=shifted)
+        return True
 
     def reschedule_job(
         self, job_id: str, *, every_seconds: int, next_run_at: float, schedule: Schedule
@@ -1105,6 +1151,14 @@ def _optional_days(raw: object, job_id: str) -> int | None:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise StoreError(f"job {job_id} is unreadable")
     return raw
+
+
+def _stored_schedule(job: Job) -> Schedule:
+    """The row's schedule. A row an older build wrote has none until the next start fills it."""
+    schedule = job.schedule()
+    if schedule is None:
+        raise StoreError(f"job {job.id} has no schedule yet")
+    return schedule
 
 
 def _schedule_values(schedule: Schedule) -> tuple[str, float, int | None, str | None]:

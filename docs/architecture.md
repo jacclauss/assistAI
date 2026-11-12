@@ -281,8 +281,26 @@ one-time job has an anchor and no repeat. `next_run_at` stays as the cached
 next run the runner polls, and `every_seconds` is still written, as days
 times 86,400 for a whole-day job, so the previous image can step a row
 after a rollback. Every path that creates or changes a job writes the
-schedule with it. The runner still steps the next run by `every_seconds`;
-moving it onto the stored schedule is spec 016's next change.
+schedule with it.
+
+When a run is over, the next run is the first slot of the stored schedule
+after that moment, read from the row in the same transaction as the write.
+It is never the finish time plus the gap, so a slow run, a late finish, or
+a send retried with backoff does not move later runs. The retry wait lives
+in the runner's memory and never touches `next_run_at`. A job that missed
+slots while the gateway was down, or whose run outlasted its next slot,
+runs once and then returns to its slot. The slots it passed are not run;
+`jobs.slots_skipped` logs the job id and how many. A whole-day slot the
+spring change skips (2:30 AM on 2027-03-14 in Chicago) is read with the
+offset before the change, so it runs one clock hour later that day only,
+at 3:30 AM CDT, and `jobs.dst_shifted` logs the job id and that local
+slot. A slot in the repeated fall-back hour runs once, at its first
+occurrence. A stored next run already after that moment is a reschedule
+confirmed during the run, and it stands. A one-time job has no next slot,
+so advancing one ends it. The runner skips a row with no schedule, which
+only exists between a rollback and the next start, and logs
+`jobs.unscheduled_row` once for it. The runner reads the household
+clock's `now`.
 
 Rows written before schema 15, or by the previous image after a rollback,
 have no schedule. The gateway fills them on every start, after the clock

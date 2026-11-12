@@ -150,9 +150,12 @@ Two kinds, both brokered, both inspectable in conversation:
   until the assistant has read the clock in that turn, and it is a local
   date and time with no timezone suffix. The reply names the reminder so it
   can be cancelled. It can fire once, or repeat until cancelled. The first
-  run and the gap between repeats can be any future value the clock can
-  represent. The gap is at least one minute. Nothing is sent before that
-  first run. A job cannot be an instruction to create another job.
+  run can be any future time the clock can represent. A repeat in whole
+  days keeps its local time of day, so the gap is 23 or 25 hours across a
+  daylight-saving change; a repeat in minutes is elapsed time
+  ([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)). The
+  gap is at least one minute. Nothing is sent before that first run. A job
+  cannot be an instruction to create another job.
 - **Jobs report; they do not act.** A job may read mail, calendar, and the web,
   and it messages the owner with what it found. It never files, drafts, writes,
   or writes a relay, because nobody is present at 7am to approve a staged
