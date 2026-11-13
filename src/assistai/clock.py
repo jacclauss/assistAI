@@ -191,21 +191,25 @@ class Schedule:
         return self.every_days is not None or self.every_seconds is not None
 
 
-def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
+def resolve_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> float:
     """The instant the person meant by a named clock time.
 
     A ``day`` is read against the household date, never the UTC date, so
     "tomorrow at 8" at 11:30 PM is the local tomorrow. A weekday is today
     while that time is still more than a minute ahead, so "Monday at 7:30"
-    on Monday morning is not next week. A time the spring change skips is
-    refused with the reason; a time the fall-back hour repeats is the first
-    occurrence unless ``fold`` is 1 or the first has passed. A time more
-    than a minute past is refused with the household's now in words, so
-    the model can correct the day instead of guessing.
+    on Monday morning is not next week. A bare time is on ``on`` when it is
+    given, or the day after once that has passed, so moving a December
+    reminder "to 9" keeps December; without ``on`` it is the next time the
+    clock shows it. A time the spring change skips is refused with the
+    reason; a time the fall-back hour repeats is the first occurrence
+    unless ``fold`` is 1 or the first has passed. A time more than a minute
+    past is refused with the household's now in words, so the model can
+    correct the day instead of guessing.
     """
     _check_at(at)
     now = clock.now()
     today = _local(now, clock.zone).date()
+    base = today if on is None else max(on, today)
     earliest = now - PAST_TOLERANCE_SECONDS
     try:
         if at.date is not None:
@@ -219,10 +223,10 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
             if ahead == 0 and _latest(today, at, clock.zone) <= now + PAST_TOLERANCE_SECONDS:
                 ahead = 7
             day = today + dt.timedelta(days=ahead)
-        elif _latest(today, at, clock.zone) < earliest:
-            day = today + dt.timedelta(days=1)
+        elif _latest(base, at, clock.zone) < earliest:
+            day = base + dt.timedelta(days=1)
         else:
-            day = today
+            day = base
     except OverflowError as exc:
         raise JobError("that date is too far out to schedule") from exc
     moment = _occurrence(day, at, clock.zone, earliest=earliest)
@@ -235,16 +239,16 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
     return moment
 
 
-def fix_at(at: LocalAt, *, clock: HouseholdClock) -> LocalAt:
+def fix_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> LocalAt:
     """``at`` pinned to the date it means now, with ``fold`` when that time happens twice.
 
     "Tomorrow" in a preview shown at 11:58 PM is a different day at a
     12:03 AM yes, so a staged time is stored as the date the person was
-    shown. ``fold`` is written only for the fall-back hour, where the date
-    and clock time alone do not say which occurrence was meant. Refuses
-    what ``resolve_at`` refuses.
+    shown. ``on`` is read as in ``resolve_at``. ``fold`` is written only for
+    the fall-back hour, where the date and clock time alone do not say
+    which occurrence was meant. Refuses what ``resolve_at`` refuses.
     """
-    moment = resolve_at(at, clock=clock)
+    moment = resolve_at(at, clock=clock, on=on)
     local = _local(moment, clock.zone)
     return LocalAt(
         date=local.date(),

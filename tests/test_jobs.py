@@ -27,6 +27,7 @@ from assistai.jobs import (
     is_nothing,
     parse_create,
     schedule_from_seconds,
+    upcoming_runs,
 )
 from assistai.relay import using_agent
 from assistai.scheduler import JobRunner, NotifyStatus
@@ -2675,13 +2676,6 @@ async def test_a_row_an_older_build_wrote_waits_for_its_schedule(tmp_path: Path)
     store.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C-3: a reschedule sets the next run to now plus the new interval, "
-        "dropping Dec 7 at 8:00 AM; fixed by spec 016 commit 7"
-    ),
-)
 async def test_reschedule_keeps_the_next_run_and_its_hour(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2696,6 +2690,150 @@ async def test_reschedule_keeps_the_next_run_and_its_hour(
 
     assert _next_run(store) == "2026-12-07 08:00:00 CST"
     store.close()
+
+
+@pytest.mark.parametrize(
+    ("job", "now", "at", "runs", "at_local"),
+    [
+        pytest.param(
+            _daily_reminder(chicago(2026, 12, 7, 8)),
+            chicago(2026, 10, 30, 21, 12),
+            {"hour": 9},
+            ["2026-12-07 09:00:00 CST", "2026-12-08 09:00:00 CST"],
+            "09:00",
+            id="a bare hour keeps the date",
+        ),
+        pytest.param(
+            _daily_reminder(chicago(2026, 11, 9, 20)),
+            chicago(2026, 11, 9, 15),
+            {"hour": 9},
+            ["2026-11-10 09:00:00 CST", "2026-11-11 09:00:00 CST"],
+            "09:00",
+            id="the next day once that hour has passed",
+        ),
+        pytest.param(
+            _daily_reminder(chicago(2026, 12, 7, 8)),
+            chicago(2026, 10, 30, 21, 12),
+            {"day": "tomorrow", "hour": 9},
+            ["2026-10-31 09:00:00 CDT", "2026-11-01 09:00:00 CST"],
+            "09:00",
+            id="a named day moves the date",
+        ),
+        pytest.param(
+            _daily_reminder(chicago(2026, 12, 7, 8), once=True),
+            chicago(2026, 10, 30, 21, 12),
+            {"hour": 9},
+            ["2026-12-07 09:00:00 CST"],
+            None,
+            id="a one-time reminder keeps its date",
+        ),
+        pytest.param(
+            _daily_reminder(chicago(2026, 12, 7, 8), every_seconds=5400),
+            chicago(2026, 11, 9, 21, 12),
+            {"hour": 9},
+            ["2026-11-10 09:00:00 CST", "2026-11-10 10:30:00 CST"],
+            None,
+            id="a minute repeat starts at the next nine",
+        ),
+    ],
+)
+async def test_reschedule_with_at_moves_the_time_of_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job: Job,
+    now: float,
+    at: dict[str, object],
+    runs: list[str],
+    at_local: str | None,
+) -> None:
+    """ "Move it to 9" changes the hour, not the day the job was going to run."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(job)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(now))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await reschedule({"name": "mgmplus cancel reminder", "at": at})
+
+    saved = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+    assert saved is not None
+    assert [wall(run) for run in upcoming_runs(saved, count=2)] == runs
+    assert saved.anchor_at == saved.next_run_at
+    assert saved.at_local == at_local
+    assert saved.every_seconds == job.every_seconds
+
+
+async def test_reschedule_to_the_same_repeat_moves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asking for "daily" again on a daily job leaves December 7 at 8:00 AM where it was."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 7, 8)))
+    before = store.find_job("jacob", name="mgmplus cancel reminder")
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await reschedule({"name": "mgmplus cancel reminder", "every_days": 1})
+
+    after = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+    assert after == before
+
+
+async def test_reschedule_of_only_the_days_keeps_the_stored_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hour is the stored at_local, not read back from a next run the spring gap shifted."""
+    store = Store(tmp_path / "assistai.sqlite")
+    shifted = chicago(2027, 3, 14, 3, 30)
+    store.save_job(
+        _daily_reminder(
+            shifted,
+            zone="America/Chicago",
+            anchor_at=chicago(2027, 3, 13, 2, 30),
+            every_days=1,
+            at_local="02:30",
+        )
+    )
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2027, 3, 13, 12)))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with using_agent(agent("jacob", "+15555550101")):
+        await reschedule({"name": "mgmplus cancel reminder", "every_days": 2})
+
+    saved = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+    assert saved is not None
+    assert saved.at_local == "02:30"
+    assert saved.every_days == 2
+    assert saved.every_seconds == 2 * 86400
+    assert [wall(run) for run in upcoming_runs(saved, count=2)] == [
+        "2027-03-14 03:30:00 CDT",
+        "2027-03-16 02:30:00 CDT",
+    ]
+
+
+async def test_a_minute_repeat_needs_at_to_become_daily(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job with no hour of its own cannot become daily without the person naming one."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 11, 10, 9), every_seconds=5400))
+    before = store.find_job("jacob", name="mgmplus cancel reminder")
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 9, 21, 12)))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with (
+        using_agent(agent("jacob", "+15555550101")),
+        pytest.raises(JobError, match="Ask them what time"),
+    ):
+        await reschedule({"name": "mgmplus cancel reminder", "every_days": 1})
+
+    after = store.find_job("jacob", name="mgmplus cancel reminder")
+    store.close()
+    assert after == before
 
 
 @pytest.mark.xfail(
@@ -2863,7 +3001,7 @@ async def test_a_minute_repeat_or_a_one_time_job_keeps_no_clock_time(
 async def test_reschedule_keeps_the_schedule_columns_in_step_with_the_gap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A whole-day repeat keeps its stored hour; a minute repeat is elapsed from now."""
+    """A new repeat keeps the next run; a whole-day one keeps its hour, a minute one has none."""
     store = Store(tmp_path / "assistai.sqlite")
     first = chicago(2026, 12, 7, 8)
     store.save_job(
@@ -2887,14 +3025,13 @@ async def test_reschedule_keeps_the_schedule_columns_in_step_with_the_gap(
     store.close()
 
     assert every_other_day is not None
-    assert every_other_day.anchor_at == every_other_day.next_run_at
-    assert wall(every_other_day.next_run_at)[11:] == "08:00:00 CST"
+    assert every_other_day.anchor_at == every_other_day.next_run_at == first
     assert every_other_day.every_days == 2
     assert every_other_day.every_seconds == 2 * 86400
     assert every_other_day.at_local == "08:00"
     assert hourly is not None
-    assert hourly.next_run_at == now + 3600
-    assert hourly.anchor_at == now + 3600
+    assert hourly.next_run_at == first
+    assert hourly.anchor_at == first
     assert hourly.every_seconds == 3600
     assert hourly.every_days is None
     assert hourly.at_local is None

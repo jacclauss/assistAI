@@ -428,6 +428,8 @@ class BoundSurface:
 
         The preview is formatted from this copy and the yes runs it, so a
         "tomorrow" shown before midnight is not a different day after it.
+        A reschedule's bare hour is fixed against the job it moves, because
+        the date it keeps is that job's next run, not today's.
         Only ``at`` changes; the model's own call stays in its history.
         """
         if call.name not in _TIMED_TOOLS or not _has_at(call):
@@ -437,8 +439,18 @@ class BoundSurface:
         parsed: object = json.loads(call.arguments)
         if not isinstance(parsed, dict):
             return call
-        fixed = resolved_arguments(parsed, clock=self._clock)
+        job = self._rescheduled_job(parsed) if call.name == JOB_RESCHEDULE else None
+        fixed = resolved_arguments(parsed, clock=self._clock, job=job)
         return replace(call, arguments=json.dumps(fixed, ensure_ascii=False))
+
+    def _rescheduled_job(self, arguments: dict[str, object]) -> Job:
+        if self._store is None:
+            raise JobError("the job store is not set, so a new time for a job cannot be staged")
+        spec = parse_reschedule(arguments)
+        job = self._store.find_job(self._agent.name, name=spec.name, job_id=spec.id)
+        if job is None:
+            raise JobError("no matching job")
+        return job
 
     def _deny_reason(self, name: str) -> DenyReason | None:
         if name not in self._catalog.names():

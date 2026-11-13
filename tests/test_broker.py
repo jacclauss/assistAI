@@ -813,6 +813,70 @@ async def test_reschedule_longer_than_ttl_is_not_staged(tmp_path: Path) -> None:
     store.close()
 
 
+async def test_a_reschedule_hour_is_staged_on_the_date_the_job_keeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Move it to 9" on the December 7 reminder previews and runs December 7, not tomorrow."""
+    store = Store(tmp_path / "assistai.sqlite")
+    first = chicago(2026, 12, 7, 8)
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="mgmplus",
+            prompt="Cancel MGM+ before the rate goes up.",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=chicago(2026, 10, 30, 21, 12),
+            expires_at=None,
+            next_run_at=first,
+            last_run_at=None,
+            cancelled_at=None,
+            verbatim=True,
+            zone="America/Chicago",
+            anchor_at=first,
+            every_days=1,
+            at_local="08:00",
+        )
+    )
+    clock = FakeClock(chicago(2026, 10, 30, 21, 12))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+    jacob = agent("jacob", "+15555550101", tools=("job_reschedule", "get_time"))
+    broker = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+        clock=chicago_clock(clock),
+    )
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        broker.bind(name, handler)
+    surface = broker.for_agent(jacob)
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+
+    reply = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="job_reschedule",
+            arguments=json.dumps({"name": "mgmplus", "at": {"hour": 9}}),
+        ),
+    )
+    (staged,) = surface.take_staged()
+    await surface.commit(staged)
+    moved = store.find_job("jacob", name="mgmplus")
+    store.close()
+
+    assert reply["status"] == "staged"
+    assert json.loads(staged.arguments) == {
+        "name": "mgmplus",
+        "at": {"date": "2026-12-07", "hour": 9, "minute": 0},
+    }
+    assert moved is not None
+    assert wall(moved.next_run_at) == "2026-12-07 09:00:00 CST"
+    assert moved.at_local == "09:00"
+
+
 async def test_report_only_surface_hides_relay_and_jobs() -> None:
     jacob = agent("jacob", "+15555550101", tools=("get_time", "relay", "job_create"))
     surface = ToolBroker(

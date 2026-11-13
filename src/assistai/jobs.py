@@ -34,9 +34,9 @@ from assistai.clock import (
     Schedule,
     at_local_of,
     fix_at,
+    local_day,
     next_slot,
     resolve_at,
-    start_of_day,
 )
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
@@ -208,8 +208,10 @@ JOB_RESCHEDULE_SPEC = ToolSpec(
     description=(
         "Propose a new time or repeat for an existing job. Give at to move it to a "
         "clock time the person named, copying their words as for job_create, and "
-        "call get_time in this same turn first. Give every_days or every_minutes "
-        "to change how often it repeats. A daily or weekly repeat keeps its time "
+        "call get_time in this same turn first. A bare hour keeps the day the job "
+        "was going to run; give day or date only if they named one. Give every_days "
+        "or every_minutes to change how often it repeats; that alone leaves the next "
+        "run where it is. A daily or weekly repeat keeps its time "
         "of day; a job that does not repeat in days yet needs at to become one, so "
         "ask what time if they did not say. The stored change is what runs after confirm."
     ),
@@ -599,19 +601,37 @@ def parse_delay(raw: object) -> Delay:
     return delay
 
 
-def resolved_arguments(arguments: dict[str, Any], *, clock: HouseholdClock) -> dict[str, Any]:
+def reschedule_day(job: Job, *, clock: HouseholdClock) -> dt.date | None:
+    """The date a bare ``at`` keeps when it moves ``job``, or None to read it as job_create does.
+
+    Moving a daily or one-time job to another hour keeps the day it was
+    going to run on, so "move it to 9" does not pull the December 7
+    reminder to tomorrow. A minute repeat has no day of its own, so a bare
+    hour there is the next time the clock shows it.
+    """
+    if job.every_days is None and not job.once:
+        return None
+    return local_day(job.next_run_at, clock.zone)
+
+
+def resolved_arguments(
+    arguments: dict[str, Any], *, clock: HouseholdClock, job: Job | None = None
+) -> dict[str, Any]:
     """The call as it is staged: a relative ``at`` fixed to the date it means now.
 
     The preview is shown now and the yes runs later, so "tomorrow" and a
     bare hour are stored as the date the person was shown, plus ``fold``
-    for an hour the clocks repeat. Only ``at`` changes, and only when the
+    for an hour the clocks repeat. A reschedule passes the ``job`` it
+    moves, so a bare hour is fixed to the date that job keeps, the same
+    date its handler would pick. Only ``at`` changes, and only when the
     model sent one. A delay is left alone: it counts from the yes, and the
     preview says so.
     """
     raw = arguments.get("at")
     if raw is None:
         return arguments
-    fixed = fix_at(parse_at(raw), clock=clock)
+    on = reschedule_day(job, clock=clock) if job is not None else None
+    fixed = fix_at(parse_at(raw), clock=clock, on=on)
     if fixed.date is None:
         raise JobError("at could not be fixed to a date")
     stored: dict[str, object] = {
@@ -936,16 +956,22 @@ def bind_jobs(
 def _rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tuple[Schedule, int]:
     """The schedule a reschedule stores, and the gap written beside it.
 
-    The new repeat starts from the next run it names: the time in ``at``, or
-    for a whole-day repeat the next time its clock time comes round, or one
-    gap from now for a minute repeat. A whole-day repeat with no new ``at``
-    keeps the hour the job already has.
+    Only a new repeat leaves the next run where it is and re-anchors the
+    grid on it, so moving the December 7 reminder to weekly keeps December 7
+    at 8:00 AM (C-3). A new ``at`` is the next run: a bare hour keeps the
+    date ``reschedule_day`` names. A whole-day repeat keeps the hour it has
+    unless ``at`` names a new one, and a job becomes whole-day only with an
+    ``at``, as in job_create.
     """
     zone = clock.zone
+    if spec.at is not None:
+        first = resolve_at(spec.at, clock=clock, on=reschedule_day(job, clock=clock))
+    else:
+        first = job.next_run_at
     if job.once:
         if spec.at is None:
             raise JobError("a one-time job does not repeat. Give at to move it")
-        return Schedule(zone=zone, anchor_at=resolve_at(spec.at, clock=clock)), job.every_seconds
+        return Schedule(zone=zone, anchor_at=first), job.every_seconds
     every_days = spec.every_days
     every_seconds = spec.every_minutes * 60 if spec.every_minutes is not None else None
     if every_days is None and every_seconds is None:
@@ -955,21 +981,10 @@ def _rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tup
         at_local = _hhmm(spec.at) if spec.at is not None else job.at_local
         if at_local is None:
             raise JobError(ASK_WHAT_TIME)
-        if spec.at is not None:
-            first = resolve_at(spec.at, clock=clock)
-        else:
-            daily = Schedule(
-                zone=zone,
-                anchor_at=start_of_day(clock.today(), zone),
-                every_days=1,
-                at_local=at_local,
-            )
-            first = next_slot(daily, after=clock.now())
         schedule = Schedule(zone=zone, anchor_at=first, every_days=every_days, at_local=at_local)
         return schedule, every_days * DAY_SECONDS
     if every_seconds is None:
         raise JobError("a repeating job needs every_days or every_minutes")
-    first = resolve_at(spec.at, clock=clock) if spec.at is not None else clock.now() + every_seconds
     return Schedule(zone=zone, anchor_at=first, every_seconds=every_seconds), every_seconds
 
 

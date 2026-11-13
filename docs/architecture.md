@@ -206,7 +206,8 @@ Properties that matter:
   12:03 AM yes. When `job_create`, `job_reschedule`, or `relay` stages, the
   broker fixes `at` to the date it means on the household clock, plus
   `fold` for an hour the clocks repeat, and changes nothing else in the
-  arguments. It never adds an `at` the model did not send, and a `delay`
+  arguments. A reschedule's bare hour is fixed against the job it moves,
+  to the date that job keeps, so the preview names the date the yes runs. It never adds an `at` the model did not send, and a `delay`
   stays a delay that the preview says counts from the yes. The staged
   result the model reads, the preview, and the yes all use that copy; the
   model's own call stays in history. Without a household clock a named
@@ -279,9 +280,16 @@ relay all run first. The pre-016 arguments `every_seconds`, `in_seconds`,
 and `start_at` are refused with the names that replace them and logged as
 `jobs.legacy_arguments_refused`, because old calls stay in history for two
 weeks and the model may copy one. `job_reschedule` takes the same `at`,
-`every_days`, and `every_minutes`: a whole-day job that only changes its
-days keeps its hour, and a job becomes whole-day only with an `at`, by
-the same rule. The Signal reply starts with the time the server stored
+`every_days`, and `every_minutes`. Only a new repeat leaves the next run
+where it is and re-anchors the grid on it, so moving the December 7
+reminder to weekly keeps December 7 at 8:00 AM, and asking for the repeat
+it already has moves nothing. A whole-day job that only changes its days
+keeps its stored hour, and a job becomes whole-day only with an `at`, by
+the same rule. A new `at` is the next run. A bare hour on a whole-day or
+one-time job keeps the date of the stored next run, or the day after once
+that hour has passed there; a `day` or `date` moves the date; on a minute
+repeat a bare hour is the next time the clock shows it, as in
+`job_create`. The Signal reply starts with the time the server stored
 and the name to cancel, then the rest of the model's answer; the tool result
 tells the model not to restate the time, and an answer that names any other
 clock time is dropped. A turn that fails after the save cancels that

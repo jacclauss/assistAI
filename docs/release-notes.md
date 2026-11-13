@@ -38,6 +38,11 @@
   something that waits for a yes shows the date it worked out, and the yes
   runs that date, even after midnight. A delay, such as "in two hours",
   counts from your yes.
+- Changing only how often a job repeats keeps its next run and its time:
+  moving the December 7 reminder to weekly keeps December 7 at 8:00 AM.
+  Moving a job to another hour keeps the day it was going to run, unless
+  you name a day or date. Before, both moved the next run to the next
+  time that hour came round, or one interval from now.
 - A proposal made before this update is not run by a yes. Ask again.
 
 ## 0.1.8 — 24 October 2026
