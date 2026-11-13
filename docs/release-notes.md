@@ -27,6 +27,18 @@
   previous image for a rollback ([pi-deploy.md](pi-deploy.md)). Coming
   forward again rebuilds any job the previous image ran or rescheduled, so
   a change made while rolled back is kept and a daily job keeps its hour.
+- "Every morning" with no hour now gets "what time?" back, and nothing is
+  set up until you name one. This reverses the 0.1.8 note "'Every morning'
+  with no hour is a daily mail check. It does not ask what time." on
+  purpose: a daily or weekly job keeps the time of day you named, so it
+  needs one. Answer with the hour and the preview shows the job at that
+  time.
+- The assistant passes your words for a time, such as "tomorrow at 8" or
+  "December 7 at 9", and the server works out the day. A preview of
+  something that waits for a yes shows the date it worked out, and the yes
+  runs that date, even after midnight. A delay, such as "in two hours",
+  counts from your yes.
+- A proposal made before this update is not run by a yes. Ask again.
 
 ## 0.1.8 — 24 October 2026
 

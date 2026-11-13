@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from assistai.clock import HouseholdClock, say_day, weekday_of
 from assistai.errors import (
     CalendarError,
     JobError,
@@ -50,9 +51,10 @@ class ToolSurface(Protocol):
 GET_TIME_SPEC = ToolSpec(
     name="get_time",
     description=(
-        "Return the current household local time and UTC. "
-        "Call this in the same turn before job_create or relay start_at. "
-        "local has no timezone suffix; copy that form into start_at."
+        "Return the current household local time, weekday, today's date, and UTC. "
+        "Call this in the same turn before any at in job_create, job_reschedule, "
+        "or relay. Use it to check which day 'tomorrow' or a weekday is; at still "
+        "takes the person's words, not a time you work out."
     ),
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
 )
@@ -120,15 +122,23 @@ def get_time(_arguments: dict[str, Any]) -> str:
 
 
 def bind_clock(timezone: str) -> Callable[[dict[str, Any]], str]:
-    """Clock the model must read before it names a start_at. Local matches that field."""
+    """Clock the model must read before it names an ``at``.
+
+    The weekday and today's date are spelled out by the server, so the model
+    does not work out which day "Monday" or "tomorrow" is from a timestamp.
+    """
 
     def handler(_arguments: dict[str, Any]) -> str:
         zone = ZoneInfo(timezone)
         now = datetime.now(zone)
+        clock = HouseholdClock(zone=zone)
+        today = clock.today()
         return json.dumps(
             {
                 "timezone": timezone,
                 "local": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                "weekday": weekday_of(today),
+                "today": say_day(today, clock=clock),
                 "utc": datetime.now(UTC).isoformat(),
             }
         )

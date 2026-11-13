@@ -25,6 +25,7 @@ from assistai.jobs import (
     JobOutcome,
     bind_jobs,
     empty_report_is_real,
+    household_clock,
     is_nothing,
     job_user_prompt,
     look_again_prompt,
@@ -109,6 +110,9 @@ class SignalChannel:
         for name, handler in bind_jobs(store, timezone=self._timezone).items():
             broker.bind(name, handler)
         broker.bind("get_time", bind_clock(self._timezone))
+        # A staged time is fixed on the clock the job handlers read, so the
+        # date in the preview is the date the yes runs.
+        broker.use_clock(household_clock(self._timezone))
         self._histories: dict[str, list[Message]] = {}
         self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
 import structlog
@@ -21,6 +21,7 @@ import structlog
 from assistai.agents import AgentSpec, BrokerPolicy
 from assistai.calendar.draft import parse_add
 from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_ADD_SPEC, CALENDAR_TODAY_SPEC
+from assistai.clock import HouseholdClock
 from assistai.errors import CalendarError, JobError, MailError, SharedError
 from assistai.inference.tools import (
     GET_TIME_SPEC,
@@ -39,9 +40,12 @@ from assistai.jobs import (
     JOB_RESCHEDULE,
     JOB_RESCHEDULE_SPEC,
     Job,
+    check_reschedule,
+    legacy_time_arguments,
     parse_cancel,
     parse_create,
     parse_reschedule,
+    resolved_arguments,
 )
 from assistai.mail.actions import parse_draft, parse_file
 from assistai.mail.tools import (
@@ -72,6 +76,12 @@ AuditAction = Literal["allow", "deny", "stage"]
 # The Pi runs this for weeks. Keep enough audit history to explain a refusal
 # without letting a long uptime grow the process.
 AUDIT_LIMIT = 1000
+
+# The tools whose time a person names. Each takes at, so each needs get_time
+# first, and each is staged with that time fixed to a date.
+_TIMED_TOOLS = frozenset({JOB_CREATE, RELAY_TOOL, JOB_RESCHEDULE})
+# A proposal stored before at and delay replaced the old time arguments.
+STALE_PROPOSAL = "This was proposed before an update. Ask again and I will set it up."
 
 
 class _JobLookup(Protocol):
@@ -167,15 +177,25 @@ class ToolBroker:
     """Builds a per-agent surface the loop can call."""
 
     def __init__(
-        self, catalog: ToolCatalog, policy: BrokerPolicy, *, store: _JobLookup | None = None
+        self,
+        catalog: ToolCatalog,
+        policy: BrokerPolicy,
+        *,
+        store: _JobLookup | None = None,
+        clock: HouseholdClock | None = None,
     ) -> None:
         self._catalog = catalog
         self._policy = policy
         self._store = store
+        self._clock = clock
         self.audit: deque[AuditEvent] = deque(maxlen=AUDIT_LIMIT)
 
     def use_store(self, store: _JobLookup) -> None:
         self._store = store
+
+    def use_clock(self, clock: HouseholdClock) -> None:
+        """The clock a staged time is fixed on. Without one, a named time is not staged."""
+        self._clock = clock
 
     def for_agent(
         self, agent: AgentSpec, scope: Scope | None = None, *, report_only: bool = False
@@ -188,6 +208,7 @@ class ToolBroker:
             record=self.record,
             report_only=report_only,
             store=self._store,
+            clock=self._clock,
         )
 
     def bind(self, name: str, handler: ToolHandler) -> None:
@@ -234,6 +255,7 @@ class BoundSurface:
         record: Callable[[AuditEvent], None],
         report_only: bool = False,
         store: _JobLookup | None = None,
+        clock: HouseholdClock | None = None,
     ) -> None:
         self._catalog = catalog
         self._policy = policy
@@ -242,6 +264,7 @@ class BoundSurface:
         self._record = record
         self._report_only = report_only
         self._store = store
+        self._clock = clock
         self._staged: list[ToolCall] = []
         self._fetched_untrusted = False
         self._read_clock = False
@@ -297,16 +320,16 @@ class BoundSurface:
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
         meta = self._catalog.meta(call.name)
-        if call.name in (JOB_CREATE, RELAY_TOOL) and _has_start_at(call) and not self._read_clock:
+        if call.name in _TIMED_TOOLS and _has_at(call) and not self._read_clock:
             # The 12:44pm reminder was a guessed clock. A named time has to come
-            # after get_time in this turn. A delay uses in_seconds instead.
+            # after get_time in this turn. A spoken duration uses delay instead.
             body = json.dumps(
                 {
                     "error": "invalid_arguments",
                     "name": call.name,
                     "message": (
-                        "start_at needs get_time in this turn. "
-                        "For a delay, set in_seconds and omit start_at."
+                        "at needs get_time in this turn. Call get_time, then call again. "
+                        "For a duration the person said, use delay instead of at."
                     ),
                 }
             )
@@ -323,6 +346,14 @@ class BoundSurface:
                 # message never reaches them: staging refuses first.
                 body = json.dumps(
                     {"error": "invalid_arguments", "name": call.name, "message": reason},
+                    ensure_ascii=False,
+                )
+                return ToolResult(body)
+            try:
+                call = self._resolved(call)
+            except (JobError, RelayError) as exc:
+                body = json.dumps(
+                    {"error": "invalid_arguments", "name": call.name, "message": str(exc)},
                     ensure_ascii=False,
                 )
                 return ToolResult(body)
@@ -359,6 +390,15 @@ class BoundSurface:
             )
             body = json.dumps({"error": "tool_denied", "name": call.name, "reason": denied})
             return ToolResult(body)
+        if call.name in _TIMED_TOOLS and _carries_legacy_time(call):
+            # Its preview showed a time this build no longer reads the same
+            # way, so the yes cannot be held to it. The person asks again.
+            log.warning("staging.legacy_proposal_refused", agent=self._agent.name, tool=call.name)
+            body = json.dumps(
+                {"error": "stale_proposal", "name": call.name, "say": STALE_PROPOSAL},
+                ensure_ascii=False,
+            )
+            return ToolResult(body)
         result = await self._run(call, self._catalog.meta(call.name))
         if call.name == JOB_CREATE:
             _note_saved_reminder(self.saved_reminders, self.saved_job_ids, result.content)
@@ -383,6 +423,23 @@ class BoundSurface:
         )
         return ToolResult(result.content, untrusted=not meta.trusted)
 
+    def _resolved(self, call: ToolCall) -> ToolCall:
+        """The call as it is stored: a named time fixed to the date it means now.
+
+        The preview is formatted from this copy and the yes runs it, so a
+        "tomorrow" shown before midnight is not a different day after it.
+        Only ``at`` changes; the model's own call stays in its history.
+        """
+        if call.name not in _TIMED_TOOLS or not _has_at(call):
+            return call
+        if self._clock is None:
+            raise JobError("the household clock is not set, so a named time cannot be staged")
+        parsed: object = json.loads(call.arguments)
+        if not isinstance(parsed, dict):
+            return call
+        fixed = resolved_arguments(parsed, clock=self._clock)
+        return replace(call, arguments=json.dumps(fixed, ensure_ascii=False))
+
     def _deny_reason(self, name: str) -> DenyReason | None:
         if name not in self._catalog.names():
             return "unknown"
@@ -403,15 +460,20 @@ class BoundSurface:
         return None
 
 
-def _has_start_at(call: ToolCall) -> bool:
+def _has_at(call: ToolCall) -> bool:
     try:
         parsed: object = json.loads(call.arguments) if call.arguments else {}
     except json.JSONDecodeError:
         return False
-    if not isinstance(parsed, dict):
+    return isinstance(parsed, dict) and parsed.get("at") is not None
+
+
+def _carries_legacy_time(call: ToolCall) -> bool:
+    try:
+        parsed: object = json.loads(call.arguments) if call.arguments else {}
+    except json.JSONDecodeError:
         return False
-    raw = parsed.get("start_at")
-    return isinstance(raw, str) and bool(raw.strip())
+    return isinstance(parsed, dict) and bool(legacy_time_arguments(parsed))
 
 
 def _tool_ok(content: str) -> bool:
@@ -445,7 +507,8 @@ def _reminder_saves_now(call: ToolCall) -> bool:
         parsed: object = json.loads(call.arguments) if call.arguments else {}
     except json.JSONDecodeError:
         return False
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, dict) or legacy_time_arguments(parsed):
+        # Staging refuses an old call and logs it once; this check would log it twice.
         return False
     try:
         return parse_create(parsed).verbatim
@@ -512,8 +575,7 @@ def _staging_error(
             found = store.find_job(agent.name, name=reschedule.name, job_id=reschedule.id)
             if found is None or _staged_cancel_covers(found, staged):
                 return "no matching job"
-            if found.ttl_seconds is not None and reschedule.every_seconds > found.ttl_seconds:
-                return "every_seconds is longer than the watch TTL"
+            check_reschedule(found, reschedule)
             return None
         if call.name == JOB_CANCEL:
             name, job_id = parse_cancel(parsed)

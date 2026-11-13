@@ -102,7 +102,7 @@ async def test_a_future_relay_waits_instead_of_sending(
         timezone="America/Chicago",
     )
     with using_agent(jacob):
-        result = json.loads(await handler({"body": "pick up milk", "in_seconds": 120}))
+        result = json.loads(await handler({"body": "pick up milk", "delay": {"minutes": 2}}))
 
     assert signal.sent == []
     assert result["scheduled"] is True
@@ -125,7 +125,7 @@ async def test_a_future_relay_waits_instead_of_sending(
 async def test_a_daily_future_relay_keeps_the_hour_it_first_sends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A repeating relay of whole days is stored on the clock, like any daily job."""
+    """A repeating relay of whole days is stored on the clock at the hour it names."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -146,9 +146,7 @@ async def test_a_daily_future_relay_keeps_the_hour_it_first_sends(
         timezone="America/Chicago",
     )
     with using_agent(jacob):
-        await handler(
-            {"body": "vitamins", "in_seconds": 3600, "once": False, "every_seconds": 86400}
-        )
+        await handler({"body": "vitamins", "at": {"hour": 8}, "once": False, "every_days": 1})
 
     saved = store.find_job("jacob", name="message to spouse")
     store.close()
@@ -184,8 +182,8 @@ async def test_a_second_future_relay_gets_its_own_name(
         timezone="America/Chicago",
     )
     with using_agent(jacob):
-        await handler({"body": "pick up milk", "in_seconds": 120})
-        second = json.loads(await handler({"body": "and bread", "in_seconds": 180}))
+        await handler({"body": "pick up milk", "delay": {"minutes": 2}})
+        second = json.loads(await handler({"body": "and bread", "delay": {"minutes": 3}}))
 
     saved = store.find_job("jacob", name="message to spouse 2")
     assert saved is not None
@@ -194,9 +192,75 @@ async def test_a_second_future_relay_gets_its_own_name(
     store.close()
 
 
-def test_a_non_text_start_at_is_not_an_immediate_relay() -> None:
-    with pytest.raises(RelayError, match="start_at"):
-        parse_relay_when({"body": "pick up milk", "start_at": 120})
+@pytest.mark.parametrize(
+    "when",
+    [
+        pytest.param({"start_at": 120}, id="a non-text start_at"),
+        pytest.param({"start_at": "2026-10-19T17:00:00"}, id="an old start_at"),
+        pytest.param({"in_seconds": 120}, id="an old in_seconds"),
+        pytest.param({"at": "5pm"}, id="an at that is not a clock time"),
+    ],
+)
+def test_an_unreadable_time_is_not_an_immediate_relay(when: dict[str, object]) -> None:
+    """Yes would deliver now, which is the opposite of a time they named."""
+    with pytest.raises(RelayError):
+        parse_relay_when({"body": "pick up milk", **when})
+
+
+async def test_a_daily_relay_without_a_time_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'Text her every morning' with no hour asks what time. Nothing is staged or stored."""
+    from assistai.broker import Scope, ToolBroker, builtin_catalog
+    from assistai.inference.types import ToolCall
+    from tests.clock_fakes import FakeClock, chicago, chicago_clock
+    from tests.fakes import body
+
+    clock = FakeClock(chicago(2026, 10, 30, 21, 12))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+    store = Store(tmp_path / "assistai.sqlite")
+    jacob = agent("jacob", "+15555550101", tools=("relay", "get_time"))
+    home = household(jacob, agent("spouse", "+15555550102", tools=("relay",)))
+    handler = bind_relay(
+        household=home,
+        signal=FakeSignal(),
+        inject=_noop_inject,
+        store=store,
+        timezone="America/Chicago",
+    )
+    catalog = builtin_catalog()
+    catalog.bind("relay", handler)
+    surface = ToolBroker(catalog, home.broker, store=store, clock=chicago_clock(clock)).for_agent(
+        jacob, Scope()
+    )
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+
+    results = [
+        await body(
+            surface,
+            ToolCall(id=f"c{index}", name="relay", arguments=json.dumps(arguments)),
+        )
+        for index, arguments in enumerate(
+            (
+                {"body": "Take your vitamins.", "once": False, "every_days": 1},
+                {
+                    "body": "Take your vitamins.",
+                    "once": False,
+                    "every_days": 1,
+                    "delay": {"hours": 11},
+                },
+            ),
+            start=1,
+        )
+    ]
+    staged = surface.take_staged()
+
+    assert staged == ()
+    assert all("Ask them what time" in str(result["message"]) for result in results), results
+    with using_agent(jacob), pytest.raises(RelayError, match="Ask them what time"):
+        await handler({"body": "Take your vitamins.", "once": False, "every_days": 1})
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
 
 
 async def test_failed_inject_still_delivered(

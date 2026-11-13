@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from structlog.testing import capture_logs
 
 from assistai.agents import AgentSpec
 from assistai.broker import AUDIT_LIMIT, AuditEvent, Scope, ToolBroker, builtin_catalog
@@ -13,7 +14,7 @@ from assistai.inference.types import Message, ToolCall, ToolSpec
 from assistai.jobs import Job, bind_jobs
 from assistai.store import Store
 from tests.agent_fakes import agent, household
-from tests.clock_fakes import FakeClock, chicago, wall
+from tests.clock_fakes import FakeClock, chicago, chicago_clock, wall
 from tests.fakes import body, tool_call
 
 
@@ -324,7 +325,7 @@ async def test_a_delayed_relay_is_not_saved_until_yes(tmp_path: Path) -> None:
         ToolCall(
             id="c1",
             name="relay",
-            arguments='{"body": "pick up milk", "in_seconds": 120}',
+            arguments='{"body": "pick up milk", "delay": {"minutes": 2}}',
         ),
     )
 
@@ -334,7 +335,7 @@ async def test_a_delayed_relay_is_not_saved_until_yes(tmp_path: Path) -> None:
     store.close()
 
 
-async def test_a_guessed_relay_start_at_is_not_staged() -> None:
+async def test_a_guessed_relay_time_is_not_staged() -> None:
     """A yes would send at a clock time the model never read."""
     jacob = agent("jacob", "+15555550101", tools=("relay", "get_time"))
     surface = ToolBroker(
@@ -346,7 +347,7 @@ async def test_a_guessed_relay_start_at_is_not_staged() -> None:
         ToolCall(
             id="c1",
             name="relay",
-            arguments='{"body": "pick up milk", "start_at": "2026-10-19T17:00:00"}',
+            arguments='{"body": "pick up milk", "at": {"hour": 17}}',
         ),
     )
 
@@ -408,12 +409,16 @@ async def test_a_reminder_in_a_tainted_conversation_waits_for_yes(
     for name, handler in bind_jobs(store, timezone="America/Chicago").items():
         catalog.bind(name, handler)
     jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    start = datetime(2026, 10, 19, 8, 0, tzinfo=ZoneInfo("America/Chicago"))
+    clock = FakeClock(start.timestamp() - 3600)
+    monkeypatch.setattr("assistai.jobs._now", clock)
     broker = ToolBroker(
-        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+        catalog,
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+        clock=chicago_clock(clock),
     )
     surface = broker.for_agent(jacob, Scope(tainted=True))
-    start = datetime(2026, 10, 19, 8, 0, tzinfo=ZoneInfo("America/Chicago"))
-    monkeypatch.setattr("assistai.jobs._now", lambda: start.timestamp() - 3600)
     await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
 
     staged = await body(surface, _pool_reminder())
@@ -433,13 +438,14 @@ def _pool_reminder() -> ToolCall:
         arguments=(
             '{"kind": "schedule", "name": "pool", '
             '"prompt": "Don\'t forget to put the cleaner in the pool.", '
-            '"every_seconds": 86400, "once": true, "verbatim": true, '
-            '"start_at": "2026-10-19T08:00:00"}'
+            '"once": true, "verbatim": true, '
+            '"at": {"date": "2026-10-19", "hour": 8}}'
         ),
     )
 
 
-async def test_a_guessed_start_at_is_not_saved(tmp_path: Path) -> None:
+async def test_a_named_time_without_get_time_is_refused(tmp_path: Path) -> None:
+    """The 12:44pm reminder was a guessed clock. A named time waits for get_time."""
     store = Store(tmp_path / "assistai.sqlite")
     catalog = builtin_catalog()
     for name, handler in bind_jobs(store, timezone="America/Chicago").items():
@@ -456,21 +462,22 @@ async def test_a_guessed_start_at_is_not_saved(tmp_path: Path) -> None:
             name="job_create",
             arguments=(
                 '{"kind": "schedule", "name": "pool", '
-                '"prompt": "working", "every_seconds": 120, "once": true, '
-                '"verbatim": true, "start_at": "2026-10-19T12:44:00"}'
+                '"prompt": "working", "once": true, '
+                '"verbatim": true, "at": {"hour": 12, "minute": 44}}'
             ),
         ),
     )
 
     assert refused["error"] == "invalid_arguments"
-    assert "in_seconds" in refused["message"]
+    assert "get_time" in refused["message"]
+    assert "delay" in refused["message"]
     assert surface.take_staged() == ()
     assert store.find_job("jacob", name="pool") is None
     assert surface.saved_reminders == []
     store.close()
 
 
-async def test_in_seconds_is_counted_by_the_server(
+async def test_a_delay_is_counted_by_the_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = Store(tmp_path / "assistai.sqlite")
@@ -492,8 +499,8 @@ async def test_in_seconds_is_counted_by_the_server(
             arguments=(
                 '{"kind": "schedule", "name": "check", '
                 '"prompt": "The new reminder system is working.", '
-                '"every_seconds": 86400, "once": true, "verbatim": true, '
-                '"in_seconds": 120}'
+                '"once": true, "verbatim": true, '
+                '"delay": {"minutes": 2}}'
             ),
         ),
     )
@@ -516,7 +523,7 @@ async def test_job_create_is_staged() -> None:
     ).for_agent(jacob)
     arguments = (
         '{"kind": "schedule", "name": "morning email", '
-        '"prompt": "summarize important mail", "every_seconds": 86400}'
+        '"prompt": "summarize important mail", "every_minutes": 60}'
     )
     call = ToolCall(id="c1", name="job_create", arguments=arguments)
 
@@ -539,7 +546,7 @@ async def test_a_watch_without_ttl_is_not_staged() -> None:
             name="job_create",
             arguments=(
                 '{"kind": "watch", "name": "flights", '
-                '"prompt": "look for cheaper flights", "every_seconds": 3600}'
+                '"prompt": "look for cheaper flights", "every_minutes": 60}'
             ),
         ),
     )
@@ -583,7 +590,7 @@ async def test_duplicate_job_name_is_not_staged(tmp_path: Path) -> None:
             name="job_create",
             arguments=(
                 '{"kind": "schedule", "name": "morning email", '
-                '"prompt": "summarize important mail", "every_seconds": 86400}'
+                '"prompt": "summarize important mail", "every_minutes": 60}'
             ),
         ),
     )
@@ -601,11 +608,9 @@ async def test_a_second_create_in_the_same_turn_cannot_reuse_the_name() -> None:
     ).for_agent(jacob)
     first = (
         '{"kind": "schedule", "name": "morning email", '
-        '"prompt": "summarize important mail", "every_seconds": 86400}'
+        '"prompt": "summarize important mail", "every_minutes": 60}'
     )
-    second = (
-        '{"kind": "schedule", "name": "Morning Email", "prompt": "again", "every_seconds": 86400}'
-    )
+    second = '{"kind": "schedule", "name": "Morning Email", "prompt": "again", "every_minutes": 60}'
 
     assert (await body(surface, ToolCall(id="c1", name="job_create", arguments=first)))[
         "status"
@@ -655,7 +660,7 @@ async def test_cancel_then_recreate_can_reuse_the_name(tmp_path: Path) -> None:
             name="job_create",
             arguments=(
                 '{"kind": "schedule", "name": "morning email", '
-                '"prompt": "summarize important mail", "every_seconds": 86400}'
+                '"prompt": "summarize important mail", "every_minutes": 60}'
             ),
         ),
     )
@@ -699,7 +704,7 @@ async def test_commit_surfaces_job_error_text(tmp_path: Path) -> None:
             name="job_create",
             arguments=(
                 '{"kind": "schedule", "name": "morning email", '
-                '"prompt": "summarize important mail", "every_seconds": 86400}'
+                '"prompt": "summarize important mail", "every_minutes": 60}'
             ),
         )
     )
@@ -799,7 +804,7 @@ async def test_reschedule_longer_than_ttl_is_not_staged(tmp_path: Path) -> None:
         ToolCall(
             id="c1",
             name="job_reschedule",
-            arguments='{"name": "flights", "every_seconds": 7200}',
+            arguments='{"name": "flights", "every_minutes": 120}',
         ),
     )
 
@@ -869,13 +874,6 @@ async def test_audit_is_bounded() -> None:
     assert broker.audit[-1].tool == f"t{AUDIT_LIMIT + 49}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "C-2: a daily digest with no hour is staged and, after yes, saved to run at "
-        "the minute it was asked, 9:12 PM; fixed by spec 016 commit 6"
-    ),
-)
 async def test_a_daily_job_without_a_time_is_neither_staged_nor_saved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -885,14 +883,25 @@ async def test_a_daily_job_without_a_time_is_neither_staged_nor_saved(
     for name, handler in bind_jobs(store, timezone="America/Chicago").items():
         catalog.bind(name, handler)
     jacob = agent("jacob", "+15555550101", tools=("job_create", "get_time"))
+    clock = FakeClock(chicago(2026, 10, 30, 21, 12))
+    monkeypatch.setattr("assistai.jobs._now", clock)
     surface = ToolBroker(
-        catalog, household(jacob, agent("spouse", "+15555550102")).broker, store=store
+        catalog,
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        store=store,
+        clock=chicago_clock(clock),
     ).for_agent(jacob, Scope())
-    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
     await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
-    daily = {"kind": "schedule", "every_seconds": 86400}
+    daily = {"kind": "schedule", "every_days": 1}
     digest = {**daily, "name": "morning email", "prompt": "Summarize my unread mail."}
-    reminder = {**daily, "name": "morning pills", "prompt": "Take your pills.", "verbatim": True}
+    reminder = {
+        **daily,
+        "name": "morning pills",
+        "prompt": "Take your pills.",
+        "verbatim": True,
+        # A delay says when the first text is, not the hour it repeats at.
+        "delay": {"hours": 11},
+    }
 
     # A digest stages and a clean verbatim reminder saves at once: both paths are checked.
     results = [
@@ -908,4 +917,107 @@ async def test_a_daily_job_without_a_time_is_neither_staged_nor_saved(
         assert saved is None, f"{name} saved for {wall(saved.next_run_at)}"
     assert staged == ()
     assert all("error" in result for result in results), results
+    assert all("Ask them what time" in str(result["message"]) for result in results), results
+    store.close()
+
+
+async def test_canonicalising_changes_only_time_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored call is the model's call with a relative day fixed to a date, and no more."""
+    clock = FakeClock(chicago(2026, 10, 30, 23, 58))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+    jacob = agent("jacob", "+15555550101", tools=("job_create", "relay", "get_time"))
+    surface = ToolBroker(
+        builtin_catalog(),
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        clock=chicago_clock(clock),
+    ).for_agent(jacob, Scope(tainted=True))
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+    digest: dict[str, object] = {
+        "kind": "schedule",
+        "name": "flights to Denver",
+        "prompt": "Check fares to Denver and say if any are under $200 — «cheap».",
+        "at": {"day": "tomorrow", "hour": 7, "minute": 5},
+        "every_days": 7,
+        "verbatim": False,
+    }
+    relay: dict[str, object] = {
+        "body": "Pick up the cake at 1:30.",
+        "at": {"date": "2026-11-01", "hour": 1, "minute": 30},
+        "name": "cake",
+    }
+    later: dict[str, object] = {"body": "Call me back.", "delay": {"hours": 2}}
+
+    replies = [
+        await body(surface, ToolCall(id="c1", name="job_create", arguments=json.dumps(digest))),
+        await body(surface, ToolCall(id="c2", name="relay", arguments=json.dumps(relay))),
+        await body(surface, ToolCall(id="c3", name="relay", arguments=json.dumps(later))),
+    ]
+    stored = [json.loads(call.arguments) for call in surface.take_staged()]
+
+    assert [reply["status"] for reply in replies] == ["staged"] * 3
+    # What the model is told was staged is what is stored.
+    assert [json.loads(str(reply["arguments"])) for reply in replies] == stored
+    for sent, kept in zip((digest, relay, later), stored, strict=True):
+        assert list(kept) == list(sent)
+        for key, value in sent.items():
+            if key != "at":
+                assert json.dumps(kept[key], ensure_ascii=False) == json.dumps(
+                    value, ensure_ascii=False
+                )
+    assert stored[0]["at"] == {"date": "2026-10-31", "hour": 7, "minute": 5}
+    # 1:30 AM happens twice on Nov 1. The first one is still ahead, and fold says so.
+    assert stored[1]["at"] == {"date": "2026-11-01", "hour": 1, "minute": 30, "fold": 0}
+    # The server never adds an at the model did not send, and a delay stays a delay.
+    assert "at" not in stored[2]
+    assert stored[2]["delay"] == {"hours": 2}
+
+
+async def test_a_named_time_is_not_staged_without_the_household_clock() -> None:
+    """With no clock to fix its date, a staged "tomorrow" could run a different day than shown."""
+    jacob = agent("jacob", "+15555550101", tools=("relay", "get_time"))
+    surface = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+    await body(surface, ToolCall(id="c0", name="get_time", arguments="{}"))
+
+    refused = await body(
+        surface,
+        ToolCall(
+            id="c1",
+            name="relay",
+            arguments='{"body": "pick up milk", "at": {"day": "tomorrow", "hour": 17}}',
+        ),
+    )
+
+    assert refused["error"] == "invalid_arguments"
+    assert surface.take_staged() == ()
+
+
+async def test_a_proposal_from_before_the_update_is_refused_at_commit(tmp_path: Path) -> None:
+    """Its preview showed start_at or in_seconds. The yes cannot be held to that preview now."""
+    store = Store(tmp_path / "assistai.sqlite")
+    jacob = agent("jacob", "+15555550101", tools=("job_create",))
+    broker = ToolBroker(
+        builtin_catalog(), household(jacob, agent("spouse", "+15555550102")).broker, store=store
+    )
+    for name, handler in bind_jobs(store, timezone="America/Chicago").items():
+        broker.bind(name, handler)
+
+    with capture_logs() as logs:
+        committed = await broker.for_agent(jacob).commit(
+            ToolCall(
+                id="c1",
+                name="job_create",
+                arguments=(
+                    '{"kind": "schedule", "name": "morning email", '
+                    '"prompt": "summarize important mail", "every_seconds": 86400}'
+                ),
+            )
+        )
+
+    payload = json.loads(committed.content)
+    assert payload["error"] == "stale_proposal"
+    assert "ask again" in payload["say"].lower()
+    assert store.find_job("jacob", name="morning email") is None
+    assert [entry["event"] for entry in logs] == ["staging.legacy_proposal_refused"]
     store.close()

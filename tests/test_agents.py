@@ -37,18 +37,18 @@ def test_example_roster_loads(repo_root: Path) -> None:
     assert spouse.name == "spouse"
     prompt = system_prompt_for(jacob, timezone="America/Chicago")
     assert "call mail_inbox" in prompt
-    assert "start_at" in prompt
     assert "America/Chicago" in prompt
     assert "saved immediately" in prompt
     assert "Nothing is sent before" in prompt
     assert "creates another job" in prompt
-    assert "in_seconds" in prompt
     assert "Local time now is" in prompt
-    assert "in_seconds 120" in prompt
     assert "it was wrong" in prompt
     assert "inbox_unread" in prompt
     assert "Do not ask them to reply yes in your own text" in prompt
-    assert "every morning" in prompt
+    # The parser refuses a daily job with no hour; the prompt says what to do then.
+    assert "ask them what time" in prompt
+    for retired in ("start_at", "in_seconds", "every_seconds", "Do not ask them what time"):
+        assert retired not in prompt
     assert household.agent_for_signal_dm("+15555550199") is None
     assert jacob.tools == (
         "get_time",

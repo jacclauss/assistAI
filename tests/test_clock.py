@@ -9,6 +9,7 @@ import pytest
 from assistai.clock import (
     LocalAt,
     Schedule,
+    fix_at,
     local_reading,
     next_slot,
     resolve_at,
@@ -18,7 +19,6 @@ from assistai.clock import (
     say_when,
 )
 from assistai.errors import JobError
-from assistai.relay import _delay_phrase
 from tests.clock_fakes import CHICAGO, FakeClock, chicago, chicago_clock, wall
 
 CDT = timedelta(hours=-5)
@@ -433,9 +433,9 @@ def test_say_repeat_names_a_zone_that_is_not_the_household_one() -> None:
         (90, "90 seconds"),
     ],
 )
-def test_say_duration_matches_the_relay_wording(seconds: int, said: str) -> None:
+def test_say_duration_uses_the_largest_whole_unit(seconds: int, said: str) -> None:
+    """The relay preview's delay wording, which moved here from relay."""
     assert say_duration(seconds) == said
-    assert say_duration(seconds) == _delay_phrase(seconds)
 
 
 @pytest.mark.parametrize(
@@ -471,3 +471,40 @@ def test_a_local_reading_names_the_offset_on_each_side_of_fall_back() -> None:
         "2026-11-01T01:30:00-06:00",
         "-06:00",
     )
+
+
+@pytest.mark.parametrize(
+    ("now", "at", "fixed"),
+    [
+        pytest.param(
+            chicago(2026, 10, 30, 23, 58),
+            LocalAt(day="tomorrow", hour=8),
+            LocalAt(date=date(2026, 10, 31), hour=8),
+            id="tomorrow before midnight",
+        ),
+        pytest.param(
+            chicago(2026, 10, 30, 21, 12),
+            LocalAt(hour=8),
+            LocalAt(date=date(2026, 10, 31), hour=8),
+            id="a bare hour already past today",
+        ),
+        pytest.param(
+            chicago(2026, 10, 31, 22),
+            LocalAt(hour=1, minute=30),
+            LocalAt(date=date(2026, 11, 1), hour=1, minute=30, fold=0),
+            id="the first of a repeated hour",
+        ),
+        pytest.param(
+            chicago(2026, 11, 1, 1, 20, fold=1),
+            LocalAt(hour=1, minute=40),
+            LocalAt(date=date(2026, 11, 1), hour=1, minute=40, fold=1),
+            id="the second of a repeated hour",
+        ),
+    ],
+)
+def test_fix_at_pins_the_date_and_the_occurrence(now: float, at: LocalAt, fixed: LocalAt) -> None:
+    """What is staged resolves to the same instant at the yes, whatever day the yes is."""
+    clock = chicago_clock(now)
+
+    assert fix_at(at, clock=clock) == fixed
+    assert resolve_at(fixed, clock=clock) == resolve_at(at, clock=clock)

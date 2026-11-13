@@ -11,11 +11,15 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from assistai.calendar.draft import CalendarDraft, parse_add
+from assistai.clock import Delay, LocalAt, say_at, say_duration, say_every
 from assistai.errors import CalendarError
 from assistai.inference.types import ToolCall
+
+if TYPE_CHECKING:
+    from assistai.jobs import JobReschedule
 
 Decision = Literal["confirm", "reject"]
 
@@ -123,12 +127,15 @@ def _format_relay(call: ToolCall, *, tainted: bool) -> str:
     else:
         from assistai.relay import when_phrase
 
-        lead = f"I will send this to the other phone {when_phrase(when)} when you confirm:\n"
-        later = (
-            ""
-            if when.once
-            else f"It repeats every {when.every_seconds} seconds until you cancel it.\n"
+        # A delay already says it counts from the yes.
+        confirm = "" if isinstance(when.first, Delay) else " when you confirm"
+        lead = f"I will send this to the other phone {when_phrase(when)}{confirm}:\n"
+        repeat = say_every(
+            every_days=when.every_days,
+            every_minutes=when.every_minutes,
+            at=when.first if isinstance(when.first, LocalAt) else None,
         )
+        later = "" if when.once else f"It repeats {repeat} until you cancel it.\n"
     lines = [
         lead,
         f"From you:\n{body}",
@@ -162,13 +169,10 @@ def _format_job_create(call: ToolCall, *, tainted: bool) -> str:
     lines = [
         f"I will create this {kind} when you confirm:\n",
         f"Name: {spec.name}",
-        f"Every: {spec.every_seconds} seconds",
         f"Check: {spec.prompt}",
+        f"First run: {_first_run_text(spec.first, every_minutes=spec.every_minutes)}",
+        f"Repeats: {_repeat_text(spec.every_days, spec.every_minutes, spec.first)}",
     ]
-    if spec.start_at is not None:
-        lines.append(f"First run: {spec.start_at}")
-    if spec.once:
-        lines.append("Once: yes")
     if spec.verbatim:
         lines.append("The text above is what you will receive.")
     if spec.ttl_seconds is not None:
@@ -177,6 +181,27 @@ def _format_job_create(call: ToolCall, *, tainted: bool) -> str:
     if tainted:
         lines.append(_TAINT_NOTE)
     return "\n".join(lines)
+
+
+def _first_run_text(first: LocalAt | Delay | None, *, every_minutes: int | None) -> str:
+    """When the first run is, from the stored call. A delay counts from the yes, not the preview."""
+    if isinstance(first, LocalAt):
+        return say_at(first)
+    if isinstance(first, Delay):
+        return f"{say_duration(first.seconds)} after you reply yes"
+    if every_minutes is not None:
+        return f"{say_duration(every_minutes * 60)} after you reply yes"
+    return "when you reply yes"
+
+
+def _repeat_text(
+    every_days: int | None, every_minutes: int | None, first: LocalAt | Delay | None
+) -> str:
+    return say_every(
+        every_days=every_days,
+        every_minutes=every_minutes,
+        at=first if isinstance(first, LocalAt) else None,
+    )
 
 
 def _format_job_reschedule(call: ToolCall, *, tainted: bool) -> str:
@@ -190,13 +215,21 @@ def _format_job_reschedule(call: ToolCall, *, tainted: bool) -> str:
     if spec is None:
         return _generic_preview(call, tainted=tainted)
     label = spec.name or spec.id or "this job"
-    lines = [
-        f"I will change {label} to every {spec.every_seconds} seconds when you confirm.\n",
-        _CONFIRM_HINT_ONE,
-    ]
+    lines = [f"I will change {label} when you confirm:\n", *_reschedule_parts(spec)]
+    lines.extend(["", _CONFIRM_HINT_ONE])
     if tainted:
         lines.append(_TAINT_NOTE)
     return "\n".join(lines)
+
+
+def _reschedule_parts(spec: JobReschedule) -> list[str]:
+    parts: list[str] = []
+    if spec.at is not None:
+        parts.append(f"Next run: {say_at(spec.at)}")
+    if spec.every_days is not None or spec.every_minutes is not None:
+        repeat = say_every(every_days=spec.every_days, every_minutes=spec.every_minutes, at=spec.at)
+        parts.append(f"Repeats: {repeat}")
+    return parts
 
 
 def _format_job_cancel(call: ToolCall, *, tainted: bool) -> str:
@@ -262,7 +295,9 @@ def _job_create_line(call: ToolCall) -> str | None:
     if spec is None:
         return None
     kind = "schedule" if spec.kind == "schedule" else "watch"
-    line = f"Create {kind} {spec.name!r} every {spec.every_seconds} seconds: {spec.prompt}"
+    first = _first_run_text(spec.first, every_minutes=spec.every_minutes)
+    repeat = _repeat_text(spec.every_days, spec.every_minutes, spec.first)
+    line = f"Create {kind} {spec.name!r}, first run {first}, repeats {repeat}: {spec.prompt}"
     if spec.ttl_seconds is not None:
         line += f" (ends after {spec.ttl_seconds} seconds)"
     return line
@@ -292,7 +327,7 @@ def _job_reschedule_line(call: ToolCall) -> str | None:
     if spec is None:
         return None
     label = spec.name or spec.id or "this job"
-    return f"Change {label} to every {spec.every_seconds} seconds"
+    return f"Change {label}: " + "; ".join(_reschedule_parts(spec))
 
 
 def _format_calendar_add(call: ToolCall, *, tainted: bool) -> str:

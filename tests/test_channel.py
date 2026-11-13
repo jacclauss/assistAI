@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -621,8 +622,8 @@ async def test_the_sent_reminder_time_is_the_servers(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "The new reminder system is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -678,8 +679,8 @@ async def test_a_reminder_keeps_the_rest_of_the_answer(
                     arguments=(
                         '{"kind": "schedule", "name": "trash", '
                         '"prompt": "Take the trash out.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -746,8 +747,8 @@ async def test_a_reminder_does_not_fire_before_its_turn_ends(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "It is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 60}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 1}}'
                     ),
                     finish="tool_calls",
                 )
@@ -800,8 +801,8 @@ async def test_a_failed_turn_cancels_the_reminder_it_saved(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "The new reminder system is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -1418,6 +1419,64 @@ async def test_relay_preview_is_the_stored_body_not_model_prose(tmp_path: Path) 
     assert "I will tell her" not in preview
     assert signal.sent[-1][0] == "+15555550101"
     await fireworks.aclose()
+
+
+async def test_a_proposal_from_before_the_update_asks_again(tmp_path: Path) -> None:
+    """A yes to a preview that named start_at or in_seconds runs nothing and says to ask again."""
+    from assistai.inference.types import ToolCall
+    from assistai.jobs import bind_jobs
+
+    store = _store(tmp_path)
+    store.replace_proposal(
+        Proposal(
+            agent="jacob",
+            calls=(
+                ToolCall(
+                    id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "pool", '
+                        '"prompt": "Put the cleaner in the pool.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"start_at": "2026-12-07T08:00:00"}'
+                    ),
+                ),
+            ),
+            tainted=True,
+            created_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+
+    def boom(_req: httpx.Request) -> httpx.Response:
+        raise AssertionError("confirm must not call the model")
+
+    signal = FakeSignal()
+    fireworks = client_for(boom)
+    home = household(
+        agent("jacob", "+15555550101", tools=("job_create",)), agent("spouse", "+15555550102")
+    )
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="UTC").items():
+        catalog.bind(name, handler)
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+
+    await channel.handle(inbound(text="yes"))
+
+    assert store.find_job("jacob", name="pool") is None
+    assert store.load_proposal("jacob") is None
+    assert signal.sent[-1][1] == (
+        "This was proposed before an update. Ask again and I will set it up."
+    )
+    await fireworks.aclose()
+    store.close()
 
 
 async def test_relay_yes_sends_verbatim_and_taints_the_recipient(tmp_path: Path) -> None:

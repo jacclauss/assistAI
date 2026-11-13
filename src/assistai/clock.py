@@ -45,6 +45,73 @@ _MONTHS = (
 )
 DAY_WORDS = ("today", "tomorrow", *_WEEKDAYS)
 
+# The time arguments of job_create, relay, and job_reschedule, as the model
+# sees them. They take the person's words, not an instant: the server turns
+# those into an instant with this module's rules.
+AT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "description": (
+        "A clock time the person named, in their words. 'tomorrow at 8' is day "
+        "tomorrow and hour 8. 'Monday at 7:30' is day monday, hour 7, minute 30. "
+        "'December 7 at 9' is date 2026-12-07 and hour 9. A bare 'at 8' is hour 8 "
+        "with neither day nor date. Needs get_time in this turn."
+    ),
+    "properties": {
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59, "default": 0},
+        "day": {
+            "type": "string",
+            "enum": list(DAY_WORDS),
+            "description": "today, tomorrow, or a weekday. Omit when date is set.",
+        },
+        "date": {
+            "type": "string",
+            "description": "A calendar date, YYYY-MM-DD. Omit when day is set.",
+        },
+        "fold": {
+            "type": "integer",
+            "enum": [0, 1],
+            "description": (
+                "Written by the server when it stores the call, for an hour the "
+                "clocks repeat. Do not set it."
+            ),
+        },
+    },
+    "required": ["hour"],
+    "additionalProperties": False,
+}
+
+DELAY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "description": (
+        "Only for a duration the person said: 'in two hours', 'in 50 days'. "
+        "The server counts it. At least one minute in total."
+    ),
+    "properties": {
+        "days": {"type": "integer", "minimum": 0},
+        "hours": {"type": "integer", "minimum": 0},
+        "minutes": {"type": "integer", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
+
+EVERY_DAYS_SCHEMA: dict[str, object] = {
+    "type": "integer",
+    "minimum": 1,
+    "description": (
+        "Whole days between runs: 1 is daily, 7 is weekly. The run keeps the "
+        "local time in at across daylight saving. Needs at."
+    ),
+}
+
+EVERY_MINUTES_SCHEMA: dict[str, object] = {
+    "type": "integer",
+    "minimum": 1,
+    "description": (
+        "Elapsed minutes between runs, such as 90. Not for whole days: use every_days."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class HouseholdClock:
@@ -166,6 +233,74 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
             "Name a later day or time."
         )
     return moment
+
+
+def fix_at(at: LocalAt, *, clock: HouseholdClock) -> LocalAt:
+    """``at`` pinned to the date it means now, with ``fold`` when that time happens twice.
+
+    "Tomorrow" in a preview shown at 11:58 PM is a different day at a
+    12:03 AM yes, so a staged time is stored as the date the person was
+    shown. ``fold`` is written only for the fall-back hour, where the date
+    and clock time alone do not say which occurrence was meant. Refuses
+    what ``resolve_at`` refuses.
+    """
+    moment = resolve_at(at, clock=clock)
+    local = _local(moment, clock.zone)
+    return LocalAt(
+        date=local.date(),
+        hour=at.hour,
+        minute=at.minute,
+        fold=local.fold if _repeated(local) else None,
+    )
+
+
+def say_at(at: LocalAt) -> str:
+    """A named time as the person can check it, before it is resolved to an instant.
+
+    A date carries its weekday and year, so a date the model got wrong reads
+    as wrong. Which occurrence of a fall-back hour is meant is spelled out,
+    because the clock time alone shows it twice.
+    """
+    text = _clock_text(dt.time(at.hour, at.minute))
+    if at.fold == 0:
+        text = f"{text} (the first one, before the clocks fall back)"
+    elif at.fold == 1:
+        text = f"{text} (the second one, after the clocks fall back)"
+    if at.date is not None:
+        return f"{_date_text(at.date, year=True)} at {text}"
+    if at.day in ("today", "tomorrow"):
+        return f"{at.day} at {text}"
+    if at.day is not None:
+        return f"{at.day.capitalize()} at {text}"
+    return f"the next {text}"
+
+
+def say_every(
+    *, every_days: int | None, every_minutes: int | None, at: LocalAt | None = None
+) -> str:
+    """How often a requested repeat runs, in words, before it is stored as a schedule.
+
+    A whole-day repeat names the clock time it keeps. Without ``at`` it keeps
+    the time the job already runs at, and says so.
+    """
+    if every_minutes is not None:
+        phrase = say_duration(every_minutes * 60)
+        return f"every {phrase[2:]}" if phrase.startswith("1 ") else f"every {phrase}"
+    if every_days is None:
+        return "once"
+    at_text = _clock_text(dt.time(at.hour, at.minute)) if at is not None else "the time it runs now"
+    if every_days == 1:
+        return f"every day at {at_text}"
+    if every_days == 7 and at is not None and at.date is not None:
+        return f"every {_weekday(at.date)} at {at_text}"
+    if every_days == 7 and at is not None and at.day is not None and at.day in _WEEKDAYS:
+        return f"every {at.day.capitalize()} at {at_text}"
+    return f"every {every_days} days at {at_text}"
+
+
+def weekday_of(day: dt.date) -> str:
+    """The weekday name of a date, so the model reads it instead of working it out."""
+    return _weekday(day)
 
 
 def next_slot(schedule: Schedule, *, after: float) -> float:
