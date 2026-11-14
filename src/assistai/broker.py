@@ -339,7 +339,7 @@ class BoundSurface:
         # once outside text is in the conversation: that text could have
         # written the sentence (decision 0001).
         if meta.staging and (self._scope.tainted or not _reminder_saves_now(call)):
-            reason = _staging_error(call, self._agent, self._store, self._staged)
+            reason = _staging_error(call, self._agent, self._store, self._staged, self._clock)
             if reason is not None:
                 # Say why. The model has to tell the person whether to pick a
                 # different name or a different job, and the commit-path
@@ -542,8 +542,13 @@ def _staging_error(
     agent: AgentSpec,
     store: _JobLookup | None = None,
     staged: Sequence[ToolCall] = (),
+    clock: HouseholdClock | None = None,
 ) -> str | None:
-    """Why a staged call could not be stored, or None when it is executable as-is."""
+    """Why a staged call could not be stored, or None when it is executable as-is.
+
+    A calendar time is checked on ``clock`` and refused without one, because
+    the year bound and the hour the clocks skip are the household's.
+    """
     try:
         parsed: object = json.loads(call.arguments) if call.arguments else {}
         if not isinstance(parsed, dict):
@@ -553,7 +558,9 @@ def _staging_error(
             parse_relay_when(parsed)
             return None
         if call.name == CALENDAR_ADD:
-            parse_add(parsed)
+            if clock is None:
+                return "the household clock is not set, so a calendar time cannot be staged"
+            parse_add(parsed, clock=clock)
             return None
         if call.name == MAIL_FILE:
             parse_file(parsed)

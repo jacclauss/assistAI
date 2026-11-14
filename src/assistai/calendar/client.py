@@ -119,16 +119,14 @@ class CalendarClient:
         self,
         draft: CalendarDraft,
         *,
+        clock: HouseholdClock,
         stamp: datetime | None = None,
-        clock: HouseholdClock | None = None,
     ) -> str:
         """PUT one new event on the configured calendar. Returns a short confirmation.
 
-        The confirmation names the day relative to ``clock``'s today, or to
-        ``stamp`` when no clock is given.
+        The confirmation names the day relative to ``clock``'s today.
         """
         _require_configured(self._settings)
-        zone = ZoneInfo(_zone_name(self._settings))
         moment = stamp if stamp is not None else datetime.now(UTC)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=UTC)
@@ -143,15 +141,12 @@ class CalendarClient:
         try:
             async with asyncio.timeout(TOTAL_SECONDS):
                 collection = await self._collection(http, base_host)
-                await self._put_new(http, collection, base_host, draft, zone, moment)
+                await self._put_new(http, collection, base_host, draft, moment)
         except TimeoutError as exc:
             raise CalendarError("that calendar took too long") from exc
         finally:
             if owns:
                 await http.aclose()
-        if clock is None:
-            created = moment.timestamp()
-            clock = HouseholdClock(zone=zone, now=lambda: created)
         return f"Added {draft.summary!r} for {draft.label(clock)}."
 
     async def _collection(self, http: httpx.AsyncClient, base_host: str) -> str:
@@ -237,13 +232,12 @@ class CalendarClient:
         collection: str,
         base_host: str,
         draft: CalendarDraft,
-        zone: ZoneInfo,
         stamp: datetime,
     ) -> None:
         folder = collection if collection.endswith("/") else collection + "/"
         for _attempt in range(2):
             uid = uuid.uuid4().hex
-            body = render_event(draft, uid=uid, zone=zone, stamp=stamp)
+            body = render_event(draft, uid=uid, stamp=stamp)
             target = urljoin(folder, f"{uid}.ics")
             status, _raw = await self._send(
                 http,

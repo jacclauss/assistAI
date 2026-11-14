@@ -14,10 +14,11 @@ from assistai.calendar.draft import parse_add
 from assistai.calendar.ics import render_event
 from assistai.calendar.parse import events_on
 from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_TODAY, bind_calendar
+from assistai.clock import HouseholdClock
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from tests.agent_fakes import agent, household
-from tests.clock_fakes import chicago, chicago_clock
+from tests.clock_fakes import chicago, chicago_clock, wall
 from tests.fakes import settings, tool_call
 
 _PASSWORD = "app-secret-password"
@@ -367,7 +368,11 @@ async def test_tool_rejects_a_bad_date_and_returns_the_agenda() -> None:
         return _calendars()
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
-    handlers = bind_calendar(_configured(), client=CalendarClient(_configured(), http=http))
+    handlers = bind_calendar(
+        _configured(),
+        client=CalendarClient(_configured(), http=http),
+        clock=chicago_clock(chicago(2026, 9, 22, 9)),
+    )
     with pytest.raises(CalendarError, match="YYYY-MM-DD"):
         await handlers[CALENDAR_TODAY]({"date": "tomorrow"})
     raw = await handlers[CALENDAR_TODAY]({"date": "2026-09-22"})
@@ -480,12 +485,11 @@ def test_a_title_cannot_smuggle_another_event() -> None:
             "description": "note\nSUMMARY:Pwned",
             "location": "Office, room 2",
         },
-        today=date(2026, 9, 24),
+        clock=chicago_clock(chicago(2026, 9, 24, 9)),
     )
     ics = render_event(
         draft,
         uid="abc",
-        zone=ZoneInfo("America/Chicago"),
         stamp=datetime(2026, 9, 24, 12, tzinfo=UTC),
     )
     found = events_on(ics, day=date(2026, 9, 24), zone=ZoneInfo("America/Chicago"))
@@ -499,12 +503,11 @@ def test_a_title_cannot_smuggle_another_event() -> None:
 def test_all_day_end_is_the_last_day() -> None:
     draft = parse_add(
         {"summary": "Trip", "start": "2026-09-22", "end": "2026-09-24"},
-        today=date(2026, 9, 22),
+        clock=chicago_clock(chicago(2026, 9, 22, 9)),
     )
     ics = render_event(
         draft,
         uid="trip",
-        zone=ZoneInfo("America/Chicago"),
         stamp=datetime(2026, 9, 22, tzinfo=UTC),
     )
     assert "DTEND;VALUE=DATE:20260925" in ics
@@ -516,7 +519,10 @@ def test_all_day_end_is_the_last_day() -> None:
 
 def test_add_rejects_a_time_that_is_not_local() -> None:
     with pytest.raises(CalendarError, match="YYYY-MM-DD"):
-        parse_add({"summary": "Dentist", "start": "2026-09-24T15:00Z"}, today=date(2026, 9, 24))
+        parse_add(
+            {"summary": "Dentist", "start": "2026-09-24T15:00Z"},
+            clock=chicago_clock(chicago(2026, 9, 24, 9)),
+        )
 
 
 async def test_create_puts_one_event_on_the_named_calendar() -> None:
@@ -547,7 +553,7 @@ async def test_create_puts_one_event_on_the_named_calendar() -> None:
     client = CalendarClient(_configured(), http=http)
     draft = parse_add(
         {"summary": "Dentist", "start": "2026-09-24T15:00", "end": "2026-09-24T16:00"},
-        today=date(2026, 9, 24),
+        clock=chicago_clock(chicago(2026, 9, 24, 9)),
     )
     message = await client.create(
         draft,
@@ -570,7 +576,9 @@ async def test_calendar_add_stages_until_commit() -> None:
     catalog = builtin_catalog()
     catalog.bind(CALENDAR_ADD, handler)
     surface = ToolBroker(
-        catalog, household(jacob, agent("spouse", "+15555550102")).broker
+        catalog,
+        household(jacob, agent("spouse", "+15555550102")).broker,
+        clock=chicago_clock(chicago(2026, 9, 22, 9)),
     ).for_agent(jacob)
     staged_result = await surface.execute(
         tool_call(
@@ -593,28 +601,36 @@ async def test_calendar_add_stages_until_commit() -> None:
     assert surface.take_staged() == ()
 
 
-def _staging_surface() -> BoundSurface:
+def _staging_surface(clock: HouseholdClock | None) -> BoundSurface:
     async def handler(_arguments: dict[str, Any]) -> str:
         raise AssertionError("a refused add must not reach the calendar")
 
     jacob = agent("jacob", "+15555550101", tools=("calendar_add",))
     catalog = builtin_catalog()
     catalog.bind(CALENDAR_ADD, handler)
-    return ToolBroker(catalog, household(jacob, agent("spouse", "+15555550102")).broker).for_agent(
-        jacob
+    broker = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker, clock=clock
+    )
+    return broker.for_agent(jacob)
+
+
+async def test_a_calendar_add_is_not_staged_without_the_household_clock() -> None:
+    """Without the household clock the year and the skipped hour would be the server's guess."""
+    surface = _staging_surface(None)
+
+    refused = await surface.execute(
+        tool_call(
+            name=CALENDAR_ADD, arguments='{"summary": "Dentist", "start": "2026-09-24T15:00"}'
+        )
     )
 
+    assert "clock is not set" in refused.content
+    assert surface.take_staged() == ()
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "X3-1: a naive start is accepted even when that wall time does not exist; "
-        "fixed by spec 016 commit 10"
-    ),
-)
+
 async def test_add_in_the_spring_gap_is_refused() -> None:
     """2:30 AM on 2027-03-14 never happens in Chicago. Saying so beats guessing an hour."""
-    surface = _staging_surface()
+    surface = _staging_surface(chicago_clock(chicago(2027, 3, 10, 12)))
 
     refused = await surface.execute(
         tool_call(
@@ -623,19 +639,73 @@ async def test_add_in_the_spring_gap_is_refused() -> None:
         )
     )
 
-    assert "does not exist" in refused.content
+    assert (
+        "2:30 AM does not exist on Sunday, March 14, 2027: clocks go from 2:00 to 3:00"
+        in json.loads(refused.content)["message"]
+    )
     assert surface.take_staged() == ()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "X3-7: the ten-year bound uses date.today(), the UTC date on the Pi, which is "
-        "already 2027 at 7:00 PM CST on Dec 31; fixed by spec 016 commit 10"
-    ),
-)
+def test_an_end_in_the_spring_gap_is_refused() -> None:
+    """An end the clocks skip is no more a time than a start the clocks skip."""
+    with pytest.raises(CalendarError, match="2:15 AM does not exist on Sunday, March 14, 2027"):
+        parse_add(
+            {"summary": "Night feed", "start": "2027-03-14T01:30", "end": "2027-03-14T02:15"},
+            clock=chicago_clock(chicago(2027, 3, 10, 12)),
+        )
+
+
+def test_add_in_the_fall_back_hour_says_which_one() -> None:
+    """1:30 AM happens twice on 2026-11-01. The event is the first, and the label says CDT."""
+    clock = chicago_clock(chicago(2026, 10, 30, 12))
+
+    draft = parse_add(
+        {"summary": "Feed the baby", "start": "2026-11-01T01:30", "end": "2026-11-01T01:45"},
+        clock=clock,
+    )
+    ics = render_event(draft, uid="feed", stamp=datetime(2026, 10, 30, 17, tzinfo=UTC))
+
+    assert isinstance(draft.start, datetime)
+    assert wall(draft.start.timestamp()) == "2026-11-01 01:30:00 CDT"
+    assert draft.label(clock) == "Sunday at 1:30 AM CDT (November 1) to 1:45 AM CDT"
+    assert "DTSTART:20261101T063000Z" in ics
+    assert "DTEND:20261101T064500Z" in ics
+
+
+def test_default_end_is_one_real_hour() -> None:
+    """An hour after 1:30 AM CDT on fall-back night is 1:30 AM CST, not 2:30 AM two hours on."""
+    clock = chicago_clock(chicago(2026, 10, 30, 12))
+
+    draft = parse_add({"summary": "Feed the baby", "start": "2026-11-01T01:30"}, clock=clock)
+    ics = render_event(draft, uid="feed", stamp=datetime(2026, 10, 30, 17, tzinfo=UTC))
+
+    assert isinstance(draft.start, datetime) and isinstance(draft.end, datetime)
+    assert draft.end.timestamp() - draft.start.timestamp() == 3600
+    assert wall(draft.end.timestamp()) == "2026-11-01 01:30:00 CST"
+    assert draft.label(clock) == "Sunday at 1:30 AM CDT (November 1) to 1:30 AM CST"
+    assert "DTEND:20261101T073000Z" in ics
+
+
+def test_an_explicit_end_is_compared_as_an_instant() -> None:
+    """Midnight to 2:30 AM on fall-back night is three real hours, and 1:30 to 1:00 is backwards."""
+    clock = chicago_clock(chicago(2026, 10, 30, 12))
+
+    draft = parse_add(
+        {"summary": "Shift", "start": "2026-11-01T00:00", "end": "2026-11-01T02:30"},
+        clock=clock,
+    )
+
+    assert isinstance(draft.start, datetime) and isinstance(draft.end, datetime)
+    assert draft.end.timestamp() - draft.start.timestamp() == 3.5 * 3600
+    with pytest.raises(CalendarError, match="end is before start"):
+        parse_add(
+            {"summary": "Shift", "start": "2026-11-01T01:30", "end": "2026-11-01T01:00"},
+            clock=clock,
+        )
+
+
 async def test_year_bound_uses_the_household_date(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On New Year's Eve evening in Chicago, the household year is still 2026."""
+    """On New Year's Eve at 7:00 PM in Chicago, the household year is still 2026."""
     utc_day = datetime.fromtimestamp(chicago(2026, 12, 31, 19), UTC).date()
 
     class PiDate(date):
@@ -645,7 +715,7 @@ async def test_year_bound_uses_the_household_date(monkeypatch: pytest.MonkeyPatc
             return cls(utc_day.year, utc_day.month, utc_day.day)
 
     monkeypatch.setattr("assistai.calendar.draft.date", PiDate)
-    surface = _staging_surface()
+    surface = _staging_surface(chicago_clock(chicago(2026, 12, 31, 19)))
 
     too_far = await surface.execute(
         tool_call(name=CALENDAR_ADD, arguments='{"summary": "Renew", "start": "2037-01-15T10:00"}')

@@ -6,7 +6,6 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from assistai.calendar.client import Agenda, CalendarClient
 from assistai.calendar.draft import parse_add
@@ -77,26 +76,24 @@ CALENDAR_ADD_SPEC = ToolSpec(
 def bind_calendar(
     settings: Settings,
     *,
+    clock: HouseholdClock,
     client: CalendarClient | None = None,
-    clock: HouseholdClock | None = None,
 ) -> dict[str, Callable[[dict[str, Any]], Awaitable[str]]]:
     """Handler closed over the household calendar. Bound when the channel starts.
 
-    ``clock`` is the household clock that "today" and the day named in a
-    result are read on; without it, the calendar's own zone and the wall clock.
+    ``clock`` is the household clock that "today", the day named in a
+    result, and the times of an added event are read on. There is no
+    fallback: the wall clock's date is the UTC date on the Pi in the evening.
     """
     calendar = client or CalendarClient(settings)
 
     async def today(arguments: dict[str, Any]) -> str:
         day = _day(arguments.get("date"))
-        if day is None and clock is not None:
-            day = clock.today()
-        agenda = await calendar.agenda(day)
-        on = clock or HouseholdClock(zone=ZoneInfo(agenda.timezone))
-        return json.dumps(_payload(agenda, clock=on), ensure_ascii=False)
+        agenda = await calendar.agenda(day if day is not None else clock.today())
+        return json.dumps(_payload(agenda, clock=clock), ensure_ascii=False)
 
     async def add(arguments: dict[str, Any]) -> str:
-        draft = parse_add(arguments)
+        draft = parse_add(arguments, clock=clock)
         return await calendar.create(draft, clock=clock)
 
     return {CALENDAR_TODAY: today, CALENDAR_ADD: add}

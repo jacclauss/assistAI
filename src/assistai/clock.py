@@ -490,6 +490,22 @@ def require_representable(instant: float, zone: ZoneInfo) -> None:
         raise JobError("that time is too far out to schedule") from exc
 
 
+def wall_time(moment: dt.datetime, zone: ZoneInfo) -> dt.datetime:
+    """The aware time a floating calendar time names on the household's wall.
+
+    A time the spring change skips is refused with ``resolve_at``'s reason,
+    so a job and a calendar add say the same thing about the same hour. A
+    time the fall-back hour repeats is its first occurrence: an event, unlike
+    a reminder, may be in the past, so "the next one still ahead" is no rule
+    for it. An aware time is moved to ``zone``, as ``in_zone`` moves it.
+    """
+    if moment.tzinfo is not None:
+        return moment.astimezone(zone)
+    first, second = _readings(moment, zone)
+    _refuse_skipped(first, second, zone)
+    return first
+
+
 def in_zone(moment: dt.datetime, zone: ZoneInfo) -> dt.datetime:
     """A calendar time on the household's wall: a floating time is read there, an aware one moved.
 
@@ -572,7 +588,11 @@ def _local(instant: float, zone: ZoneInfo) -> dt.datetime:
 
 
 def _walls(day: dt.date, at: LocalAt, zone: ZoneInfo) -> tuple[dt.datetime, dt.datetime]:
-    naive = dt.datetime.combine(day, dt.time(at.hour, at.minute))
+    return _readings(dt.datetime.combine(day, dt.time(at.hour, at.minute)), zone)
+
+
+def _readings(naive: dt.datetime, zone: ZoneInfo) -> tuple[dt.datetime, dt.datetime]:
+    """A floating time read with the offset before and after a change, which differ only at one."""
     return naive.replace(tzinfo=zone, fold=0), naive.replace(tzinfo=zone, fold=1)
 
 
@@ -584,20 +604,30 @@ def _latest(day: dt.date, at: LocalAt, zone: ZoneInfo) -> float:
 
 def _occurrence(day: dt.date, at: LocalAt, zone: ZoneInfo, *, earliest: float) -> float:
     first, second = _walls(day, at, zone)
-    before, after = first.utcoffset(), second.utcoffset()
-    if before is None or after is None or before == after:
+    _refuse_skipped(first, second, zone)
+    if not _repeated(first):
         return first.timestamp()
-    if before < after:
-        start, end = _jump(first, second, zone, before=before, after=after)
-        raise JobError(
-            f"{_clock_text(first)} does not exist on {_date_text(day, year=True)}: "
-            f"clocks go from {start} to {end}. Name another time."
-        )
     if at.fold == 1:
         return second.timestamp()
     if at.fold is None and first.timestamp() < earliest:
         return second.timestamp()
     return first.timestamp()
+
+
+def _refuse_skipped(first: dt.datetime, second: dt.datetime, zone: ZoneInfo) -> None:
+    """Refuse a wall time the spring change skips, naming the day and the jump.
+
+    Read with the offset before the change it would silently become an hour
+    the person did not say, so they are asked for another.
+    """
+    before, after = first.utcoffset(), second.utcoffset()
+    if before is None or after is None or before >= after:
+        return
+    start, end = _jump(first, second, zone, before=before, after=after)
+    raise JobError(
+        f"{_clock_text(first)} does not exist on {_date_text(first.date(), year=True)}: "
+        f"clocks go from {start} to {end}. Name another time."
+    )
 
 
 def _jump(

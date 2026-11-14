@@ -129,7 +129,14 @@ of a single-box household appliance, not something the broker can fix.
 The shared calendar is the exception: one Apple ID that can see that calendar,
 one app-specific password, and the calendar's display name. The model does
 not choose another calendar. A read lists one day. Adding an event stages
-and waits for a yes; it does not invite anyone. "Today" is a day in `ASSISTAI_TIMEZONE`. iCloud is asked to expand
+and waits for a yes; it does not invite anyone. "Today" is a day in `ASSISTAI_TIMEZONE`. An added event's times
+are read on the household clock when it is staged: a time the spring change
+skips is refused with the reason a job gets ("2:30 AM does not exist on
+Sunday, March 14, 2027: clocks go from 2:00 to 3:00"), a time the fall-back
+hour repeats is the first one and the preview names it ("1:30 AM CDT"), the
+default end is one real hour later, and the ten-year bound is counted from
+the household's date, not the UTC one. The event is written as those
+instants. iCloud is asked to expand
 recurrences into that local day. Event text is untrusted, because an invite is
 attacker-controlled text. The app-specific password is not stored in the repo
 or in `.env`. The Mac gateway reads it from the Keychain; the Pi reads a

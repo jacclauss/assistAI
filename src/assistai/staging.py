@@ -424,7 +424,7 @@ def _job_reschedule_line(call: ToolCall, *, words: _Words) -> str | None:
 
 
 def _format_calendar_add(call: ToolCall, *, tainted: bool, words: _Words) -> str:
-    draft = _calendar_draft(call)
+    draft = _calendar_draft(call, clock=words.clock)
     if draft is None:
         return _generic_preview(call, tainted=tainted, words=words)
     lines = [
@@ -443,18 +443,18 @@ def _format_calendar_add(call: ToolCall, *, tainted: bool, words: _Words) -> str
 
 
 def _calendar_add_line(call: ToolCall, *, words: _Words) -> str | None:
-    draft = _calendar_draft(call)
+    draft = _calendar_draft(call, clock=words.clock)
     if draft is None:
         return None
     return f"Add {draft.summary!r} {draft.label(words.clock)}"
 
 
-def _calendar_draft(call: ToolCall) -> CalendarDraft | None:
+def _calendar_draft(call: ToolCall, *, clock: HouseholdClock) -> CalendarDraft | None:
     try:
         parsed: object = json.loads(call.arguments) if call.arguments else {}
         if not isinstance(parsed, dict):
             return None
-        return parse_add(parsed)
+        return parse_add(parsed, clock=clock)
     except (CalendarError, json.JSONDecodeError):
         return None
 
