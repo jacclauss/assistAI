@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from icalendar import Calendar, Event
 
 from assistai.calendar.draft import CalendarDraft
+from assistai.clock import in_zone
 from assistai.errors import CalendarError
 
 
@@ -24,8 +25,8 @@ def render_event(draft: CalendarDraft, *, uid: str, zone: ZoneInfo, stamp: datet
         event.add("dtstart", _day(draft.start))
         event.add("dtend", _day(draft.end) + timedelta(days=1))
     elif isinstance(draft.start, datetime) and isinstance(draft.end, datetime):
-        event.add("dtstart", _aware(draft.start, zone).astimezone(UTC))
-        event.add("dtend", _aware(draft.end, zone).astimezone(UTC))
+        event.add("dtstart", in_zone(draft.start, zone).astimezone(UTC))
+        event.add("dtend", in_zone(draft.end, zone).astimezone(UTC))
     else:
         raise CalendarError("start needs a time")
     if draft.location:
@@ -43,9 +44,3 @@ def _day(value: date | datetime) -> date:
     if isinstance(value, datetime):
         return value.date()
     return value
-
-
-def _aware(moment: datetime, zone: ZoneInfo) -> datetime:
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=zone)
-    return moment.astimezone(zone)

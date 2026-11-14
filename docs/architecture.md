@@ -214,6 +214,12 @@ Properties that matter:
   time is not staged at all. A proposal stored before `at` and `delay`
   existed is refused at the yes with "ask again", since its preview no
   longer describes what this build would run.
+- Every time in a preview is in the server's words on the household clock.
+  A job or relay, alone or in a bundle, names its first run ("First run:
+  tomorrow at 8:00 AM (Saturday, October 31)", or "2 hours after you reply
+  yes" for a `delay`) and its repeat ("every day at 8:00 AM", or "once"). A
+  reschedule names the next run the yes keeps, worked out from the job it
+  moves. A calendar add names its day relative to today.
 
 ## Jobs
 
@@ -315,6 +321,20 @@ sticks, so a failed write is retried instead of the message; only a
 restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
+
+Every household time the model or the person reads is put into words by
+`clock.py`, and only there; `tests/test_invariants.py` fails on a
+`strftime`, `fromtimestamp`, or `replace(tzinfo=` elsewhere that does not
+name UTC. No Unix number reaches the model. `job_create` returns
+`first_run` ("Thursday, December 10 at 8:00 AM"), `repeats`, and a `say`
+sentence for every job, not only reminders. `job_list` returns `next_run`,
+`repeats`, and `ends` for a watch. `job_reschedule` returns `next_run`,
+`repeats`, and a `say` sentence, and `job_cancel`'s `say` names the run
+that will not happen. After a yes the person is shown those `say`
+sentences. `calendar_today` adds `day`, the date with its weekday and
+"today", "tomorrow", or "yesterday", so a date read in the wrong zone is
+visible. The system prompt's clock and `get_time` give the local wall time
+and weekday from the same module.
 
 Each job row stores its schedule in the household zone
 ([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)): the

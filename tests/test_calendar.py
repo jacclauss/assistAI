@@ -17,7 +17,7 @@ from assistai.calendar.tools import CALENDAR_ADD, CALENDAR_TODAY, bind_calendar
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from tests.agent_fakes import agent, household
-from tests.clock_fakes import chicago
+from tests.clock_fakes import chicago, chicago_clock
 from tests.fakes import settings, tool_call
 
 _PASSWORD = "app-secret-password"
@@ -381,6 +381,35 @@ async def test_tool_rejects_a_bad_date_and_returns_the_agenda() -> None:
     assert payload["events"][0]["end"] == "2026-09-22"
 
 
+async def test_calendar_today_names_the_day_relative_to_today() -> None:
+    """At 8 PM in Chicago the UTC date is tomorrow; the result says so, not passing as today."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "REPORT":
+            return _report()
+        if request.url.path == "/":
+            return _principal()
+        if request.url.path.endswith("/principal/"):
+            return _home()
+        return _calendars()
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    handlers = bind_calendar(
+        _configured(),
+        client=CalendarClient(_configured(), http=http),
+        clock=chicago_clock(chicago(2026, 9, 22, 20)),
+    )
+    today = json.loads(await handlers[CALENDAR_TODAY]({}))
+    utc_date = json.loads(await handlers[CALENDAR_TODAY]({"date": "2026-09-23"}))
+    earlier = json.loads(await handlers[CALENDAR_TODAY]({"date": "2026-09-21"}))
+    await http.aclose()
+
+    assert today["date"] == "2026-09-22"
+    assert today["day"] == "today, Tuesday, September 22"
+    assert utc_date["day"] == "tomorrow, Wednesday, September 23"
+    assert earlier["day"] == "yesterday, Monday, September 21"
+
+
 def test_builtin_catalog_marks_calendar_untrusted_and_not_web() -> None:
     meta = builtin_catalog().meta(CALENDAR_TODAY)
     assert meta.trusted is False
@@ -520,9 +549,13 @@ async def test_create_puts_one_event_on_the_named_calendar() -> None:
         {"summary": "Dentist", "start": "2026-09-24T15:00", "end": "2026-09-24T16:00"},
         today=date(2026, 9, 24),
     )
-    message = await client.create(draft, stamp=datetime(2026, 9, 24, tzinfo=UTC))
+    message = await client.create(
+        draft,
+        stamp=datetime(2026, 9, 24, 14, tzinfo=UTC),
+        clock=chicago_clock(chicago(2026, 9, 24, 9)),
+    )
     await http.aclose()
-    assert message == "Added 'Dentist' for 2026-09-24 15:00-16:00 (household local time)."
+    assert message == "Added 'Dentist' for today at 3:00 PM to 4:00 PM."
     assert any(request.method == "PUT" for request in seen)
 
 

@@ -16,6 +16,7 @@ from assistai.mail.scope import GMAIL_SCOPE, assert_scope_allowed
 from assistai.mail.tools import MAIL_FILE, MAIL_INBOX
 from assistai.staging import format_proposal
 from tests.agent_fakes import agent, household
+from tests.clock_fakes import chicago, chicago_clock
 from tests.fakes import settings, tool_call
 
 _SECRET = "client-secret"
@@ -483,6 +484,7 @@ def test_file_preview_lists_every_message() -> None:
             ),
         ),
         tainted=True,
+        clock=chicago_clock(chicago(2026, 10, 30, 15)),
     )
     assert "Weekly" in preview
     assert "Receipt" in preview

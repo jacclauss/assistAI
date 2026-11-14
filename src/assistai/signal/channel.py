@@ -38,7 +38,13 @@ from assistai.signal.envelopes import InboundText, parse_inbound
 from assistai.signal.numbers import is_uuid
 from assistai.signal.policy import AccessPolicy
 from assistai.signal.ratelimit import RateLimiter
-from assistai.staging import Proposal, format_executed, format_proposal, parse_decision
+from assistai.staging import (
+    JobFinder,
+    Proposal,
+    format_executed,
+    format_proposal,
+    parse_decision,
+)
 from assistai.store import Store
 
 log = structlog.get_logger(__name__)
@@ -112,7 +118,8 @@ class SignalChannel:
         broker.bind("get_time", bind_clock(self._timezone))
         # A staged time is fixed on the clock the job handlers read, so the
         # date in the preview is the date the yes runs.
-        broker.use_clock(household_clock(self._timezone))
+        self._clock = household_clock(self._timezone)
+        broker.use_clock(self._clock)
         self._histories: dict[str, list[Message]] = {}
         self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}
@@ -424,7 +431,12 @@ class SignalChannel:
                 proposal: Proposal | Literal["keep"] = "keep"
                 if staged:
                     now = time.time()
-                    preview = format_proposal(staged, tainted=surface.tainted)
+                    preview = format_proposal(
+                        staged,
+                        tainted=surface.tainted,
+                        clock=self._clock,
+                        jobs=self._job_finder(agent.name),
+                    )
                     if surface.saved_reminders:
                         preview = reply + "\n\n" + preview
                     # The preview quotes staged prompts and relay bodies; in a
@@ -565,6 +577,14 @@ class SignalChannel:
                 return
         log.info("staging.discarded", agent=agent.name)
         await self._safe_send(inbound.sender, _DISCARDED)
+
+    def _job_finder(self, agent_name: str) -> JobFinder:
+        """This person's jobs, so a reschedule preview names the run the yes keeps."""
+
+        def find(*, name: str | None, job_id: str | None) -> Job | None:
+            return self._store.find_job(agent_name, name=name, job_id=job_id)
+
+        return find
 
     def _cancel_turn_jobs(self, surface: BoundSurface) -> None:
         """Drop reminders saved during a turn the person will be told failed.

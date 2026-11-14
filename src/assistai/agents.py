@@ -9,12 +9,13 @@ Signal DM; an organizer process is not a Signal identity.
 from __future__ import annotations
 
 import re
+import time
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from assistai.clock import HouseholdClock, local_text, weekday_of
 from assistai.config import Settings
 from assistai.errors import HouseholdConfigError
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
@@ -188,8 +189,10 @@ def _local_clock(timezone: str) -> str:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError:
         return ""
-    local = datetime.now(zone).strftime("%Y-%m-%dT%H:%M:%S")
-    return f"Local time now is {local} in {timezone}. "
+    instant = time.time()
+    clock = HouseholdClock(zone=zone, now=lambda: instant)
+    local = local_text(instant, clock=clock)
+    return f"Local time now is {local}, a {weekday_of(clock.today())}, in {timezone}. "
 
 
 def resolve_household_path(settings: Settings) -> Path:

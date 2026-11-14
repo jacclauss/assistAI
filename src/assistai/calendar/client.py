@@ -16,6 +16,7 @@ from assistai.bounded import ACCEPT_ENCODING, BodyTooLargeError, BodyUnreadableE
 from assistai.calendar.draft import CalendarDraft
 from assistai.calendar.ics import render_event
 from assistai.calendar.parse import CalendarEvent, events_on
+from assistai.clock import HouseholdClock, in_zone
 from assistai.config import Settings
 from assistai.errors import CalendarError, ResearchError
 from assistai.research.ssrf import check_url
@@ -81,11 +82,9 @@ class CalendarClient:
         """Events overlapping ``day``. Omitted day means today in the household zone."""
         _require_configured(self._settings)
         zone = ZoneInfo(_zone_name(self._settings))
-        moment = now if now is not None else datetime.now(zone)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=zone)
+        moment = in_zone(now if now is not None else datetime.now(zone), zone)
         if day is None:
-            day = moment.astimezone(zone).date()
+            day = moment.date()
         start = datetime.combine(day, time.min, tzinfo=zone)
         end = start + timedelta(days=1)
         base_host = _configured_host(self._settings.caldav_base_url)
@@ -116,8 +115,18 @@ class CalendarClient:
             truncated=len(events) > MAX_EVENTS,
         )
 
-    async def create(self, draft: CalendarDraft, *, stamp: datetime | None = None) -> str:
-        """PUT one new event on the configured calendar. Returns a short confirmation."""
+    async def create(
+        self,
+        draft: CalendarDraft,
+        *,
+        stamp: datetime | None = None,
+        clock: HouseholdClock | None = None,
+    ) -> str:
+        """PUT one new event on the configured calendar. Returns a short confirmation.
+
+        The confirmation names the day relative to ``clock``'s today, or to
+        ``stamp`` when no clock is given.
+        """
         _require_configured(self._settings)
         zone = ZoneInfo(_zone_name(self._settings))
         moment = stamp if stamp is not None else datetime.now(UTC)
@@ -140,7 +149,10 @@ class CalendarClient:
         finally:
             if owns:
                 await http.aclose()
-        return f"Added {draft.summary!r} for {draft.label()}."
+        if clock is None:
+            created = moment.timestamp()
+            clock = HouseholdClock(zone=zone, now=lambda: created)
+        return f"Added {draft.summary!r} for {draft.label(clock)}."
 
     async def _collection(self, http: httpx.AsyncClient, base_host: str) -> str:
         if self._calendar_url is not None:

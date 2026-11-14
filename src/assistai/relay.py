@@ -22,9 +22,13 @@ from assistai.clock import (
     EVERY_DAYS_SCHEMA,
     EVERY_MINUTES_SCHEMA,
     Delay,
+    HouseholdClock,
     LocalAt,
+    resolve_at,
     say_at,
     say_duration,
+    say_repeat,
+    say_when,
 )
 from assistai.errors import JobError, StoreError
 from assistai.errors import RelayError as RelayError
@@ -212,13 +216,22 @@ def parse_relay_when(arguments: dict[str, Any]) -> RelayWhen | None:
     )
 
 
-def when_phrase(when: RelayWhen) -> str:
-    """Preview text. A staged at already carries its date; a delay counts from the yes."""
+def when_phrase(when: RelayWhen, *, clock: HouseholdClock) -> str:
+    """Preview text. A staged at already carries its date; a delay counts from the yes.
+
+    A named time that cannot be resolved any more, because it has passed,
+    is shown as the person named it rather than not at all.
+    """
     if isinstance(when.first, Delay):
         return f"{say_duration(when.first.seconds)} after you reply yes"
     if isinstance(when.first, LocalAt):
-        said = say_at(when.first)
-        return f"on {said}" if when.first.date is not None else said
+        try:
+            return say_when(resolve_at(when.first, clock=clock), clock=clock)
+        except JobError:
+            return say_at(when.first)
+    if when.every_minutes is not None:
+        # A minute repeat with no first time starts one gap after the yes.
+        return f"{say_duration(when.every_minutes * 60)} after you reply yes"
     return "as soon as you reply yes"
 
 
@@ -357,10 +370,10 @@ def bind_relay(
         say = describe_saved_reminder(
             prompt=body,
             fires_at=first_run,
-            now=now,
-            timezone=timezone,
+            clock=clock,
             audience="the other phone",
             name=job.name,
+            repeats=say_repeat(schedule, clock=clock) if schedule.repeats else None,
         )
         return json.dumps(
             {"ok": True, "scheduled": True, "id": job.id, "name": job.name, "say": say},

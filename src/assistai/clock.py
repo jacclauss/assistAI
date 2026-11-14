@@ -446,6 +446,46 @@ def say_day(day: dt.date, *, clock: HouseholdClock) -> str:
     return text
 
 
+def say_span(start: float, end: float, *, clock: HouseholdClock) -> str:
+    """A timed event as a person reads it: the start in full, and the end alone on the same day.
+
+    Each end carries the zone abbreviation when the fall-back hour shows its
+    clock time twice, the same as ``say_when``.
+    """
+    end_local = _local(end, clock.zone)
+    if end_local.date() == _local(start, clock.zone).date():
+        return f"{say_when(start, clock=clock)} to {_clock_text(end_local)}"
+    return f"{say_when(start, clock=clock)} to {say_when(end, clock=clock)}"
+
+
+def local_text(instant: float, *, clock: HouseholdClock) -> str:
+    """An instant as the household's wall clock shows it, ``YYYY-MM-DDTHH:MM:SS``.
+
+    This is the reading ``get_time`` and the system prompt give the model,
+    so it is never the UTC wall time with the zone name beside it.
+    """
+    return _local(instant, clock.zone).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def require_representable(instant: float, zone: ZoneInfo) -> None:
+    """Refuse an instant the zone cannot show, before anything is saved for it."""
+    try:
+        _local(instant, zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise JobError("that time is too far out to schedule") from exc
+
+
+def in_zone(moment: dt.datetime, zone: ZoneInfo) -> dt.datetime:
+    """A calendar time on the household's wall: a floating time is read there, an aware one moved.
+
+    A floating time is what the model sends and what an invite without a
+    zone holds; both mean the household clock, not UTC.
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=zone)
+    return moment.astimezone(zone)
+
+
 def local_reading(instant: float, *, clock: HouseholdClock) -> tuple[str, str]:
     """An instant as ISO-8601 local time and its UTC offset, for operator logs.
 

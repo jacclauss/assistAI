@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from assistai.calendar.parse import MAX_DESCRIPTION, MAX_LOCATION, MAX_SUMMARY
+from assistai.clock import HouseholdClock, in_zone, say_day, say_span
 from assistai.errors import CalendarError
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -27,21 +28,26 @@ class CalendarDraft:
     location: str = ""
     description: str = ""
 
-    def label(self) -> str:
+    def label(self, clock: HouseholdClock) -> str:
+        """When the event is, in the household's words: the day relative to today, and the hour.
+
+        A start in the hour the clocks repeat names its zone abbreviation,
+        so the person can see which of the two it is.
+        """
         if self.all_day:
             start_day = _as_date(self.start)
             end_day = _as_date(self.end)
             if start_day == end_day:
-                return f"{start_day.isoformat()} (all day)"
-            return f"{start_day.isoformat()} through {end_day.isoformat()} (all day)"
+                return f"{say_day(start_day, clock=clock)} (all day)"
+            return (
+                f"{say_day(start_day, clock=clock)} through "
+                f"{say_day(end_day, clock=clock)} (all day)"
+            )
         if not isinstance(self.start, datetime) or not isinstance(self.end, datetime):
             raise CalendarError("start needs a time")
-        start_text = self.start.strftime("%Y-%m-%d %H:%M")
-        if self.start.date() == self.end.date():
-            end_text = self.end.strftime("%H:%M")
-        else:
-            end_text = self.end.strftime("%Y-%m-%d %H:%M")
-        return f"{start_text}-{end_text} (household local time)"
+        start = in_zone(self.start, clock.zone).timestamp()
+        end = in_zone(self.end, clock.zone).timestamp()
+        return say_span(start, end, clock=clock)
 
 
 def parse_add(arguments: dict[str, Any], *, today: date | None = None) -> CalendarDraft:

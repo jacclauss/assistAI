@@ -16,7 +16,6 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -37,7 +36,10 @@ from assistai.clock import (
     local_day,
     next_slot,
     resolve_at,
+    say_repeat,
+    say_when,
 )
+from assistai.clock import require_representable as _require_in_zone
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
 from assistai.relay import active_agent, active_taint
@@ -862,49 +864,55 @@ def bind_jobs(
         if saved is None:
             raise last_error if last_error is not None else StoreError("job could not be saved")
         job = saved
+        words = _schedule_in_words(job, clock=clock)
         payload: dict[str, object] = {
             "ok": True,
             "id": job.id,
             "name": job.name,
             "kind": job.kind,
             **_repeat_fields(spec.every_days, spec.every_minutes),
-            "next_run_at": job.next_run_at,
-            "fires_at_local": _local_stamp(job.next_run_at, timezone),
-            "local_now": _local_stamp(now, timezone),
+            "first_run": say_when(job.next_run_at, clock=clock),
+            "repeats": say_repeat(words, clock=clock),
             "once": job.once,
             "verbatim": job.verbatim,
         }
+        if job.expires_at is not None:
+            payload["ends"] = say_when(job.expires_at, clock=clock)
         if job.verbatim:
             payload["say"] = describe_saved_reminder(
                 prompt=job.prompt,
                 fires_at=job.next_run_at,
-                now=now,
-                timezone=timezone,
+                clock=clock,
                 name=job.name,
+                repeats=say_repeat(words, clock=clock) if words.repeats else None,
             )
             payload["note"] = (
                 "The person is sent the say sentence ahead of your reply. "
                 "Do not restate the reminder or its time; answer anything else they asked."
             )
+        else:
+            payload["say"] = describe_saved_job(job, clock=clock)
         return json.dumps(payload, ensure_ascii=False)
 
     async def list_jobs(_arguments: dict[str, Any]) -> str:
         agent = active_agent()
+        clock = household_clock(timezone)
         jobs = store.list_jobs(agent.name)
-        payload = [
-            {
+        payload: list[dict[str, object]] = []
+        for job in jobs:
+            entry: dict[str, object] = {
                 "id": job.id,
                 "name": job.name,
                 "kind": job.kind,
-                "every_seconds": job.every_seconds,
-                "next_run_at": job.next_run_at,
-                "expires_at": job.expires_at,
+                "next_run": say_when(job.next_run_at, clock=clock),
+                "repeats": say_repeat(_schedule_in_words(job, clock=clock), clock=clock),
                 "once": job.once,
                 "verbatim": job.verbatim,
                 "relay": job.relay,
             }
-            for job in jobs
-        ]
+            if job.expires_at is not None:
+                entry["ends"] = say_when(job.expires_at, clock=clock)
+            payload.append(entry)
         return json.dumps({"jobs": payload}, ensure_ascii=False)
 
     async def cancel(arguments: dict[str, Any]) -> str:
@@ -913,8 +921,20 @@ def bind_jobs(
         job = store.find_job(agent.name, name=name, job_id=job_id)
         if job is None:
             raise JobError("no matching job")
-        store.cancel_job(job.id, at=_now())
-        return json.dumps({"ok": True, "id": job.id, "name": job.name}, ensure_ascii=False)
+        clock = household_clock(timezone)
+        store.cancel_job(job.id, at=clock.now())
+        return json.dumps(
+            {
+                "ok": True,
+                "id": job.id,
+                "name": job.name,
+                "say": (
+                    f"Cancelled {job.name!r}. "
+                    f"Its next run, {say_when(job.next_run_at, clock=clock)}, will not happen."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     async def reschedule(arguments: dict[str, Any]) -> str:
         spec = parse_reschedule(arguments)
@@ -924,7 +944,7 @@ def bind_jobs(
             raise JobError("no matching job")
         check_reschedule(job, spec)
         clock = household_clock(timezone)
-        schedule, every_seconds = _rescheduled(job, spec, clock=clock)
+        schedule, every_seconds = rescheduled(job, spec, clock=clock)
         next_run_at = schedule.anchor_at
         require_representable(next_run_at, timezone)
         if not store.reschedule_job(
@@ -934,13 +954,18 @@ def bind_jobs(
             schedule=schedule,
         ):
             raise JobError("no matching job")
+        next_run = say_when(next_run_at, clock=clock)
+        repeats = say_repeat(schedule, clock=clock)
+        then = f", then {repeats}" if schedule.repeats else ""
         return json.dumps(
             {
                 "ok": True,
                 "id": job.id,
                 "name": job.name,
                 **_repeat_fields(schedule.every_days, _minutes_of(schedule)),
-                "next_run_at": next_run_at,
+                "next_run": next_run,
+                "repeats": repeats,
+                "say": f"Moved {job.name!r}: next run {next_run}{then}.",
             },
             ensure_ascii=False,
         )
@@ -953,8 +978,11 @@ def bind_jobs(
     }
 
 
-def _rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tuple[Schedule, int]:
+def rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tuple[Schedule, int]:
     """The schedule a reschedule stores, and the gap written beside it.
+
+    The preview calls this too, so the next run it names is the one the
+    yes stores.
 
     Only a new repeat leaves the next run where it is and re-anchors the
     grid on it, so moving the December 7 reminder to weekly keeps December 7
@@ -1033,28 +1061,35 @@ def describe_saved_reminder(
     *,
     prompt: str,
     fires_at: float,
-    now: float,
-    timezone: str,
+    clock: HouseholdClock,
     audience: str = "you",
     name: str | None = None,
+    repeats: str | None = None,
 ) -> str:
-    """The sentence the person sees. The clock is the server's, not the model's."""
-    require_representable(fires_at, timezone)
-    require_representable(now, timezone)
-    zone = ZoneInfo(timezone)
-    when = datetime.fromtimestamp(fires_at, zone)
-    current = datetime.fromtimestamp(now, zone)
-    clock = when.strftime("%I:%M %p").lstrip("0")
-    if when.date() == current.date():
-        when_text = f"{clock} today"
-    elif (when.date() - current.date()).days == 1:
-        when_text = f"{clock} tomorrow"
-    else:
-        when_text = f"{when.strftime('%A, %B')} {when.day} at {clock}"
-    sentence = f'I will text {audience} at {when_text}: "{prompt}"'
+    """The sentence the person sees. The clock is the server's, not the model's.
+
+    The time is spelled "8:00 AM" so the reply check, which drops a model
+    answer naming any other clock time, reads the same time here.
+    """
+    require_representable(fires_at, clock.zone.key)
+    when = say_when(fires_at, clock=clock)
+    then = f", then {repeats}" if repeats else ""
+    sentence = f'I will text {audience} {when}{then}: "{prompt}"'
     if name:
         return f"{sentence}\nName: {name}"
     return sentence
+
+
+def describe_saved_job(job: Job, *, clock: HouseholdClock) -> str:
+    """What a confirmed digest or watch will do, in the server's words: its first run and repeat."""
+    kind = "schedule" if job.kind == "schedule" else "watch"
+    words = _schedule_in_words(job, clock=clock)
+    then = f", then {say_repeat(words, clock=clock)}" if words.repeats else ", once"
+    ends = f", ending {say_when(job.expires_at, clock=clock)}" if job.expires_at is not None else ""
+    return (
+        f"Created {kind} {job.name!r}: first run "
+        f"{say_when(job.next_run_at, clock=clock)}{then}{ends}."
+    )
 
 
 def require_representable(moment: float, timezone: str) -> None:
@@ -1063,15 +1098,27 @@ def require_representable(moment: float, timezone: str) -> None:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError as exc:
         raise JobError("the household timezone is not configured") from exc
+    _require_in_zone(moment, zone)
+
+
+def _schedule_in_words(job: Job, *, clock: HouseholdClock) -> Schedule:
+    """The schedule a job is described by, read from its gap when no build has stored one yet.
+
+    A row an older image wrote is described the way the next start will
+    fill it in, so a listing never falls back to a number of seconds.
+    """
     try:
-        datetime.fromtimestamp(moment, zone)
-    except (OSError, OverflowError, ValueError) as exc:
-        raise JobError("that time is too far out to schedule") from exc
-
-
-def _local_stamp(moment: float, timezone: str) -> str:
-    require_representable(moment, timezone)
-    return datetime.fromtimestamp(moment, ZoneInfo(timezone)).strftime("%Y-%m-%dT%H:%M:%S")
+        schedule = job.schedule()
+    except JobError:
+        schedule = None
+    if schedule is not None:
+        return schedule
+    return schedule_from_seconds(
+        zone=clock.zone,
+        first_run=job.next_run_at,
+        every_seconds=job.every_seconds,
+        once=job.once,
+    )
 
 
 def _parse_ttl(raw: object, *, kind: JobKind, every_seconds: int) -> int | None:

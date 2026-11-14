@@ -2836,13 +2836,6 @@ async def test_a_minute_repeat_needs_at_to_become_daily(
     assert after == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "X3-3: job_list hands the model next_run_at as a Unix float to convert; "
-        "fixed by spec 016 commit 8"
-    ),
-)
 async def test_job_list_reports_local_time_not_unix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2859,6 +2852,81 @@ async def test_job_list_reports_local_time_not_unix(
     assert "December 10" in raw
     assert "8:00 AM" in raw
     store.close()
+
+
+async def test_create_and_cancel_results_say_the_run_in_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A digest's yes and a cancel's yes each name the run, so the person sees what changed."""
+    from assistai.staging import format_executed
+
+    store = Store(tmp_path / "assistai.sqlite")
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    handlers = bind_jobs(store, timezone="America/Chicago")
+    create = ToolCall(
+        id="c1",
+        name="job_create",
+        arguments=json.dumps(
+            {
+                "kind": "schedule",
+                "name": "denver flights",
+                "prompt": "Check flight prices to Denver.",
+                "every_days": 1,
+                "at": {"date": "2026-12-09", "hour": 7},
+            }
+        ),
+    )
+    cancel = ToolCall(id="c2", name="job_cancel", arguments='{"name": "denver flights"}')
+
+    with using_agent(agent("jacob", "+15555550101")):
+        created = await handlers["job_create"](json.loads(create.arguments))
+        cancelled = await handlers["job_cancel"](json.loads(cancel.arguments))
+    store.close()
+
+    result = json.loads(created)
+    assert _unix_numbers(result) == []
+    assert {"next_run_at", "fires_at_local", "local_now"}.isdisjoint(result)
+    assert result["first_run"] == "Wednesday, December 9 at 7:00 AM"
+    assert result["repeats"] == "every day at 7:00 AM"
+    assert format_executed([(create, created), (cancel, cancelled)]) == (
+        "Created schedule 'denver flights': first run Wednesday, December 9 at 7:00 AM, "
+        "then every day at 7:00 AM.\n"
+        "Cancelled 'denver flights'. Its next run, Wednesday, December 9 at 7:00 AM, "
+        "will not happen."
+    )
+
+
+async def test_reschedule_result_names_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the mgmplus reminder to 9 says when it next runs, and the yes shows the same words."""
+    from assistai.staging import format_executed
+
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(_daily_reminder(chicago(2026, 12, 10, 8)))
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 10, 30, 21, 12)))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+    call = ToolCall(
+        id="c1",
+        name="job_reschedule",
+        arguments='{"name": "mgmplus cancel reminder", "at": {"hour": 9}}',
+    )
+
+    with using_agent(agent("jacob", "+15555550101")):
+        raw = await reschedule(json.loads(call.arguments))
+    store.close()
+
+    result = json.loads(raw)
+    assert _unix_numbers(result) == []
+    assert "next_run_at" not in result
+    assert result["next_run"] == "Thursday, December 10 at 9:00 AM"
+    assert result["repeats"] == "every day at 9:00 AM"
+    said = (
+        "Moved 'mgmplus cancel reminder': next run Thursday, December 10 at 9:00 AM, "
+        "then every day at 9:00 AM."
+    )
+    assert result["say"] == said
+    assert format_executed([(call, raw)]) == said
 
 
 async def test_a_reminder_at_one_forty_after_fall_back_is_twenty_minutes_away(

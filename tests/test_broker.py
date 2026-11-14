@@ -396,7 +396,7 @@ async def test_a_verbatim_reminder_is_saved_without_a_yes(
     assert created.prompt == "Don't forget to put the cleaner in the pool."
     assert created.next_run_at == pytest.approx(start.timestamp())
     assert surface.saved_reminders
-    assert "8:00 AM today" in surface.saved_reminders[0]
+    assert "today at 8:00 AM" in surface.saved_reminders[0]
     store.close()
 
 
@@ -506,12 +506,14 @@ async def test_a_delay_is_counted_by_the_server(
     )
 
     assert saved["ok"] is True
-    assert saved["fires_at_local"] == "2026-10-18T20:55:00"
+    assert saved["first_run"] == "today at 8:55 PM"
+    assert "fires_at_local" not in saved
+    assert "next_run_at" not in saved
     created = store.find_job("jacob", name="check")
     assert created is not None
     assert created.next_run_at == pytest.approx(now.timestamp() + 120)
     assert surface.saved_reminders == [
-        'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check'
+        'I will text you today at 8:55 PM: "The new reminder system is working."\nName: check'
     ]
     store.close()
 

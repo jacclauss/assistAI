@@ -645,7 +645,7 @@ async def test_the_sent_reminder_time_is_the_servers(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check',
+            'I will text you today at 8:55 PM: "The new reminder system is working."\nName: check',
         )
     ]
     await fireworks.aclose()
@@ -658,7 +658,7 @@ async def test_the_sent_reminder_time_is_the_servers(
 def test_a_reply_naming_another_time_is_caught(said: str) -> None:
     from assistai.signal.channel import _names_another_time
 
-    stored = 'I will text you at 8:55 PM today: "It is working."\nName: check'
+    stored = 'I will text you today at 8:55 PM: "It is working."\nName: check'
 
     assert _names_another_time(said, stored)
     assert not _names_another_time("Also, it is 8:55 PM then. Pickup is Tuesday.", stored)
@@ -703,7 +703,7 @@ async def test_a_reminder_keeps_the_rest_of_the_answer(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "Take the trash out."\n'
+            'I will text you today at 8:55 PM: "Take the trash out."\n'
             "Name: trash\n\nPickup is Tuesday.",
         )
     ]
@@ -776,7 +776,7 @@ async def test_a_reminder_does_not_fire_before_its_turn_ends(
 
     assert mid_turn == [[]]
     assert [text for _number, text in signal.sent] == [
-        'I will text you at 8:54 PM today: "It is working."\nName: check\n\nDone.'
+        'I will text you today at 8:54 PM: "It is working."\nName: check\n\nDone.'
     ]
     await runner._tick()
     assert signal.sent[-1][1] == "It is working."

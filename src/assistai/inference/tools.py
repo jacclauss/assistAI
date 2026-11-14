@@ -8,6 +8,7 @@ directly. ``get_time`` stays side-effect free.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from assistai.clock import HouseholdClock, say_day, weekday_of
+from assistai.clock import HouseholdClock, local_text, say_day, weekday_of
 from assistai.errors import (
     CalendarError,
     JobError,
@@ -129,17 +130,18 @@ def bind_clock(timezone: str) -> Callable[[dict[str, Any]], str]:
     """
 
     def handler(_arguments: dict[str, Any]) -> str:
-        zone = ZoneInfo(timezone)
-        now = datetime.now(zone)
-        clock = HouseholdClock(zone=zone)
+        # One reading for every field, so local, today, and utc cannot
+        # straddle midnight and disagree about the day.
+        instant = time.time()
+        clock = HouseholdClock(zone=ZoneInfo(timezone), now=lambda: instant)
         today = clock.today()
         return json.dumps(
             {
                 "timezone": timezone,
-                "local": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                "local": local_text(instant, clock=clock),
                 "weekday": weekday_of(today),
                 "today": say_day(today, clock=clock),
-                "utc": datetime.now(UTC).isoformat(),
+                "utc": datetime.fromtimestamp(instant, UTC).isoformat(),
             }
         )
 

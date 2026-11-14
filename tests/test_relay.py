@@ -107,7 +107,7 @@ async def test_a_future_relay_waits_instead_of_sending(
     assert signal.sent == []
     assert result["scheduled"] is True
     assert result["say"] == (
-        'I will text the other phone at 8:55 PM today: "pick up milk"\nName: message to spouse'
+        'I will text the other phone today at 8:55 PM: "pick up milk"\nName: message to spouse'
     )
     saved = store.find_job("jacob", name="message to spouse")
     assert saved is not None

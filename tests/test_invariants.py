@@ -156,6 +156,66 @@ def test_the_import_walker_sees_every_import_form() -> None:
     assert found == {"store", "broker", "gateway", "scheduler", "signal", "inference"}
 
 
+def test_local_times_are_formatted_in_one_place() -> None:
+    """A second formatter is how a UTC wall time reached the phone as a local one (X3-1, X3-3)."""
+    violations = [
+        f"{path.relative_to(_SRC)}:{line}"
+        for path in sorted(_SRC.rglob("*.py"))
+        if path != _SRC / "clock.py"
+        for line in _local_time_calls(path.read_text(encoding="utf-8"))
+    ]
+    assert not violations, (
+        "household time formatted outside clock.py:\n  "
+        + "\n  ".join(violations)
+        + "\nUse say_when, say_day, say_repeat, local_text, or in_zone from assistai.clock, "
+        "or add the reading you need there."
+    )
+
+
+def test_the_local_time_scanner_sees_household_uses() -> None:
+    """A form the scanner skips is a second formatter nobody is told about."""
+    source = "\n".join(
+        [
+            "a = when.strftime('%I:%M %p')",
+            "b = datetime.fromtimestamp(moment, zone)",
+            "c = moment.replace(tzinfo=zone)",
+            "d = moment.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')",
+            "e = moment.replace(tzinfo=UTC)",
+            "f = datetime.fromtimestamp(instant, UTC)",
+            "g = moment.replace(hour=8)",
+        ]
+    )
+
+    assert _local_time_calls(source) == [1, 2, 3]
+
+
+# These calls turn an instant into wall-clock text or attach a zone to a
+# floating time. Spelled with UTC they are protocol stamps (an iCalendar
+# DTSTAMP, get_time's utc field), not a household time, so they are allowed.
+_LOCAL_TIME_CALLS = ("strftime", "fromtimestamp")
+
+
+def _local_time_calls(source: str) -> list[int]:
+    """Lines that format or attach a zone to a time without naming UTC."""
+    lines: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        attaches_zone = node.func.attr == "replace" and any(
+            keyword.arg == "tzinfo" for keyword in node.keywords
+        )
+        if node.func.attr not in _LOCAL_TIME_CALLS and not attaches_zone:
+            continue
+        names_utc = any(
+            (isinstance(part, ast.Name) and part.id == "UTC")
+            or (isinstance(part, ast.Attribute) and part.attr in ("UTC", "utc"))
+            for part in ast.walk(node)
+        )
+        if not names_utc:
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
 def _assistai_imports(path: Path) -> set[str]:
     package = ("assistai", *path.relative_to(_SRC).parent.parts)
     return _imports_in(path.read_text(encoding="utf-8"), package=package)
