@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Literal
 
@@ -21,6 +22,7 @@ from assistai.inference.loop import run_turn
 from assistai.inference.tools import bind_clock
 from assistai.inference.types import Message, ToolCall
 from assistai.jobs import (
+    JOB_CREATE,
     Job,
     JobOutcome,
     bind_jobs,
@@ -415,6 +417,11 @@ class SignalChannel:
                     self._cancel_turn_jobs(surface)
                     await self._safe_send(inbound.sender, _UNAVAILABLE)
                     return
+                for tool in _delays_beside_a_named_clock(inbound.text, messages[baseline:]):
+                    # Shadow mode: the owner reads these before deciding whether
+                    # a delay beside a clock time should be refused. Nothing of
+                    # the message is logged; it may be private.
+                    log.info("jobs.delay_with_named_clock", agent=agent.name, tool=tool)
                 reply = last_assistant_text(messages)
                 if surface.saved_reminders:
                     # The model announced 12:44pm after saving that guess, so the
@@ -781,3 +788,65 @@ def _names_another_time(reply: str, said: str) -> bool:
 
 def _clock_key(text: str) -> str:
     return re.sub(r"[\s.]", "", text).lower()
+
+
+# What a person writes for a time on the clock: "8:53pm", "7 a.m.", "7:05",
+# "at 8", "9 o'clock", "noon", "midnight". Durations ("in 2 hours") and
+# dates ("December 9") are not clock times. It reads only what the person
+# sent, not the model's reply, and it is separate from ``_CLOCK_TIME``,
+# which decides whether a reply is dropped.
+_NAMED_CLOCK = re.compile(
+    r"\b\d{1,2}(?::[0-5]\d)?\s*[ap]\.?m\b"
+    r"|\b(?:[01]?\d|2[0-3]):[0-5]\d\b"
+    r"|\bat\s+\d{1,2}(?![\d%])(?!\s*(?:minutes?|mins?|hours?|hrs?|days?|weeks?)\b)"
+    r"|\b\d{1,2}\s*o'?clock\b"
+    r"|\b(?:noon|midnight)\b",
+    re.IGNORECASE,
+)
+# job_reschedule takes no delay, so only these two can carry one.
+_DELAY_TOOLS = frozenset({JOB_CREATE, RELAY_TOOL})
+
+
+def _names_a_clock_time(text: str) -> bool:
+    """True when the person's message names a time on the clock, not a duration."""
+    return _NAMED_CLOCK.search(text) is not None
+
+
+def _delays_beside_a_named_clock(text: str, turn: Sequence[Message]) -> list[str]:
+    """Tools the turn saved or staged with a delay and no at, when the person named a clock time.
+
+    A delay the model worked out from "8:53pm" is arithmetic on a clock it
+    may have misread. The ``say`` line shows the result, but only a log
+    shows how often it happens. A call the broker refused is not counted.
+    """
+    if not _names_a_clock_time(text):
+        return []
+    results = {message.tool_call_id: message.content for message in turn if message.role == "tool"}
+    tools: list[str] = []
+    for message in turn:
+        if message.role != "assistant":
+            continue
+        for call in message.tool_calls:
+            if call.name not in _DELAY_TOOLS or _was_refused(results.get(call.id)):
+                continue
+            try:
+                arguments: object = json.loads(call.arguments) if call.arguments else {}
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(arguments, dict)
+                and arguments.get("delay") is not None
+                and arguments.get("at") is None
+            ):
+                tools.append(call.name)
+    return tools
+
+
+def _was_refused(content: str | None) -> bool:
+    if content is None:
+        return True
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and "error" in parsed

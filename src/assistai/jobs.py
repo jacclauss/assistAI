@@ -999,24 +999,7 @@ def bind_jobs(
 
     async def list_jobs(_arguments: dict[str, Any]) -> str:
         agent = active_agent()
-        clock = household_clock(timezone)
-        jobs = store.list_jobs(agent.name)
-        payload: list[dict[str, object]] = []
-        for job in jobs:
-            entry: dict[str, object] = {
-                "id": job.id,
-                "name": job.name,
-                "kind": job.kind,
-                "next_run": say_when(job.next_run_at, clock=clock),
-                "repeats": say_repeat(_schedule_in_words(job, clock=clock), clock=clock),
-                "once": job.once,
-                "verbatim": job.verbatim,
-                "relay": job.relay,
-            }
-            if job.expires_at is not None:
-                entry["ends"] = say_when(job.expires_at, clock=clock)
-            payload.append(entry)
-        return json.dumps({"jobs": payload}, ensure_ascii=False)
+        return job_list_result(store.list_jobs(agent.name), clock=household_clock(timezone))
 
     async def cancel(arguments: dict[str, Any]) -> str:
         agent = active_agent()
@@ -1087,6 +1070,30 @@ def bind_jobs(
         JOB_CANCEL: cancel,
         JOB_RESCHEDULE: reschedule,
     }
+
+
+def job_list_result(jobs: Sequence[Job], *, clock: HouseholdClock) -> str:
+    """What ``job_list`` returns: each run in the household's words, and no Unix number.
+
+    The model answered "when is it?" with the UTC hour when it read a
+    timestamp, so the only time it is given is the one a person would read.
+    """
+    payload: list[dict[str, object]] = []
+    for job in jobs:
+        entry: dict[str, object] = {
+            "id": job.id,
+            "name": job.name,
+            "kind": job.kind,
+            "next_run": say_when(job.next_run_at, clock=clock),
+            "repeats": say_repeat(_schedule_in_words(job, clock=clock), clock=clock),
+            "once": job.once,
+            "verbatim": job.verbatim,
+            "relay": job.relay,
+        }
+        if job.expires_at is not None:
+            entry["ends"] = say_when(job.expires_at, clock=clock)
+        payload.append(entry)
+    return json.dumps({"jobs": payload}, ensure_ascii=False)
 
 
 def rescheduled(

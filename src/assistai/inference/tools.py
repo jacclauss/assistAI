@@ -122,17 +122,20 @@ def get_time(_arguments: dict[str, Any]) -> str:
     return json.dumps({"utc": datetime.now(UTC).isoformat()})
 
 
-def bind_clock(timezone: str) -> Callable[[dict[str, Any]], str]:
+def bind_clock(
+    timezone: str, *, now: Callable[[], float] | None = None
+) -> Callable[[dict[str, Any]], str]:
     """Clock the model must read before it names an ``at``.
 
     The weekday and today's date are spelled out by the server, so the model
     does not work out which day "Monday" or "tomorrow" is from a timestamp.
+    ``now`` is the wall clock unless an eval case stops it at its own moment.
     """
 
     def handler(_arguments: dict[str, Any]) -> str:
         # One reading for every field, so local, today, and utc cannot
         # straddle midnight and disagree about the day.
-        instant = time.time()
+        instant = now() if now is not None else time.time()
         clock = HouseholdClock(zone=ZoneInfo(timezone), now=lambda: instant)
         today = clock.today()
         return json.dumps(

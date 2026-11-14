@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -94,11 +95,17 @@ def local_agent(name: str, *, tools: tuple[str, ...] = ("get_time",)) -> AgentSp
     )
 
 
-def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
-    """Identity the model sees. Distinct per agent so routing is observable."""
+def system_prompt_for(
+    agent: AgentSpec, *, timezone: str = "", now: Callable[[], float] | None = None
+) -> str:
+    """Identity the model sees. Distinct per agent so routing is observable.
+
+    ``now`` is the wall clock unless an eval case stops it, so the prompt's
+    local time and the case's ``get_time`` name the same moment.
+    """
     return (
         f"You are AssistAI agent '{agent.name}', a concise household assistant. "
-        + _local_clock(timezone)
+        + _local_clock(timezone, now)
         + (
             "If they ask to remind, text, or tell the other person, now or later, "
             "call relay before you answer. "
@@ -181,7 +188,7 @@ def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
     )
 
 
-def _local_clock(timezone: str) -> str:
+def _local_clock(timezone: str, now: Callable[[], float] | None) -> str:
     """Fresh each turn. A cached prompt is how a guessed clock survives."""
     if not timezone:
         return ""
@@ -189,7 +196,7 @@ def _local_clock(timezone: str) -> str:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError:
         return ""
-    instant = time.time()
+    instant = now() if now is not None else time.time()
     clock = HouseholdClock(zone=zone, now=lambda: instant)
     local = local_text(instant, clock=clock)
     return f"Local time now is {local}, a {weekday_of(clock.today())}, in {timezone}. "

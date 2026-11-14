@@ -1,0 +1,23 @@
+# Spec 016 AC2a: once the person answers "what time?", the daily check is
+# staged at that hour and keeps it: every_days 1 with at, not a delay.
+id = "job-morning-email-named-hour"
+tags = ["jobs", "staging", "time", "regression"]
+user = "8am"
+now = 2026-10-30T21:13:00
+timezone = "America/Chicago"
+
+[[history]]
+role = "user"
+content = "Every morning, check my email and tell me if anything important came in."
+
+[[history]]
+role = "assistant"
+content = "What time each morning?"
+
+[expect]
+staged = ["job_create"]
+no_staged = ["mail_file", "relay"]
+
+[expect.arguments.job_create]
+equals = { every_days = 1, "at.hour" = 8, "at.minute" = 0 }
+absent = ["delay"]

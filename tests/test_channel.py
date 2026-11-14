@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.errors import HouseholdConfigError, StoreError
@@ -663,6 +664,126 @@ def test_a_reply_naming_another_time_is_caught(said: str) -> None:
 
     assert _names_another_time(said, stored)
     assert not _names_another_time("Also, it is 8:55 PM then. Pickup is Tuesday.", stored)
+
+
+def _reminder_turn(*calls: tuple[str, dict[str, object]]) -> Handler:
+    rounds = [
+        completion_stream(
+            tool_event(
+                call_id=f"c{index}",
+                name=name,
+                arguments=json.dumps(arguments),
+                finish="tool_calls",
+            )
+        )
+        for index, (name, arguments) in enumerate(calls, start=1)
+    ]
+    return sequence(*rounds, completion_stream(text_event("Done.", finish="stop")))
+
+
+_CALL_MOM: dict[str, object] = {
+    "kind": "schedule",
+    "name": "call mom",
+    "prompt": "Call mom.",
+    "once": True,
+    "verbatim": True,
+}
+
+
+async def _delay_logs(
+    tmp_path: Path, text: str, *calls: tuple[str, dict[str, object]]
+) -> list[dict[str, object]]:
+    fireworks = client_for(_reminder_turn(*calls))
+    channel = _channel(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+    try:
+        with capture_logs() as logs:
+            await channel.handle(inbound(text=text))
+    finally:
+        await fireworks.aclose()
+    return [dict(entry) for entry in logs if entry["event"] == "jobs.delay_with_named_clock"]
+
+
+async def test_a_delay_beside_a_named_clock_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 016 AC5: "8:53pm" sent as a delay is model arithmetic; the owner sees how often."""
+    monkeypatch.setattr("assistai.jobs._now", lambda: chicago(2026, 10, 30, 15, 4))
+
+    logged = await _delay_logs(
+        tmp_path,
+        "remind me at 8:53pm to call mom",
+        ("job_create", {**_CALL_MOM, "delay": {"hours": 5, "minutes": 49}}),
+    )
+
+    # The agent and tool only: the message may be private.
+    assert logged == [
+        {
+            "event": "jobs.delay_with_named_clock",
+            "agent": "jacob",
+            "tool": "job_create",
+            "log_level": "info",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "calls"),
+    [
+        pytest.param(
+            "remind me in 2 hours to call mom",
+            (("job_create", {**_CALL_MOM, "delay": {"hours": 2}}),),
+            id="a-delay-the-person-said",
+        ),
+        pytest.param(
+            "remind me at 8:53pm to call mom",
+            (("get_time", {}), ("job_create", {**_CALL_MOM, "at": {"hour": 20, "minute": 53}})),
+            id="an-at-beside-the-clock",
+        ),
+        pytest.param(
+            "remind me at 8:53pm to call mom",
+            (("job_create", {**_CALL_MOM, "every_days": 1, "delay": {"hours": 5}}),),
+            id="a-refused-call",
+        ),
+    ],
+)
+async def test_a_delay_is_not_logged_without_a_named_clock_or_with_an_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    calls: tuple[tuple[str, dict[str, object]], ...],
+) -> None:
+    monkeypatch.setattr("assistai.jobs._now", lambda: chicago(2026, 10, 30, 15, 4))
+
+    assert await _delay_logs(tmp_path, text, *calls) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "named"),
+    [
+        ("remind me at 8:53pm to call mom", True),
+        ("tomorrow at 7:05 to test the morning", True),
+        ("text her at 8", True),
+        ("at 7 a.m. on Friday", True),
+        ("Call me at 9 o'clock", True),
+        ("lunch at noon", True),
+        ("remind me in 2 hours", False),
+        ("in 50 days, check the filter", False),
+        ("Starting December 9, check prices", False),
+        ("look at 3 minutes of the video", False),
+        ("this afternoon", False),
+        ("every morning, check my email", False),
+    ],
+)
+def test_a_clock_time_in_the_message_is_told_from_a_duration(text: str, named: bool) -> None:
+    from assistai.signal.channel import _names_a_clock_time
+
+    assert _names_a_clock_time(text) is named
 
 
 async def test_a_reminder_keeps_the_rest_of_the_answer(

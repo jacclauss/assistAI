@@ -1,0 +1,14 @@
+# Spec 016 AC4: a start date the person names goes in at.date, so the
+# preview shows the real first run instead of hiding it in the prompt.
+id = "job-dated-digest"
+tags = ["jobs", "staging", "time", "regression"]
+user = "Starting December 9, check flight prices to Denver every morning at 7"
+now = 2026-10-30T15:04:00
+timezone = "America/Chicago"
+
+[expect]
+staged = ["job_create"]
+
+[expect.arguments.job_create]
+equals = { "at.date" = "2026-12-09", "at.hour" = 7 }
+absent = ["delay"]

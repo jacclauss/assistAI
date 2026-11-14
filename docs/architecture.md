@@ -297,7 +297,12 @@ The refusal is in the parser that staging, a clean reminder's save, and a
 relay all run first. The pre-016 arguments `every_seconds`, `in_seconds`,
 and `start_at` are refused with the names that replace them and logged as
 `jobs.legacy_arguments_refused`, because old calls stay in history for two
-weeks and the model may copy one. `job_reschedule` takes the same `at`,
+weeks and the model may copy one. When the person's message names a clock
+time ("8:53pm", "at 8", "7:05", "noon") and the turn still saved or staged
+a `job_create` or `relay` with `delay` and no `at`, the
+channel logs `jobs.delay_with_named_clock` with the agent and tool, not the
+text. Nothing is refused; the log shows how often the model does that
+arithmetic before anyone decides to refuse it. `job_reschedule` takes the same `at`,
 `every_days`, and `every_minutes`. Only a new repeat leaves the next run
 where it is and re-anchors the grid on it, so moving the December 7
 reminder to weekly keeps December 7 at 8:00 AM, and asking for the repeat
