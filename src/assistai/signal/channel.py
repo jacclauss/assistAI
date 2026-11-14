@@ -111,9 +111,13 @@ class SignalChannel:
                 inject=self._inject_relay,
                 store=store,
                 timezone=self._timezone,
+                staging_ttl_seconds=settings.staging_ttl_seconds,
             ),
         )
-        for name, handler in bind_jobs(store, timezone=self._timezone).items():
+        jobs = bind_jobs(
+            store, timezone=self._timezone, staging_ttl_seconds=settings.staging_ttl_seconds
+        )
+        for name, handler in jobs.items():
             broker.bind(name, handler)
         broker.bind("get_time", bind_clock(self._timezone))
         # A staged time is fixed on the clock the job handlers read, so the

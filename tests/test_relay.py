@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from assistai.agents import AgentSpec
+from assistai.broker import ToolBroker, builtin_catalog
 from assistai.errors import StoreError
-from assistai.inference.types import Message
+from assistai.inference.types import Message, ToolCall
 from assistai.relay import (
     RelayError,
     bind_relay,
@@ -20,6 +21,7 @@ from assistai.relay import (
 from assistai.signal.client import MAX_SEND_CHARS
 from assistai.store import Store
 from tests.agent_fakes import agent, household
+from tests.clock_fakes import FakeClock, chicago, wall
 from tests.signal_fakes import FakeSignal
 
 
@@ -289,3 +291,138 @@ async def test_cannot_relay_without_another_household_member() -> None:
 
 async def _noop_inject(_recipient: AgentSpec, _record: str) -> None:
     raise AssertionError("must not inject")
+
+
+def _relay_surface(
+    store: Store, signal: FakeSignal, injected: list[tuple[str, str]]
+) -> tuple[ToolBroker, AgentSpec]:
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    home = household(jacob, agent("spouse", "+15555550102", tools=("relay",)))
+
+    async def inject(recipient: AgentSpec, record: str) -> None:
+        injected.append((recipient.name, record))
+
+    catalog = builtin_catalog()
+    catalog.bind(
+        "relay",
+        bind_relay(
+            household=home,
+            signal=signal,
+            inject=inject,
+            store=store,
+            timezone="America/Chicago",
+        ),
+    )
+    return ToolBroker(catalog, home.broker, store=store), jacob
+
+
+_LAPSED_RELAY = ToolCall(
+    id="c1",
+    name="relay",
+    arguments=json.dumps(
+        {"body": "Dinner is ready.", "at": {"date": "2026-11-14", "hour": 20, "minute": 2}}
+    ),
+)
+
+
+async def test_a_lapsed_relay_is_sent_at_the_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """8:02 PM passed eight minutes before the yes: the stored text goes out now, and says why."""
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 20, 10)))
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    injected: list[tuple[str, str]] = []
+    broker, jacob = _relay_surface(store, signal, injected)
+
+    result = json.loads((await broker.for_agent(jacob).commit(_LAPSED_RELAY)).content)
+
+    assert signal.sent == [("+15555550102", "From Jacob:\nDinner is ready.")]
+    assert [name for name, _record in injected] == ["spouse"]
+    assert result["say"] == (
+        "Today at 8:02 PM had passed when you said yes; "
+        'I sent it to the other phone now: "Dinner is ready."'
+    )
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_relay_long_past_its_time_is_refused_at_the_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twenty-eight minutes late is older than any live preview: nothing is sent or stored."""
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 20, 30)))
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    injected: list[tuple[str, str]] = []
+    broker, jacob = _relay_surface(store, signal, injected)
+
+    result = json.loads((await broker.for_agent(jacob).commit(_LAPSED_RELAY)).content)
+
+    assert result["error"] == "tool_failed"
+    assert result["message"].startswith(
+        "Today at 8:02 PM had passed when you said yes, too long ago to run it now."
+    )
+    assert signal.sent == []
+    assert injected == []
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()
+
+
+async def test_a_lapsed_daily_relay_starts_at_its_next_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeating relay whose first 8:00 AM passed before the yes starts at the next 8:00 AM."""
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 8, 5)))
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    broker, jacob = _relay_surface(store, signal, [])
+    call = ToolCall(
+        id="c1",
+        name="relay",
+        arguments=json.dumps(
+            {
+                "body": "Vitamins.",
+                "once": False,
+                "every_days": 1,
+                "at": {"date": "2026-11-14", "hour": 8, "minute": 0},
+            }
+        ),
+    )
+
+    result = json.loads((await broker.for_agent(jacob).commit(call)).content)
+
+    saved = store.find_job("jacob", name="message to spouse")
+    assert saved is not None
+    assert wall(saved.next_run_at) == "2026-11-15 08:00:00 CST"
+    assert saved.at_local == "08:00"
+    assert signal.sent == []
+    assert result["say"].startswith(
+        "Today at 8:00 AM had passed when you said yes; I will text the other phone "
+        "tomorrow at 8:00 AM (Sunday, November 15), then every day at 8:00 AM"
+    )
+    store.close()
+
+
+async def test_a_passed_relay_time_outside_a_confirm_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a yes reads a passed time as late; a direct call with one is refused as before."""
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 20, 10)))
+    store = Store(tmp_path / "assistai.sqlite")
+    signal = FakeSignal()
+    jacob = agent("jacob", "+15555550101", tools=("relay",))
+    handler = bind_relay(
+        household=household(jacob, agent("spouse", "+15555550102", tools=("relay",))),
+        signal=signal,
+        inject=_noop_inject,
+        store=store,
+        timezone="America/Chicago",
+    )
+
+    with using_agent(jacob), pytest.raises(RelayError, match="has already passed"):
+        await handler(json.loads(_LAPSED_RELAY.arguments))
+
+    assert signal.sent == []
+    assert store.find_job("jacob", name="message to spouse") is None
+    store.close()

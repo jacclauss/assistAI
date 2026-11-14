@@ -279,7 +279,7 @@ def _reschedule_parts(spec: JobReschedule, *, words: _Words) -> list[str]:
     job = words.jobs(name=spec.name, job_id=spec.id) if words.jobs is not None else None
     if job is not None:
         try:
-            schedule, _gap = rescheduled(job, spec, clock=words.clock)
+            schedule, _gap, _passed = rescheduled(job, spec, clock=words.clock)
         except JobError:
             pass
         else:

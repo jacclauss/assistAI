@@ -399,13 +399,15 @@ class BoundSurface:
                 ensure_ascii=False,
             )
             return ToolResult(body)
-        result = await self._run(call, self._catalog.meta(call.name))
+        result = await self._run(call, self._catalog.meta(call.name), committing=True)
         if call.name == JOB_CREATE:
             _note_saved_reminder(self.saved_reminders, self.saved_job_ids, result.content)
         return result
 
-    async def _run(self, call: ToolCall, meta: ToolMeta) -> ToolResult:
-        with using_agent(self._agent, tainted=self._scope.tainted):
+    async def _run(self, call: ToolCall, meta: ToolMeta, *, committing: bool = False) -> ToolResult:
+        # The handler learns a yes is running from here, not from its
+        # arguments, so a direct call cannot pass itself off as confirmed.
+        with using_agent(self._agent, tainted=self._scope.tainted, committing=committing):
             result = await self._catalog.execute(call)
         # Read before this call's own result taints the scope: the question the
         # log answers is what was already in context when the tool ran.

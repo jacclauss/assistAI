@@ -27,6 +27,7 @@ from assistai.clock import (
     DELAY_SCHEMA,
     EVERY_DAYS_SCHEMA,
     EVERY_MINUTES_SCHEMA,
+    PAST_TOLERANCE_SECONDS,
     Delay,
     HouseholdClock,
     LocalAt,
@@ -34,6 +35,7 @@ from assistai.clock import (
     at_local_of,
     fix_at,
     local_day,
+    named_instant,
     next_slot,
     resolve_at,
     say_repeat,
@@ -42,7 +44,7 @@ from assistai.clock import (
 from assistai.clock import require_representable as _require_in_zone
 from assistai.errors import JobError, StoreError
 from assistai.inference.types import Message, ToolSpec
-from assistai.relay import active_agent, active_taint
+from assistai.relay import active_agent, active_commit, active_taint
 
 log = structlog.get_logger(__name__)
 
@@ -360,6 +362,93 @@ def first_run_at(
     if every_minutes is not None:
         return clock.now() + every_minutes * 60
     raise JobError("the first run needs at or delay")
+
+
+@dataclass(frozen=True)
+class FirstRun:
+    """When a job first runs, and the named instant it replaces when that passed before the yes."""
+
+    at: float
+    passed: float | None = None
+
+
+def late_send_seconds(staging_ttl_seconds: float) -> float:
+    """How late a confirmed one-time send may be and still go out at the yes.
+
+    A preview can name a time up to the past tolerance ago and lives for
+    the staging TTL, so a yes inside that window can be no later than this.
+    Anything later did not come from a live preview and is refused.
+    """
+    return staging_ttl_seconds + PAST_TOLERANCE_SECONDS
+
+
+def run_for_named(
+    at: LocalAt,
+    *,
+    clock: HouseholdClock,
+    late_seconds: float,
+    grid: Callable[[float], Schedule] | None,
+    on: dt.date | None = None,
+) -> FirstRun:
+    """The run a named time stands for, read on the server's clock when the handler runs.
+
+    Outside a confirm a passed time is refused, as ``resolve_at`` refuses
+    it. Inside one, the time may have passed while the person read the
+    preview (B-7): a repeating job (``grid`` builds its schedule from an
+    anchor) starts at its next slot, and a one-time send goes out at the
+    yes when it is no more than ``late_seconds`` late. An older one is
+    refused with the time that passed.
+    """
+    if not active_commit():
+        return FirstRun(resolve_at(at, clock=clock, on=on))
+    named = named_instant(at, clock=clock, on=on)
+    now = clock.now()
+    if named >= now - PAST_TOLERANCE_SECONDS:
+        return FirstRun(named)
+    if grid is not None:
+        return FirstRun(next_slot(grid(named), after=now), passed=named)
+    if now - named <= late_seconds:
+        return FirstRun(now, passed=named)
+    raise JobError(
+        f"{passed_when_confirmed(named, clock=clock)}, too long ago to run it now. "
+        f"It is now {say_when(now, clock=clock)}. Name a later time."
+    )
+
+
+def confirmed_first_run(
+    first: LocalAt | Delay | None,
+    *,
+    clock: HouseholdClock,
+    once: bool,
+    every_days: int | None,
+    every_minutes: int | None,
+    late_seconds: float,
+) -> FirstRun:
+    """The first run of a new job or later relay; a named time that passed is read as at the yes."""
+    if not isinstance(first, LocalAt):
+        return FirstRun(first_run_at(first, clock=clock, every_minutes=every_minutes))
+
+    def grid(anchor: float) -> Schedule:
+        return schedule_for(
+            zone=clock.zone,
+            first_run=anchor,
+            once=False,
+            first=first,
+            every_days=every_days,
+            every_minutes=every_minutes,
+        )
+
+    return run_for_named(first, clock=clock, late_seconds=late_seconds, grid=None if once else grid)
+
+
+def passed_when_confirmed(named: float, *, clock: HouseholdClock) -> str:
+    """The opening of every sentence about a named time that passed before the yes.
+
+    The time stays spelled "8:02 PM", so the reply check reads it the way
+    it reads the rest of the server's sentences.
+    """
+    text = say_when(named, clock=clock)
+    return f"{text[:1].upper()}{text[1:]} had passed when you said yes"
 
 
 def upcoming_runs(job: Job, *, count: int, after: float | None = None) -> list[float]:
@@ -801,9 +890,14 @@ def household_clock(timezone: str) -> HouseholdClock:
 
 
 def bind_jobs(
-    store: Any, *, timezone: str = "UTC"
+    store: Any, *, timezone: str = "UTC", staging_ttl_seconds: float = 600.0
 ) -> dict[str, Callable[[dict[str, Any]], Awaitable[str]]]:
-    """Handlers closed over the live store. Bound when the channel starts."""
+    """Handlers closed over the live store. Bound when the channel starts.
+
+    ``staging_ttl_seconds`` is how long a proposal lives, which bounds how
+    late a confirmed one-time reminder may be and still go out at the yes.
+    """
+    late_seconds = late_send_seconds(staging_ttl_seconds)
 
     async def create(arguments: dict[str, Any]) -> str:
         spec = parse_create(arguments)
@@ -812,7 +906,15 @@ def bind_jobs(
         now = clock.now()
         if store.find_job(agent.name, name=spec.name) is not None:
             raise JobError(f"a job named {spec.name!r} already exists")
-        first_run = first_run_at(spec.first, clock=clock, every_minutes=spec.every_minutes)
+        start = confirmed_first_run(
+            spec.first,
+            clock=clock,
+            once=spec.once,
+            every_days=spec.every_days,
+            every_minutes=spec.every_minutes,
+            late_seconds=late_seconds,
+        )
+        first_run = start.at
         # Reject a delay the clock cannot represent before the row exists.
         # Saving first and then failing the reply leaves an armed reminder.
         require_representable(first_run, timezone)
@@ -885,13 +987,14 @@ def bind_jobs(
                 clock=clock,
                 name=job.name,
                 repeats=say_repeat(words, clock=clock) if words.repeats else None,
+                passed=start.passed,
             )
             payload["note"] = (
                 "The person is sent the say sentence ahead of your reply. "
                 "Do not restate the reminder or its time; answer anything else they asked."
             )
         else:
-            payload["say"] = describe_saved_job(job, clock=clock)
+            payload["say"] = describe_saved_job(job, clock=clock, passed=start.passed)
         return json.dumps(payload, ensure_ascii=False)
 
     async def list_jobs(_arguments: dict[str, Any]) -> str:
@@ -944,7 +1047,9 @@ def bind_jobs(
             raise JobError("no matching job")
         check_reschedule(job, spec)
         clock = household_clock(timezone)
-        schedule, every_seconds = rescheduled(job, spec, clock=clock)
+        schedule, every_seconds, passed = rescheduled(
+            job, spec, clock=clock, late_seconds=late_seconds
+        )
         next_run_at = schedule.anchor_at
         require_representable(next_run_at, timezone)
         if not store.reschedule_job(
@@ -957,6 +1062,12 @@ def bind_jobs(
         next_run = say_when(next_run_at, clock=clock)
         repeats = say_repeat(schedule, clock=clock)
         then = f", then {repeats}" if schedule.repeats else ""
+        moved = f"{job.name!r}: next run {next_run}{then}."
+        say = f"Moved {moved}"
+        if passed is not None:
+            if not schedule.repeats:
+                moved = f"{job.name!r}: next run now."
+            say = f"{passed_when_confirmed(passed, clock=clock)}; moved {moved}"
         return json.dumps(
             {
                 "ok": True,
@@ -965,7 +1076,7 @@ def bind_jobs(
                 **_repeat_fields(schedule.every_days, _minutes_of(schedule)),
                 "next_run": next_run,
                 "repeats": repeats,
-                "say": f"Moved {job.name!r}: next run {next_run}{then}.",
+                "say": say,
             },
             ensure_ascii=False,
         )
@@ -978,8 +1089,10 @@ def bind_jobs(
     }
 
 
-def rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tuple[Schedule, int]:
-    """The schedule a reschedule stores, and the gap written beside it.
+def rescheduled(
+    job: Job, spec: JobReschedule, *, clock: HouseholdClock, late_seconds: float = 0.0
+) -> tuple[Schedule, int, float | None]:
+    """The schedule a reschedule stores, the gap written beside it, and a new time that passed.
 
     The preview calls this too, so the next run it names is the one the
     yes stores.
@@ -989,31 +1102,56 @@ def rescheduled(job: Job, spec: JobReschedule, *, clock: HouseholdClock) -> tupl
     at 8:00 AM (C-3). A new ``at`` is the next run: a bare hour keeps the
     date ``reschedule_day`` names. A whole-day repeat keeps the hour it has
     unless ``at`` names a new one, and a job becomes whole-day only with an
-    ``at``, as in job_create.
+    ``at``, as in job_create. A new ``at`` that passed before the yes is
+    read the way a new job's first run is (``run_for_named``), and the
+    instant that passed is returned so the result can say so.
     """
     zone = clock.zone
-    if spec.at is not None:
-        first = resolve_at(spec.at, clock=clock, on=reschedule_day(job, clock=clock))
-    else:
-        first = job.next_run_at
+    build: Callable[[float], Schedule]
     if job.once:
         if spec.at is None:
             raise JobError("a one-time job does not repeat. Give at to move it")
-        return Schedule(zone=zone, anchor_at=first), job.every_seconds
-    every_days = spec.every_days
-    every_seconds = spec.every_minutes * 60 if spec.every_minutes is not None else None
-    if every_days is None and every_seconds is None:
-        every_days = job.every_days
-        every_seconds = job.every_seconds if job.every_days is None else None
-    if every_days is not None:
-        at_local = _hhmm(spec.at) if spec.at is not None else job.at_local
-        if at_local is None:
-            raise JobError(ASK_WHAT_TIME)
-        schedule = Schedule(zone=zone, anchor_at=first, every_days=every_days, at_local=at_local)
-        return schedule, every_days * DAY_SECONDS
-    if every_seconds is None:
-        raise JobError("a repeating job needs every_days or every_minutes")
-    return Schedule(zone=zone, anchor_at=first, every_seconds=every_seconds), every_seconds
+
+        def build(anchor: float) -> Schedule:
+            return Schedule(zone=zone, anchor_at=anchor)
+
+        gap = job.every_seconds
+    else:
+        every_days = spec.every_days
+        every_seconds = spec.every_minutes * 60 if spec.every_minutes is not None else None
+        if every_days is None and every_seconds is None:
+            every_days = job.every_days
+            every_seconds = job.every_seconds if job.every_days is None else None
+        if every_days is not None:
+            days = every_days
+            at_local = _hhmm(spec.at) if spec.at is not None else job.at_local
+            if at_local is None:
+                raise JobError(ASK_WHAT_TIME)
+            hhmm = at_local
+
+            def build(anchor: float) -> Schedule:
+                return Schedule(zone=zone, anchor_at=anchor, every_days=days, at_local=hhmm)
+
+            gap = days * DAY_SECONDS
+        elif every_seconds is not None:
+            step = every_seconds
+
+            def build(anchor: float) -> Schedule:
+                return Schedule(zone=zone, anchor_at=anchor, every_seconds=step)
+
+            gap = step
+        else:
+            raise JobError("a repeating job needs every_days or every_minutes")
+    if spec.at is None:
+        return build(job.next_run_at), gap, None
+    start = run_for_named(
+        spec.at,
+        clock=clock,
+        late_seconds=late_seconds,
+        grid=None if job.once else build,
+        on=reschedule_day(job, clock=clock),
+    )
+    return build(start.at), gap, start.passed
 
 
 def _repeat_fields(every_days: int | None, every_minutes: int | None) -> dict[str, object]:
@@ -1065,31 +1203,47 @@ def describe_saved_reminder(
     audience: str = "you",
     name: str | None = None,
     repeats: str | None = None,
+    passed: float | None = None,
 ) -> str:
     """The sentence the person sees. The clock is the server's, not the model's.
 
     The time is spelled "8:00 AM" so the reply check, which drops a model
-    answer naming any other clock time, reads the same time here.
+    answer naming any other clock time, reads the same time here. A named
+    time that ``passed`` before the yes is said first, so the person learns
+    why it runs later than they named, or right now.
     """
     require_representable(fires_at, clock.zone.key)
     when = say_when(fires_at, clock=clock)
     then = f", then {repeats}" if repeats else ""
-    sentence = f'I will text {audience} {when}{then}: "{prompt}"'
+    lead = ""
+    if passed is not None:
+        lead = f"{passed_when_confirmed(passed, clock=clock)}; "
+        if not repeats:
+            when = "now"
+    sentence = f'{lead}I will text {audience} {when}{then}: "{prompt}"'
     if name:
         return f"{sentence}\nName: {name}"
     return sentence
 
 
-def describe_saved_job(job: Job, *, clock: HouseholdClock) -> str:
-    """What a confirmed digest or watch will do, in the server's words: its first run and repeat."""
+def describe_saved_job(job: Job, *, clock: HouseholdClock, passed: float | None = None) -> str:
+    """What a confirmed digest or watch will do, in the server's words: its first run and repeat.
+
+    A named time that ``passed`` before the yes is said first, as for a reminder.
+    """
     kind = "schedule" if job.kind == "schedule" else "watch"
     words = _schedule_in_words(job, clock=clock)
     then = f", then {say_repeat(words, clock=clock)}" if words.repeats else ", once"
     ends = f", ending {say_when(job.expires_at, clock=clock)}" if job.expires_at is not None else ""
-    return (
-        f"Created {kind} {job.name!r}: first run "
-        f"{say_when(job.next_run_at, clock=clock)}{then}{ends}."
+    first = (
+        "now"
+        if passed is not None and not words.repeats
+        else say_when(job.next_run_at, clock=clock)
     )
+    created = f"{kind} {job.name!r}: first run {first}{then}{ends}."
+    if passed is not None:
+        return f"{passed_when_confirmed(passed, clock=clock)}; created {created}"
+    return f"Created {created}"
 
 
 def require_representable(moment: float, timezone: str) -> None:

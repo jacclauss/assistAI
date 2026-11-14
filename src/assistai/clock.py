@@ -192,7 +192,24 @@ class Schedule:
 
 
 def resolve_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> float:
-    """The instant the person meant by a named clock time.
+    """The instant the person meant by a named clock time, refused once it has passed.
+
+    The instant is read as ``named_instant`` reads it. A time more than a
+    minute past is refused with the household's now in words, so the model
+    can correct the day instead of guessing.
+    """
+    moment, now = _named(at, clock=clock, on=on)
+    if moment < now - PAST_TOLERANCE_SECONDS:
+        raise JobError(
+            f"{_full(moment, clock.zone, year=True)} has already passed. "
+            f"It is now {_full(now, clock.zone, year=True)} household time ({clock.zone.key}). "
+            "Name a later day or time."
+        )
+    return moment
+
+
+def named_instant(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> float:
+    """The instant the person meant by a named clock time, even when it has passed.
 
     A ``day`` is read against the household date, never the UTC date, so
     "tomorrow at 8" at 11:30 PM is the local tomorrow. A weekday is today
@@ -202,10 +219,15 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None)
     reminder "to 9" keeps December; without ``on`` it is the next time the
     clock shows it. A time the spring change skips is refused with the
     reason; a time the fall-back hour repeats is the first occurrence
-    unless ``fold`` is 1 or the first has passed. A time more than a minute
-    past is refused with the household's now in words, so the model can
-    correct the day instead of guessing.
+    unless ``fold`` is 1 or the first has passed. Only a date, today, or
+    tomorrow can name a time already past; a confirm reads that time to
+    say it passed before the yes.
     """
+    return _named(at, clock=clock, on=on)[0]
+
+
+def _named(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None) -> tuple[float, float]:
+    """The named instant and the now it was read against, so both checks see one clock reading."""
     _check_at(at)
     now = clock.now()
     today = _local(now, clock.zone).date()
@@ -229,14 +251,7 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None)
             day = base
     except OverflowError as exc:
         raise JobError("that date is too far out to schedule") from exc
-    moment = _occurrence(day, at, clock.zone, earliest=earliest)
-    if moment < earliest:
-        raise JobError(
-            f"{_full(moment, clock.zone, year=True)} has already passed. "
-            f"It is now {_full(now, clock.zone, year=True)} household time ({clock.zone.key}). "
-            "Name a later day or time."
-        )
-    return moment
+    return _occurrence(day, at, clock.zone, earliest=earliest), now
 
 
 def fix_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> LocalAt:

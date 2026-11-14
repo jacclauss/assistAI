@@ -3121,3 +3121,75 @@ def _unix_numbers(value: object) -> list[float]:
     if isinstance(value, list):
         return [n for item in value for n in _unix_numbers(item)]
     return []
+
+
+async def test_a_passed_at_outside_a_confirm_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a yes reads a passed time as late; a direct call with one is refused, unsaved."""
+    store = Store(tmp_path / "assistai.sqlite")
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 20, 10)))
+    create = bind_jobs(store, timezone="America/Chicago")["job_create"]
+
+    with (
+        using_agent(agent("jacob", "+15555550101")),
+        pytest.raises(JobError, match="has already passed"),
+    ):
+        await create(
+            {
+                "kind": "schedule",
+                "name": "trash",
+                "prompt": "Take the trash out.",
+                "once": True,
+                "verbatim": True,
+                "at": {"date": "2026-11-14", "hour": 20, "minute": 2},
+            }
+        )
+
+    assert store.find_job("jacob", name="trash") is None
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("job", "now", "next_run", "say"),
+    [
+        pytest.param(
+            _daily_reminder(chicago(2026, 11, 20, 8)),
+            chicago(2026, 11, 14, 9, 5),
+            "2026-11-15 09:00:00 CST",
+            "Today at 9:00 AM had passed when you said yes; moved 'mgmplus cancel reminder': "
+            "next run tomorrow at 9:00 AM (Sunday, November 15), then every day at 9:00 AM.",
+            id="a daily job starts at its next slot",
+        ),
+        pytest.param(
+            _daily_reminder(chicago(2026, 11, 20, 8), once=True),
+            chicago(2026, 11, 14, 9, 5),
+            "2026-11-14 09:05:00 CST",
+            "Today at 9:00 AM had passed when you said yes; "
+            "moved 'mgmplus cancel reminder': next run now.",
+            id="a one-time job runs at the yes",
+        ),
+    ],
+)
+async def test_a_confirmed_reschedule_whose_time_passed_reads_it_as_a_first_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job: Job, now: float, next_run: str, say: str
+) -> None:
+    """A new time that passed during the yes is treated like a new job's first run."""
+    store = Store(tmp_path / "assistai.sqlite")
+    store.save_job(job)
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(now))
+    reschedule = bind_jobs(store, timezone="America/Chicago")["job_reschedule"]
+
+    with using_agent(agent("jacob", "+15555550101"), committing=True):
+        result = json.loads(
+            await reschedule(
+                {
+                    "name": "mgmplus cancel reminder",
+                    "at": {"date": "2026-11-14", "hour": 9, "minute": 0},
+                }
+            )
+        )
+
+    assert _next_run(store) == next_run
+    assert result["say"] == say
+    store.close()

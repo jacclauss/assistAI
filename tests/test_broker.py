@@ -1087,3 +1087,35 @@ async def test_a_proposal_from_before_the_update_is_refused_at_commit(tmp_path: 
     assert store.find_job("jacob", name="morning email") is None
     assert [entry["event"] for entry in logs] == ["staging.legacy_proposal_refused"]
     store.close()
+
+
+async def test_only_a_commit_runs_its_handler_as_confirmed() -> None:
+    """A handler reads the yes from the broker, and the mark is gone once the call returns."""
+    from assistai.errors import JobError
+    from assistai.relay import active_commit
+
+    seen: list[bool] = []
+
+    def note(_arguments: dict[str, object]) -> str:
+        seen.append(active_commit())
+        return json.dumps({"ok": True})
+
+    def fail(_arguments: dict[str, object]) -> str:
+        seen.append(active_commit())
+        raise JobError("refused")
+
+    catalog = builtin_catalog()
+    catalog.add(_spec("get_time"), note)
+    catalog.add(_spec("shared_write"), fail, sink="shared:write", staging=True)
+    jacob = agent("jacob", "+15555550101", tools=("get_time", "shared_write"))
+    surface = ToolBroker(
+        catalog, household(jacob, agent("spouse", "+15555550102")).broker
+    ).for_agent(jacob)
+
+    await surface.execute(tool_call("get_time"))
+    await surface.commit(tool_call("get_time"))
+    failed = json.loads((await surface.commit(tool_call("shared_write", '{"path": "x"}'))).content)
+
+    assert seen == [False, True, True]
+    assert failed["error"] == "tool_failed"
+    assert active_commit() is False

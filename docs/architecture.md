@@ -214,6 +214,11 @@ Properties that matter:
   time is not staged at all. A proposal stored before `at` and `delay`
   existed is refused at the yes with "ask again", since its preview no
   longer describes what this build would run.
+- A named time can pass while the preview waits. The broker's commit marks
+  the handler call as a yes (`relay.active_commit()`, beside the agent and
+  the taint), and only then is a passed `at` read as late rather than
+  refused; see § Jobs. The proposal is still consumed before the handlers
+  run, as for any other yes.
 - Every time in a preview is in the server's words on the household clock.
   A job or relay, alone or in a bundle, names its first run ("First run:
   tomorrow at 8:00 AM (Saturday, October 31)", or "2 hours after you reply
@@ -307,6 +312,17 @@ yes. A one-time job has no repeat. `every_days` or `every_minutes` is the
 gap after the first run, at least a minute, with no maximum. Nothing is
 sent before that first run. A reminder has to name it, with `at` or
 `delay`; a minute repeat with neither starts one gap from now.
+A first run named with `at` that passed between the preview and the yes
+is not refused at the yes. A repeating job or relay starts at its next
+slot on the same grid ("Today at 8:00 AM had passed when you said yes; I
+will text you tomorrow at 8:00 AM ..."). A one-time reminder or relay
+that is no more than `staging_ttl_seconds` plus a minute late, the most a
+live preview allows, goes out at the yes: the reminder is saved due now
+for the runner, the relay is sent by its handler as an untimed one is,
+and the sentence says the named time had passed. Anything later is
+refused with that sentence. A confirmed `job_reschedule` whose new `at`
+passed follows the same rule. Outside a yes, a passed `at` is refused as
+before.
 A job cannot be an instruction to create another job; that check applies to
 digests, because a reminder's sentence is texted and never run. A watch
 cannot be a reminder. A digest, which writes its own report, still waits for a yes. A

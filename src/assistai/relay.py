@@ -89,20 +89,26 @@ InjectFn = Callable[[AgentSpec, str], Awaitable[None]]
 
 _ACTIVE_AGENT: ContextVar[AgentSpec | None] = ContextVar("assistai_relay_agent", default=None)
 _ACTIVE_TAINT: ContextVar[bool] = ContextVar("assistai_relay_tainted", default=False)
+_ACTIVE_COMMIT: ContextVar[bool] = ContextVar("assistai_relay_commit", default=False)
 
 
 @contextmanager
-def using_agent(agent: AgentSpec, *, tainted: bool = False) -> Iterator[None]:
-    """Bind the confirming agent, and whether its conversation is tainted, for one handler call.
+def using_agent(
+    agent: AgentSpec, *, tainted: bool = False, committing: bool = False
+) -> Iterator[None]:
+    """Bind the confirming agent, its taint, and whether a yes is running, for one handler call.
 
     A handler that stores text for later reads the taint here. The model's
-    arguments cannot clear it.
+    arguments cannot clear it, and they cannot claim a yes either: only the
+    broker's commit sets ``committing``.
     """
     token = activate_agent(agent)
     taint_token = _ACTIVE_TAINT.set(tainted)
+    commit_token = _ACTIVE_COMMIT.set(committing)
     try:
         yield
     finally:
+        _ACTIVE_COMMIT.reset(commit_token)
         _ACTIVE_TAINT.reset(taint_token)
         reset_agent(token)
 
@@ -125,6 +131,16 @@ def active_agent() -> AgentSpec:
 def active_taint() -> bool:
     """True when the conversation running this handler holds untrusted text."""
     return _ACTIVE_TAINT.get()
+
+
+def active_commit() -> bool:
+    """True while a handler runs a stored call the person said yes to.
+
+    A named time can pass between the preview and the yes. Only then is a
+    passed time moved to the next run or sent at the yes; a call the model
+    makes directly with a passed time is still refused.
+    """
+    return _ACTIVE_COMMIT.get()
 
 
 def format_outbound(from_name: str, body: str) -> str:
@@ -283,6 +299,7 @@ def bind_relay(
     inject: InjectFn,
     store: Any = None,
     timezone: str = "UTC",
+    staging_ttl_seconds: float = 600.0,
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """Handler closed over the live household and Signal client.
 
@@ -290,32 +307,38 @@ def bind_relay(
     The channel owns that write so it can take her history lock and keep the
     in-memory cache aligned with SQLite. A future relay stores the body and
     sends those bytes when it is due. Yes is the only confirmation.
+    ``staging_ttl_seconds`` is how long a proposal lives, which bounds how
+    late a confirmed one-time relay may be and still go out at the yes.
     """
+    from assistai.jobs import late_send_seconds
+
+    late_seconds = late_send_seconds(staging_ttl_seconds)
+
+    async def send_now(sender: AgentSpec, body: str) -> dict[str, object]:
+        await deliver_stored_relay(
+            household=household,
+            signal=signal,
+            inject=inject,
+            sender=sender,
+            body=body,
+        )
+        return {"ok": True, "to": _peer(household, sender), "from": sender.name}
 
     async def relay(arguments: dict[str, Any]) -> str:
         sender = active_agent()
         body = parse_body(arguments, from_name=sender.name)
         when = parse_relay_when(arguments)
         if when is None:
-            await deliver_stored_relay(
-                household=household,
-                signal=signal,
-                inject=inject,
-                sender=sender,
-                body=body,
-            )
-            return json.dumps(
-                {"ok": True, "to": _peer(household, sender), "from": sender.name},
-                ensure_ascii=False,
-            )
+            return json.dumps(await send_now(sender, body), ensure_ascii=False)
         if store is None:
             raise RelayError("a future relay cannot be stored")
         from assistai.jobs import (
             Job,
+            confirmed_first_run,
             describe_saved_reminder,
-            first_run_at,
             household_clock,
             new_job_id,
+            passed_when_confirmed,
             require_representable,
             schedule_for,
         )
@@ -323,7 +346,27 @@ def bind_relay(
         try:
             clock = household_clock(timezone)
             now = clock.now()
-            first_run = first_run_at(when.first, clock=clock, every_minutes=when.every_minutes)
+            start = confirmed_first_run(
+                when.first,
+                clock=clock,
+                once=when.once,
+                every_days=when.every_days,
+                every_minutes=when.every_minutes,
+                late_seconds=late_seconds,
+            )
+        except JobError as exc:
+            raise RelayError(str(exc)) from exc
+        if start.passed is not None and when.once:
+            # The yes is the send time now, so the bytes go out the way a
+            # relay with no time does, not on the next poll.
+            sent = await send_now(sender, body)
+            sent["say"] = (
+                f"{passed_when_confirmed(start.passed, clock=clock)}; "
+                f'I sent it to the other phone now: "{body}"'
+            )
+            return json.dumps(sent, ensure_ascii=False)
+        first_run = start.at
+        try:
             require_representable(first_run, timezone)
             schedule = schedule_for(
                 zone=clock.zone,
@@ -374,6 +417,7 @@ def bind_relay(
             audience="the other phone",
             name=job.name,
             repeats=say_repeat(schedule, clock=clock) if schedule.repeats else None,
+            passed=start.passed,
         )
         return json.dumps(
             {"ok": True, "scheduled": True, "id": job.id, "name": job.name, "say": say},
