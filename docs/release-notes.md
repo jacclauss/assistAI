@@ -51,8 +51,10 @@
 - A yes that comes after the time you named has passed still works. A
   repeating job starts at its next time and says so. A one-time reminder
   or message to the other person goes out at the yes, and says the time
-  had passed, if it is no more than about 11 minutes late. Later than
-  that, nothing is set up; ask again with a later time.
+  had passed, if it is no more than about 11 minutes late. Moving a
+  one-time reminder to such a time works the same way, and it arrives
+  after the reply that confirms the move. Later than that, nothing is set
+  up or moved; ask again with a later time.
 - A calendar event at a time the clocks skip in spring is refused with the
   reason. One in the hour that repeats in the fall is the first of the
   two, and the preview names it, such as "1:30 AM CDT". An event with no

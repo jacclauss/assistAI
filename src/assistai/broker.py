@@ -270,6 +270,10 @@ class BoundSurface:
         self._read_clock = False
         self.saved_reminders: list[str] = []
         self.saved_job_ids: list[str] = []
+        # Jobs this turn moved. A move can make one due now, so it waits for
+        # the reply like a new reminder; but the row existed before the
+        # turn, so a failed turn must not cancel it as it cancels those.
+        self.moved_job_ids: list[str] = []
 
     @property
     def tainted(self) -> bool:
@@ -402,6 +406,8 @@ class BoundSurface:
         result = await self._run(call, self._catalog.meta(call.name), committing=True)
         if call.name == JOB_CREATE:
             _note_saved_reminder(self.saved_reminders, self.saved_job_ids, result.content)
+        elif call.name == JOB_RESCHEDULE:
+            _note_moved_job(self.moved_job_ids, result.content)
         return result
 
     async def _run(self, call: ToolCall, meta: ToolMeta, *, committing: bool = False) -> ToolResult:
@@ -511,6 +517,18 @@ def _note_saved_reminder(notes: list[str], job_ids: list[str], content: str) -> 
         job_id = parsed.get("id")
         if isinstance(job_id, str) and job_id:
             job_ids.append(job_id)
+
+
+def _note_moved_job(job_ids: list[str], content: str) -> None:
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        return
+    job_id = parsed.get("id")
+    if isinstance(job_id, str) and job_id:
+        job_ids.append(job_id)
 
 
 def _reminder_saves_now(call: ToolCall) -> bool:

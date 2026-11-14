@@ -300,12 +300,16 @@ class SignalChannel:
         return self._job_sends.would_allow(agent.name)
 
     def holds_job(self, job_id: str) -> bool:
-        """A reminder saved by a turn still running waits for that turn.
+        """A reminder saved or moved by a turn still running waits for that turn.
 
         Otherwise it can reach the phone before the reply that confirms it,
-        or before a failed turn cancels it.
+        or before a failed turn cancels it. A one-time move confirmed late
+        is due at the yes, so it waits like a new reminder.
         """
-        return any(job_id in surface.saved_job_ids for surface in self._open_turns)
+        return any(
+            job_id in surface.saved_job_ids or job_id in surface.moved_job_ids
+            for surface in self._open_turns
+        )
 
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
         """Send a job report. History is persisted separately after delivery is recorded."""

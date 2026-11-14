@@ -1641,6 +1641,109 @@ async def test_a_lapsed_one_time_reminder_is_sent_at_the_yes(
     store.close()
 
 
+async def test_a_lapsed_one_time_move_waits_for_the_yes_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move to 8:02 PM confirmed at 8:10 PM is due now, but the reply that says so goes first.
+
+    The job existed before this turn, so it is held without being one a
+    failed turn would cancel.
+    """
+    from assistai.inference.types import ToolCall
+    from assistai.jobs import Job, schedule_from_seconds
+    from assistai.scheduler import JobRunner
+
+    store = _store(tmp_path)
+    tomorrow = chicago(2026, 11, 15, 9)
+    schedule = schedule_from_seconds(
+        zone=ZoneInfo("America/Chicago"), first_run=tomorrow, every_seconds=86400, once=True
+    )
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="trash",
+            prompt="Take the trash out.",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=chicago(2026, 11, 14, 9),
+            expires_at=None,
+            next_run_at=tomorrow,
+            last_run_at=None,
+            cancelled_at=None,
+            once=True,
+            verbatim=True,
+            zone=schedule.zone.key,
+            anchor_at=schedule.anchor_at,
+            every_days=schedule.every_days,
+            at_local=schedule.at_local,
+        )
+    )
+    store.replace_proposal(
+        Proposal(
+            agent="jacob",
+            calls=(
+                ToolCall(
+                    id="c1",
+                    name="job_reschedule",
+                    arguments='{"name": "trash", "at": {"date": "2026-11-14", "hour": 20, '
+                    '"minute": 2}}',
+                ),
+            ),
+            tainted=False,
+            created_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+    held: list[bool] = []
+    cancellable: list[bool] = []
+
+    class _WatchingSignal(FakeSignal):
+        async def send(self, recipient: str, text: str) -> None:
+            held.append(channel.holds_job("jabcd1234"))
+            cancellable.append(
+                any("jabcd1234" in turn.saved_job_ids for turn in channel._open_turns)
+            )
+            await super().send(recipient, text)
+
+    def boom(_req: httpx.Request) -> httpx.Response:
+        raise AssertionError("confirm must not call the model")
+
+    signal = _WatchingSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        client_for(boom),
+        store=store,
+        jacob_tools=("job_reschedule",),
+        timezone="America/Chicago",
+    )
+    clock = FakeClock(chicago(2026, 11, 14, 20, 10))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+
+    await channel.handle(inbound(text="yes"))
+
+    moved = store.find_job("jacob", name="trash")
+    assert moved is not None
+    assert moved.cancelled_at is None
+    assert moved.next_run_at == clock()
+    assert "Today at 8:02 PM had passed when you said yes" in signal.sent[-1][1]
+    assert held == [True]
+    assert cancellable == [False]
+    assert not channel.holds_job("jabcd1234")
+    runner = JobRunner(
+        store,
+        channel._household,
+        channel,
+        signal_settings(state_dir=tmp_path),
+        clock=clock,
+    )
+    await runner._tick()
+    assert signal.sent[-1] == ("+15555550101", "Take the trash out.")
+    store.close()
+
+
 async def test_a_one_time_reminder_long_past_its_time_is_refused_at_the_yes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
