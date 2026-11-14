@@ -870,6 +870,7 @@ the same schema. Closed after the phone checks pass, the next morning's
   passed; an older one is refused with the reason. Closes B-7.
   (`tests/test_channel.py::test_a_lapsed_daily_job_starts_at_its_next_slot`,
   `tests/test_channel.py::test_a_lapsed_one_time_reminder_is_sent_at_the_yes`,
+  `tests/test_channel.py::test_a_lapsed_one_time_move_waits_for_the_yes_reply`,
   `tests/test_relay.py::test_a_lapsed_relay_is_sent_at_the_yes`)
 - [ ] AC13 — The timezone has no default, and Signal does not start
   without one. Closes B-8.

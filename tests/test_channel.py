@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from assistai.broker import ToolBroker, builtin_catalog
 from assistai.errors import HouseholdConfigError, StoreError
@@ -20,6 +22,7 @@ from assistai.staging import Proposal
 from assistai.store import Store
 from tests.agent_fakes import agent, household
 from tests.channel_fakes import channel_for, policy_for, store_for
+from tests.clock_fakes import FakeClock, chicago, wall
 from tests.fakes import (
     Handler,
     client_for,
@@ -621,8 +624,8 @@ async def test_the_sent_reminder_time_is_the_servers(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "The new reminder system is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -644,7 +647,7 @@ async def test_the_sent_reminder_time_is_the_servers(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "The new reminder system is working."\nName: check',
+            'I will text you today at 8:55 PM: "The new reminder system is working."\nName: check',
         )
     ]
     await fireworks.aclose()
@@ -657,10 +660,130 @@ async def test_the_sent_reminder_time_is_the_servers(
 def test_a_reply_naming_another_time_is_caught(said: str) -> None:
     from assistai.signal.channel import _names_another_time
 
-    stored = 'I will text you at 8:55 PM today: "It is working."\nName: check'
+    stored = 'I will text you today at 8:55 PM: "It is working."\nName: check'
 
     assert _names_another_time(said, stored)
     assert not _names_another_time("Also, it is 8:55 PM then. Pickup is Tuesday.", stored)
+
+
+def _reminder_turn(*calls: tuple[str, dict[str, object]]) -> Handler:
+    rounds = [
+        completion_stream(
+            tool_event(
+                call_id=f"c{index}",
+                name=name,
+                arguments=json.dumps(arguments),
+                finish="tool_calls",
+            )
+        )
+        for index, (name, arguments) in enumerate(calls, start=1)
+    ]
+    return sequence(*rounds, completion_stream(text_event("Done.", finish="stop")))
+
+
+_CALL_MOM: dict[str, object] = {
+    "kind": "schedule",
+    "name": "call mom",
+    "prompt": "Call mom.",
+    "once": True,
+    "verbatim": True,
+}
+
+
+async def _delay_logs(
+    tmp_path: Path, text: str, *calls: tuple[str, dict[str, object]]
+) -> list[dict[str, object]]:
+    fireworks = client_for(_reminder_turn(*calls))
+    channel = _channel(
+        tmp_path,
+        FakeSignal(),
+        fireworks,
+        jacob_tools=("job_create", "get_time"),
+        timezone="America/Chicago",
+    )
+    try:
+        with capture_logs() as logs:
+            await channel.handle(inbound(text=text))
+    finally:
+        await fireworks.aclose()
+    return [dict(entry) for entry in logs if entry["event"] == "jobs.delay_with_named_clock"]
+
+
+async def test_a_delay_beside_a_named_clock_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 016 AC5: "8:53pm" sent as a delay is model arithmetic; the owner sees how often."""
+    monkeypatch.setattr("assistai.jobs._now", lambda: chicago(2026, 10, 30, 15, 4))
+
+    logged = await _delay_logs(
+        tmp_path,
+        "remind me at 8:53pm to call mom",
+        ("job_create", {**_CALL_MOM, "delay": {"hours": 5, "minutes": 49}}),
+    )
+
+    # The agent and tool only: the message may be private.
+    assert logged == [
+        {
+            "event": "jobs.delay_with_named_clock",
+            "agent": "jacob",
+            "tool": "job_create",
+            "log_level": "info",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "calls"),
+    [
+        pytest.param(
+            "remind me in 2 hours to call mom",
+            (("job_create", {**_CALL_MOM, "delay": {"hours": 2}}),),
+            id="a-delay-the-person-said",
+        ),
+        pytest.param(
+            "remind me at 8:53pm to call mom",
+            (("get_time", {}), ("job_create", {**_CALL_MOM, "at": {"hour": 20, "minute": 53}})),
+            id="an-at-beside-the-clock",
+        ),
+        pytest.param(
+            "remind me at 8:53pm to call mom",
+            (("job_create", {**_CALL_MOM, "every_days": 1, "delay": {"hours": 5}}),),
+            id="a-refused-call",
+        ),
+    ],
+)
+async def test_a_delay_is_not_logged_without_a_named_clock_or_with_an_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    calls: tuple[tuple[str, dict[str, object]], ...],
+) -> None:
+    monkeypatch.setattr("assistai.jobs._now", lambda: chicago(2026, 10, 30, 15, 4))
+
+    assert await _delay_logs(tmp_path, text, *calls) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "named"),
+    [
+        ("remind me at 8:53pm to call mom", True),
+        ("tomorrow at 7:05 to test the morning", True),
+        ("text her at 8", True),
+        ("at 7 a.m. on Friday", True),
+        ("Call me at 9 o'clock", True),
+        ("lunch at noon", True),
+        ("remind me in 2 hours", False),
+        ("in 50 days, check the filter", False),
+        ("Starting December 9, check prices", False),
+        ("look at 3 minutes of the video", False),
+        ("this afternoon", False),
+        ("every morning, check my email", False),
+    ],
+)
+def test_a_clock_time_in_the_message_is_told_from_a_duration(text: str, named: bool) -> None:
+    from assistai.signal.channel import _names_a_clock_time
+
+    assert _names_a_clock_time(text) is named
 
 
 async def test_a_reminder_keeps_the_rest_of_the_answer(
@@ -678,8 +801,8 @@ async def test_a_reminder_keeps_the_rest_of_the_answer(
                     arguments=(
                         '{"kind": "schedule", "name": "trash", '
                         '"prompt": "Take the trash out.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -702,7 +825,7 @@ async def test_a_reminder_keeps_the_rest_of_the_answer(
     assert signal.sent == [
         (
             "+15555550101",
-            'I will text you at 8:55 PM today: "Take the trash out."\n'
+            'I will text you today at 8:55 PM: "Take the trash out."\n'
             "Name: trash\n\nPickup is Tuesday.",
         )
     ]
@@ -746,8 +869,8 @@ async def test_a_reminder_does_not_fire_before_its_turn_ends(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "It is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 60}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 1}}'
                     ),
                     finish="tool_calls",
                 )
@@ -775,7 +898,7 @@ async def test_a_reminder_does_not_fire_before_its_turn_ends(
 
     assert mid_turn == [[]]
     assert [text for _number, text in signal.sent] == [
-        'I will text you at 8:54 PM today: "It is working."\nName: check\n\nDone.'
+        'I will text you today at 8:54 PM: "It is working."\nName: check\n\nDone.'
     ]
     await runner._tick()
     assert signal.sent[-1][1] == "It is working."
@@ -800,8 +923,8 @@ async def test_a_failed_turn_cancels_the_reminder_it_saved(
                     arguments=(
                         '{"kind": "schedule", "name": "check", '
                         '"prompt": "The new reminder system is working.", '
-                        '"every_seconds": 86400, "once": true, "verbatim": true, '
-                        '"in_seconds": 120}'
+                        '"once": true, "verbatim": true, '
+                        '"delay": {"minutes": 2}}'
                     ),
                     finish="tool_calls",
                 )
@@ -1418,6 +1541,288 @@ async def test_relay_preview_is_the_stored_body_not_model_prose(tmp_path: Path) 
     assert "I will tell her" not in preview
     assert signal.sent[-1][0] == "+15555550101"
     await fireworks.aclose()
+
+
+def _confirming_jobs(
+    tmp_path: Path, store: Store, arguments: str
+) -> tuple[SignalChannel, FakeSignal]:
+    """A channel holding one staged job_create, as the broker stored it, waiting for yes."""
+    from assistai.inference.types import ToolCall
+
+    store.replace_proposal(
+        Proposal(
+            agent="jacob",
+            calls=(ToolCall(id="c1", name="job_create", arguments=arguments),),
+            tainted=True,
+            created_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+
+    def boom(_req: httpx.Request) -> httpx.Response:
+        raise AssertionError("confirm must not call the model")
+
+    signal = FakeSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        client_for(boom),
+        store=store,
+        jacob_tools=("job_create",),
+        timezone="America/Chicago",
+    )
+    return channel, signal
+
+
+async def test_a_lapsed_daily_job_starts_at_its_next_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """8:00 AM passed while the preview waited, so the yes starts the job tomorrow at 8:00 AM."""
+    store = _store(tmp_path)
+    channel, signal = _confirming_jobs(
+        tmp_path,
+        store,
+        '{"kind": "schedule", "name": "vitamins", "prompt": "Take the vitamins.", '
+        '"verbatim": true, "every_days": 1, '
+        '"at": {"date": "2026-11-14", "hour": 8, "minute": 0}}',
+    )
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 8, 5)))
+
+    await channel.handle(inbound(text="yes"))
+
+    saved = store.find_job("jacob", name="vitamins")
+    assert saved is not None
+    assert wall(saved.next_run_at) == "2026-11-15 08:00:00 CST"
+    assert saved.anchor_at == saved.next_run_at
+    assert saved.every_days == 1
+    assert saved.at_local == "08:00"
+    assert signal.sent[-1][1] == (
+        "Today at 8:00 AM had passed when you said yes; I will text you tomorrow at 8:00 AM "
+        '(Sunday, November 15), then every day at 8:00 AM: "Take the vitamins."\nName: vitamins'
+    )
+    store.close()
+
+
+async def test_a_lapsed_one_time_reminder_is_sent_at_the_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """8:02 PM passed eight minutes before the yes: the reminder goes out now, and says why."""
+    from assistai.scheduler import JobRunner
+
+    store = _store(tmp_path)
+    channel, signal = _confirming_jobs(
+        tmp_path,
+        store,
+        '{"kind": "schedule", "name": "trash", "prompt": "Take the trash out.", '
+        '"once": true, "verbatim": true, '
+        '"at": {"date": "2026-11-14", "hour": 20, "minute": 2}}',
+    )
+    clock = FakeClock(chicago(2026, 11, 14, 20, 10))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+
+    await channel.handle(inbound(text="yes"))
+
+    saved = store.find_job("jacob", name="trash")
+    assert saved is not None
+    assert saved.next_run_at == clock()
+    assert signal.sent[-1][1] == (
+        "Today at 8:02 PM had passed when you said yes; "
+        'I will text you now: "Take the trash out."\nName: trash'
+    )
+    runner = JobRunner(
+        store,
+        channel._household,
+        channel,
+        signal_settings(state_dir=tmp_path),
+        clock=clock,
+    )
+    await runner._tick()
+    assert signal.sent[-1] == ("+15555550101", "Take the trash out.")
+    store.close()
+
+
+async def test_a_lapsed_one_time_move_waits_for_the_yes_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move to 8:02 PM confirmed at 8:10 PM is due now, but the reply that says so goes first.
+
+    The job existed before this turn, so it is held without being one a
+    failed turn would cancel.
+    """
+    from assistai.inference.types import ToolCall
+    from assistai.jobs import Job, schedule_from_seconds
+    from assistai.scheduler import JobRunner
+
+    store = _store(tmp_path)
+    tomorrow = chicago(2026, 11, 15, 9)
+    schedule = schedule_from_seconds(
+        zone=ZoneInfo("America/Chicago"), first_run=tomorrow, every_seconds=86400, once=True
+    )
+    store.save_job(
+        Job(
+            id="jabcd1234",
+            agent="jacob",
+            kind="schedule",
+            name="trash",
+            prompt="Take the trash out.",
+            every_seconds=86400,
+            ttl_seconds=None,
+            created_at=chicago(2026, 11, 14, 9),
+            expires_at=None,
+            next_run_at=tomorrow,
+            last_run_at=None,
+            cancelled_at=None,
+            once=True,
+            verbatim=True,
+            zone=schedule.zone.key,
+            anchor_at=schedule.anchor_at,
+            every_days=schedule.every_days,
+            at_local=schedule.at_local,
+        )
+    )
+    store.replace_proposal(
+        Proposal(
+            agent="jacob",
+            calls=(
+                ToolCall(
+                    id="c1",
+                    name="job_reschedule",
+                    arguments='{"name": "trash", "at": {"date": "2026-11-14", "hour": 20, '
+                    '"minute": 2}}',
+                ),
+            ),
+            tainted=False,
+            created_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+    held: list[bool] = []
+    cancellable: list[bool] = []
+
+    class _WatchingSignal(FakeSignal):
+        async def send(self, recipient: str, text: str) -> None:
+            held.append(channel.holds_job("jabcd1234"))
+            cancellable.append(
+                any("jabcd1234" in turn.saved_job_ids for turn in channel._open_turns)
+            )
+            await super().send(recipient, text)
+
+    def boom(_req: httpx.Request) -> httpx.Response:
+        raise AssertionError("confirm must not call the model")
+
+    signal = _WatchingSignal()
+    channel = _channel(
+        tmp_path,
+        signal,
+        client_for(boom),
+        store=store,
+        jacob_tools=("job_reschedule",),
+        timezone="America/Chicago",
+    )
+    clock = FakeClock(chicago(2026, 11, 14, 20, 10))
+    monkeypatch.setattr("assistai.jobs._now", clock)
+
+    await channel.handle(inbound(text="yes"))
+
+    moved = store.find_job("jacob", name="trash")
+    assert moved is not None
+    assert moved.cancelled_at is None
+    assert moved.next_run_at == clock()
+    assert "Today at 8:02 PM had passed when you said yes" in signal.sent[-1][1]
+    assert held == [True]
+    assert cancellable == [False]
+    assert not channel.holds_job("jabcd1234")
+    runner = JobRunner(
+        store,
+        channel._household,
+        channel,
+        signal_settings(state_dir=tmp_path),
+        clock=clock,
+    )
+    await runner._tick()
+    assert signal.sent[-1] == ("+15555550101", "Take the trash out.")
+    store.close()
+
+
+async def test_a_one_time_reminder_long_past_its_time_is_refused_at_the_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twenty-eight minutes late is not a yes to that preview: nothing is saved, and it says why."""
+    store = _store(tmp_path)
+    channel, signal = _confirming_jobs(
+        tmp_path,
+        store,
+        '{"kind": "schedule", "name": "trash", "prompt": "Take the trash out.", '
+        '"once": true, "verbatim": true, '
+        '"at": {"date": "2026-11-14", "hour": 20, "minute": 2}}',
+    )
+    monkeypatch.setattr("assistai.jobs._now", FakeClock(chicago(2026, 11, 14, 20, 30)))
+
+    await channel.handle(inbound(text="yes"))
+
+    assert store.find_job("jacob", name="trash") is None
+    reply = signal.sent[-1][1]
+    assert "Today at 8:02 PM had passed when you said yes, too long ago to run it now." in reply
+    assert "It is now today at 8:30 PM." in reply
+    store.close()
+
+
+async def test_a_proposal_from_before_the_update_asks_again(tmp_path: Path) -> None:
+    """A yes to a preview that named start_at or in_seconds runs nothing and says to ask again."""
+    from assistai.inference.types import ToolCall
+    from assistai.jobs import bind_jobs
+
+    store = _store(tmp_path)
+    store.replace_proposal(
+        Proposal(
+            agent="jacob",
+            calls=(
+                ToolCall(
+                    id="c1",
+                    name="job_create",
+                    arguments=(
+                        '{"kind": "schedule", "name": "pool", '
+                        '"prompt": "Put the cleaner in the pool.", '
+                        '"every_seconds": 86400, "once": true, "verbatim": true, '
+                        '"start_at": "2026-12-07T08:00:00"}'
+                    ),
+                ),
+            ),
+            tainted=True,
+            created_at=time.time(),
+            expires_at=time.time() + 600,
+        )
+    )
+
+    def boom(_req: httpx.Request) -> httpx.Response:
+        raise AssertionError("confirm must not call the model")
+
+    signal = FakeSignal()
+    fireworks = client_for(boom)
+    home = household(
+        agent("jacob", "+15555550101", tools=("job_create",)), agent("spouse", "+15555550102")
+    )
+    catalog = builtin_catalog()
+    for name, handler in bind_jobs(store, timezone="UTC").items():
+        catalog.bind(name, handler)
+    channel = _channel(
+        tmp_path,
+        signal,
+        fireworks,
+        home=home,
+        broker=ToolBroker(catalog, home.broker),
+        store=store,
+    )
+
+    await channel.handle(inbound(text="yes"))
+
+    assert store.find_job("jacob", name="pool") is None
+    assert store.load_proposal("jacob") is None
+    assert signal.sent[-1][1] == (
+        "This was proposed before an update. Ask again and I will set it up."
+    )
+    await fireworks.aclose()
+    store.close()
 
 
 async def test_relay_yes_sends_verbatim_and_taints_the_recipient(tmp_path: Path) -> None:

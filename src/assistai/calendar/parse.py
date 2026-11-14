@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from icalendar import Calendar
 from icalendar.error import IncompleteComponent, InvalidCalendar
 
+from assistai.clock import in_zone
 from assistai.errors import CalendarError
 
 MAX_SUMMARY = 200
@@ -86,9 +87,7 @@ def _event(component: Any, zone: ZoneInfo) -> CalendarEvent | None:
 
 def _localize(value: datetime | date, zone: ZoneInfo) -> datetime:
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=zone)
-        return value.astimezone(zone)
+        return in_zone(value, zone)
     return datetime.combine(value, time.min, tzinfo=zone)
 
 

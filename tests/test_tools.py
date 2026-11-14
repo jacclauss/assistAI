@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from assistai.inference.tools import GET_TIME_SPEC, default_registry
+from assistai.inference.tools import GET_TIME_SPEC, bind_clock, default_registry
 from tests.fakes import body, tool_call
 
 
@@ -13,6 +15,24 @@ async def test_get_time_returns_utc() -> None:
 
     assert "T" in result["utc"]
     assert result["utc"].endswith("+00:00") or result["utc"].endswith("Z")
+
+
+def test_the_household_get_time_names_the_weekday_and_today() -> None:
+    """The model reads which day it is; it does not work out a weekday from a timestamp."""
+    result = json.loads(bind_clock("America/Chicago")({}))
+
+    assert result["timezone"] == "America/Chicago"
+    assert result["weekday"] in {
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    }
+    assert result["today"].startswith(f"today, {result['weekday']}, ")
+    assert "start_at" not in GET_TIME_SPEC.description
 
 
 async def test_unknown_tool_is_an_error_string() -> None:

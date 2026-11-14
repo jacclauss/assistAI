@@ -8,6 +8,7 @@ directly. ``get_time`` stays side-effect free.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from assistai.clock import HouseholdClock, local_text, say_day, weekday_of
 from assistai.errors import (
     CalendarError,
     JobError,
@@ -50,9 +52,10 @@ class ToolSurface(Protocol):
 GET_TIME_SPEC = ToolSpec(
     name="get_time",
     description=(
-        "Return the current household local time and UTC. "
-        "Call this in the same turn before job_create or relay start_at. "
-        "local has no timezone suffix; copy that form into start_at."
+        "Return the current household local time, weekday, today's date, and UTC. "
+        "Call this in the same turn before any at in job_create, job_reschedule, "
+        "or relay. Use it to check which day 'tomorrow' or a weekday is; at still "
+        "takes the person's words, not a time you work out."
     ),
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
 )
@@ -119,17 +122,29 @@ def get_time(_arguments: dict[str, Any]) -> str:
     return json.dumps({"utc": datetime.now(UTC).isoformat()})
 
 
-def bind_clock(timezone: str) -> Callable[[dict[str, Any]], str]:
-    """Clock the model must read before it names a start_at. Local matches that field."""
+def bind_clock(
+    timezone: str, *, now: Callable[[], float] | None = None
+) -> Callable[[dict[str, Any]], str]:
+    """Clock the model must read before it names an ``at``.
+
+    The weekday and today's date are spelled out by the server, so the model
+    does not work out which day "Monday" or "tomorrow" is from a timestamp.
+    ``now`` is the wall clock unless an eval case stops it at its own moment.
+    """
 
     def handler(_arguments: dict[str, Any]) -> str:
-        zone = ZoneInfo(timezone)
-        now = datetime.now(zone)
+        # One reading for every field, so local, today, and utc cannot
+        # straddle midnight and disagree about the day.
+        instant = now() if now is not None else time.time()
+        clock = HouseholdClock(zone=ZoneInfo(timezone), now=lambda: instant)
+        today = clock.today()
         return json.dumps(
             {
                 "timezone": timezone,
-                "local": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                "utc": datetime.now(UTC).isoformat(),
+                "local": local_text(instant, clock=clock),
+                "weekday": weekday_of(today),
+                "today": say_day(today, clock=clock),
+                "utc": datetime.fromtimestamp(instant, UTC).isoformat(),
             }
         )
 

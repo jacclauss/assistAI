@@ -215,7 +215,7 @@ class Gateway:
                 quarantine=self._manifest.quarantine if self._manifest is not None else None,
             ).items():
                 broker.bind(name, handler)
-            for name, handler in bind_calendar(self._settings).items():
+            for name, handler in bind_calendar(self._settings, clock=self._clock).items():
                 broker.bind(name, handler)
             for name, handler in bind_mail(self._settings, store).items():
                 broker.bind(name, handler)

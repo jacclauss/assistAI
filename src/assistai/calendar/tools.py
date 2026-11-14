@@ -10,6 +10,7 @@ from typing import Any
 from assistai.calendar.client import Agenda, CalendarClient
 from assistai.calendar.draft import parse_add
 from assistai.calendar.parse import CalendarEvent
+from assistai.clock import HouseholdClock, say_day
 from assistai.config import Settings
 from assistai.errors import CalendarError
 from assistai.inference.types import ToolSpec
@@ -75,19 +76,25 @@ CALENDAR_ADD_SPEC = ToolSpec(
 def bind_calendar(
     settings: Settings,
     *,
+    clock: HouseholdClock,
     client: CalendarClient | None = None,
 ) -> dict[str, Callable[[dict[str, Any]], Awaitable[str]]]:
-    """Handler closed over the household calendar. Bound when the channel starts."""
+    """Handler closed over the household calendar. Bound when the channel starts.
+
+    ``clock`` is the household clock that "today", the day named in a
+    result, and the times of an added event are read on. There is no
+    fallback: the wall clock's date is the UTC date on the Pi in the evening.
+    """
     calendar = client or CalendarClient(settings)
 
     async def today(arguments: dict[str, Any]) -> str:
         day = _day(arguments.get("date"))
-        agenda = await calendar.agenda(day)
-        return json.dumps(_payload(agenda), ensure_ascii=False)
+        agenda = await calendar.agenda(day if day is not None else clock.today())
+        return json.dumps(_payload(agenda, clock=clock), ensure_ascii=False)
 
     async def add(arguments: dict[str, Any]) -> str:
-        draft = parse_add(arguments)
-        return await calendar.create(draft)
+        draft = parse_add(arguments, clock=clock)
+        return await calendar.create(draft, clock=clock)
 
     return {CALENDAR_TODAY: today, CALENDAR_ADD: add}
 
@@ -109,11 +116,14 @@ def _day(value: object) -> date | None:
         raise CalendarError("date must be YYYY-MM-DD") from exc
 
 
-def _payload(agenda: Agenda) -> dict[str, Any]:
+def _payload(agenda: Agenda, *, clock: HouseholdClock) -> dict[str, Any]:
+    # The day in words makes a date the model got wrong visible to it and in
+    # its answer: a UTC date read in a Chicago evening says "tomorrow" (F-6).
     body: dict[str, Any] = {
         "calendar": agenda.calendar,
         "timezone": agenda.timezone,
         "date": agenda.day.isoformat(),
+        "day": say_day(agenda.day, clock=clock),
         "events": [_event_dict(event) for event in agenda.events],
     }
     if agenda.truncated:

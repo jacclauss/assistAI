@@ -1,0 +1,14 @@
+# Spec 016 AC5: a clock time the person names goes to at, not a delay the
+# model worked out. "8:53pm" at 3:04 PM was once sent as a delay.
+id = "reminder-named-clock"
+tags = ["jobs", "time", "regression"]
+user = "remind me at 8:53pm to call mom"
+now = 2026-10-30T15:04:00
+timezone = "America/Chicago"
+
+[expect]
+calls = ["get_time", "job_create"]
+
+[expect.arguments.job_create]
+equals = { "at.hour" = 20, "at.minute" = 53 }
+absent = ["delay"]

@@ -27,6 +27,43 @@
   previous image for a rollback ([pi-deploy.md](pi-deploy.md)). Coming
   forward again rebuilds any job the previous image ran or rescheduled, so
   a change made while rolled back is kept and a daily job keeps its hour.
+- "Every morning" with no hour now gets "what time?" back, and nothing is
+  set up until you name one. This reverses the 0.1.8 note "'Every morning'
+  with no hour is a daily mail check. It does not ask what time." on
+  purpose: a daily or weekly job keeps the time of day you named, so it
+  needs one. Answer with the hour and the preview shows the job at that
+  time.
+- The assistant passes your words for a time, such as "tomorrow at 8" or
+  "December 7 at 9", and the server works out the day. A preview of
+  something that waits for a yes shows the date it worked out, and the yes
+  runs that date, even after midnight. A delay, such as "in two hours",
+  counts from your yes.
+- Changing only how often a job repeats keeps its next run and its time:
+  moving the December 7 reminder to weekly keeps December 7 at 8:00 AM.
+  Moving a job to another hour keeps the day it was going to run, unless
+  you name a day or date. Before, both moved the next run to the next
+  time that hour came round, or one interval from now.
+- Every time you see is written by the server in household time, with
+  the weekday and "today" or "tomorrow" where it helps: previews,
+  confirmations, the job list, and calendar entries. The assistant no
+  longer works a time out from a number, so "when is my reminder?" names
+  the hour on your clock, not the UTC one.
+- A yes that comes after the time you named has passed still works. A
+  repeating job starts at its next time and says so. A one-time reminder
+  or message to the other person goes out at the yes, and says the time
+  had passed, if it is no more than about 11 minutes late. Moving a
+  one-time reminder to such a time works the same way, and it arrives
+  after the reply that confirms the move. Later than that, nothing is set
+  up or moved; ask again with a later time.
+- A calendar event at a time the clocks skip in spring is refused with the
+  reason. One in the hour that repeats in the fall is the first of the
+  two, and the preview names it, such as "1:30 AM CDT". An event with no
+  end lasts one real hour, even across a clock change.
+- For the operator: when a message names a clock time ("at 8:53pm") and
+  the assistant still set a delay instead, the gateway logs
+  `jobs.delay_with_named_clock` with the agent and tool, not the message.
+  Nothing is refused. Watch it for two weeks after this deploy.
+- A proposal made before this update is not run by a yes. Ask again.
 
 ## 0.1.8 — 24 October 2026
 

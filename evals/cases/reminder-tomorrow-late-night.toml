@@ -1,0 +1,15 @@
+# Spec 016 AC8: "tomorrow" at 11:30 PM local is the local tomorrow, not the
+# UTC one. The model may copy the word or name the date it reads from
+# get_time; both are the 31st.
+id = "reminder-tomorrow-late-night"
+tags = ["jobs", "time", "regression"]
+user = "remind me tomorrow at 8 to take the bins in"
+now = 2026-10-30T23:30:00
+timezone = "America/Chicago"
+
+[expect]
+calls = ["get_time", "job_create"]
+
+[expect.arguments.job_create]
+any_of = [{ "at.day" = "tomorrow" }, { "at.date" = "2026-10-31" }]
+absent = ["delay"]

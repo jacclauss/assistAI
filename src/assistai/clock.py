@@ -45,6 +45,73 @@ _MONTHS = (
 )
 DAY_WORDS = ("today", "tomorrow", *_WEEKDAYS)
 
+# The time arguments of job_create, relay, and job_reschedule, as the model
+# sees them. They take the person's words, not an instant: the server turns
+# those into an instant with this module's rules.
+AT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "description": (
+        "A clock time the person named, in their words. 'tomorrow at 8' is day "
+        "tomorrow and hour 8. 'Monday at 7:30' is day monday, hour 7, minute 30. "
+        "'December 7 at 9' is date 2026-12-07 and hour 9. A bare 'at 8' is hour 8 "
+        "with neither day nor date. Needs get_time in this turn."
+    ),
+    "properties": {
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59, "default": 0},
+        "day": {
+            "type": "string",
+            "enum": list(DAY_WORDS),
+            "description": "today, tomorrow, or a weekday. Omit when date is set.",
+        },
+        "date": {
+            "type": "string",
+            "description": "A calendar date, YYYY-MM-DD. Omit when day is set.",
+        },
+        "fold": {
+            "type": "integer",
+            "enum": [0, 1],
+            "description": (
+                "Written by the server when it stores the call, for an hour the "
+                "clocks repeat. Do not set it."
+            ),
+        },
+    },
+    "required": ["hour"],
+    "additionalProperties": False,
+}
+
+DELAY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "description": (
+        "Only for a duration the person said: 'in two hours', 'in 50 days'. "
+        "The server counts it. At least one minute in total."
+    ),
+    "properties": {
+        "days": {"type": "integer", "minimum": 0},
+        "hours": {"type": "integer", "minimum": 0},
+        "minutes": {"type": "integer", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
+
+EVERY_DAYS_SCHEMA: dict[str, object] = {
+    "type": "integer",
+    "minimum": 1,
+    "description": (
+        "Whole days between runs: 1 is daily, 7 is weekly. The run keeps the "
+        "local time in at across daylight saving. Needs at."
+    ),
+}
+
+EVERY_MINUTES_SCHEMA: dict[str, object] = {
+    "type": "integer",
+    "minimum": 1,
+    "description": (
+        "Elapsed minutes between runs, such as 90. Not for whole days: use every_days."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class HouseholdClock:
@@ -124,21 +191,47 @@ class Schedule:
         return self.every_days is not None or self.every_seconds is not None
 
 
-def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
-    """The instant the person meant by a named clock time.
+def resolve_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> float:
+    """The instant the person meant by a named clock time, refused once it has passed.
+
+    The instant is read as ``named_instant`` reads it. A time more than a
+    minute past is refused with the household's now in words, so the model
+    can correct the day instead of guessing.
+    """
+    moment, now = _named(at, clock=clock, on=on)
+    if moment < now - PAST_TOLERANCE_SECONDS:
+        raise JobError(
+            f"{_full(moment, clock.zone, year=True)} has already passed. "
+            f"It is now {_full(now, clock.zone, year=True)} household time ({clock.zone.key}). "
+            "Name a later day or time."
+        )
+    return moment
+
+
+def named_instant(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> float:
+    """The instant the person meant by a named clock time, even when it has passed.
 
     A ``day`` is read against the household date, never the UTC date, so
     "tomorrow at 8" at 11:30 PM is the local tomorrow. A weekday is today
     while that time is still more than a minute ahead, so "Monday at 7:30"
-    on Monday morning is not next week. A time the spring change skips is
-    refused with the reason; a time the fall-back hour repeats is the first
-    occurrence unless ``fold`` is 1 or the first has passed. A time more
-    than a minute past is refused with the household's now in words, so
-    the model can correct the day instead of guessing.
+    on Monday morning is not next week. A bare time is on ``on`` when it is
+    given, or the day after once that has passed, so moving a December
+    reminder "to 9" keeps December; without ``on`` it is the next time the
+    clock shows it. A time the spring change skips is refused with the
+    reason; a time the fall-back hour repeats is the first occurrence
+    unless ``fold`` is 1 or the first has passed. Only a date, today, or
+    tomorrow can name a time already past; a confirm reads that time to
+    say it passed before the yes.
     """
+    return _named(at, clock=clock, on=on)[0]
+
+
+def _named(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None) -> tuple[float, float]:
+    """The named instant and the now it was read against, so both checks see one clock reading."""
     _check_at(at)
     now = clock.now()
     today = _local(now, clock.zone).date()
+    base = today if on is None else max(on, today)
     earliest = now - PAST_TOLERANCE_SECONDS
     try:
         if at.date is not None:
@@ -152,20 +245,81 @@ def resolve_at(at: LocalAt, *, clock: HouseholdClock) -> float:
             if ahead == 0 and _latest(today, at, clock.zone) <= now + PAST_TOLERANCE_SECONDS:
                 ahead = 7
             day = today + dt.timedelta(days=ahead)
-        elif _latest(today, at, clock.zone) < earliest:
-            day = today + dt.timedelta(days=1)
+        elif _latest(base, at, clock.zone) < earliest:
+            day = base + dt.timedelta(days=1)
         else:
-            day = today
+            day = base
     except OverflowError as exc:
         raise JobError("that date is too far out to schedule") from exc
-    moment = _occurrence(day, at, clock.zone, earliest=earliest)
-    if moment < earliest:
-        raise JobError(
-            f"{_full(moment, clock.zone, year=True)} has already passed. "
-            f"It is now {_full(now, clock.zone, year=True)} household time ({clock.zone.key}). "
-            "Name a later day or time."
-        )
-    return moment
+    return _occurrence(day, at, clock.zone, earliest=earliest), now
+
+
+def fix_at(at: LocalAt, *, clock: HouseholdClock, on: dt.date | None = None) -> LocalAt:
+    """``at`` pinned to the date it means now, with ``fold`` when that time happens twice.
+
+    "Tomorrow" in a preview shown at 11:58 PM is a different day at a
+    12:03 AM yes, so a staged time is stored as the date the person was
+    shown. ``on`` is read as in ``resolve_at``. ``fold`` is written only for
+    the fall-back hour, where the date and clock time alone do not say
+    which occurrence was meant. Refuses what ``resolve_at`` refuses.
+    """
+    moment = resolve_at(at, clock=clock, on=on)
+    local = _local(moment, clock.zone)
+    return LocalAt(
+        date=local.date(),
+        hour=at.hour,
+        minute=at.minute,
+        fold=local.fold if _repeated(local) else None,
+    )
+
+
+def say_at(at: LocalAt) -> str:
+    """A named time as the person can check it, before it is resolved to an instant.
+
+    A date carries its weekday and year, so a date the model got wrong reads
+    as wrong. Which occurrence of a fall-back hour is meant is spelled out,
+    because the clock time alone shows it twice.
+    """
+    text = _clock_text(dt.time(at.hour, at.minute))
+    if at.fold == 0:
+        text = f"{text} (the first one, before the clocks fall back)"
+    elif at.fold == 1:
+        text = f"{text} (the second one, after the clocks fall back)"
+    if at.date is not None:
+        return f"{_date_text(at.date, year=True)} at {text}"
+    if at.day in ("today", "tomorrow"):
+        return f"{at.day} at {text}"
+    if at.day is not None:
+        return f"{at.day.capitalize()} at {text}"
+    return f"the next {text}"
+
+
+def say_every(
+    *, every_days: int | None, every_minutes: int | None, at: LocalAt | None = None
+) -> str:
+    """How often a requested repeat runs, in words, before it is stored as a schedule.
+
+    A whole-day repeat names the clock time it keeps. Without ``at`` it keeps
+    the time the job already runs at, and says so.
+    """
+    if every_minutes is not None:
+        phrase = say_duration(every_minutes * 60)
+        return f"every {phrase[2:]}" if phrase.startswith("1 ") else f"every {phrase}"
+    if every_days is None:
+        return "once"
+    at_text = _clock_text(dt.time(at.hour, at.minute)) if at is not None else "the time it runs now"
+    if every_days == 1:
+        return f"every day at {at_text}"
+    if every_days == 7 and at is not None and at.date is not None:
+        return f"every {_weekday(at.date)} at {at_text}"
+    if every_days == 7 and at is not None and at.day is not None and at.day in _WEEKDAYS:
+        return f"every {at.day.capitalize()} at {at_text}"
+    return f"every {every_days} days at {at_text}"
+
+
+def weekday_of(day: dt.date) -> str:
+    """The weekday name of a date, so the model reads it instead of working it out."""
+    return _weekday(day)
 
 
 def next_slot(schedule: Schedule, *, after: float) -> float:
@@ -307,6 +461,62 @@ def say_day(day: dt.date, *, clock: HouseholdClock) -> str:
     return text
 
 
+def say_span(start: float, end: float, *, clock: HouseholdClock) -> str:
+    """A timed event as a person reads it: the start in full, and the end alone on the same day.
+
+    Each end carries the zone abbreviation when the fall-back hour shows its
+    clock time twice, the same as ``say_when``.
+    """
+    end_local = _local(end, clock.zone)
+    if end_local.date() == _local(start, clock.zone).date():
+        return f"{say_when(start, clock=clock)} to {_clock_text(end_local)}"
+    return f"{say_when(start, clock=clock)} to {say_when(end, clock=clock)}"
+
+
+def local_text(instant: float, *, clock: HouseholdClock) -> str:
+    """An instant as the household's wall clock shows it, ``YYYY-MM-DDTHH:MM:SS``.
+
+    This is the reading ``get_time`` and the system prompt give the model,
+    so it is never the UTC wall time with the zone name beside it.
+    """
+    return _local(instant, clock.zone).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def require_representable(instant: float, zone: ZoneInfo) -> None:
+    """Refuse an instant the zone cannot show, before anything is saved for it."""
+    try:
+        _local(instant, zone)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise JobError("that time is too far out to schedule") from exc
+
+
+def wall_time(moment: dt.datetime, zone: ZoneInfo) -> dt.datetime:
+    """The aware time a floating calendar time names on the household's wall.
+
+    A time the spring change skips is refused with ``resolve_at``'s reason,
+    so a job and a calendar add say the same thing about the same hour. A
+    time the fall-back hour repeats is its first occurrence: an event, unlike
+    a reminder, may be in the past, so "the next one still ahead" is no rule
+    for it. An aware time is moved to ``zone``, as ``in_zone`` moves it.
+    """
+    if moment.tzinfo is not None:
+        return moment.astimezone(zone)
+    first, second = _readings(moment, zone)
+    _refuse_skipped(first, second, zone)
+    return first
+
+
+def in_zone(moment: dt.datetime, zone: ZoneInfo) -> dt.datetime:
+    """A calendar time on the household's wall: a floating time is read there, an aware one moved.
+
+    A floating time is what the model sends and what an invite without a
+    zone holds; both mean the household clock, not UTC.
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=zone)
+    return moment.astimezone(zone)
+
+
 def local_reading(instant: float, *, clock: HouseholdClock) -> tuple[str, str]:
     """An instant as ISO-8601 local time and its UTC offset, for operator logs.
 
@@ -378,7 +588,11 @@ def _local(instant: float, zone: ZoneInfo) -> dt.datetime:
 
 
 def _walls(day: dt.date, at: LocalAt, zone: ZoneInfo) -> tuple[dt.datetime, dt.datetime]:
-    naive = dt.datetime.combine(day, dt.time(at.hour, at.minute))
+    return _readings(dt.datetime.combine(day, dt.time(at.hour, at.minute)), zone)
+
+
+def _readings(naive: dt.datetime, zone: ZoneInfo) -> tuple[dt.datetime, dt.datetime]:
+    """A floating time read with the offset before and after a change, which differ only at one."""
     return naive.replace(tzinfo=zone, fold=0), naive.replace(tzinfo=zone, fold=1)
 
 
@@ -390,20 +604,30 @@ def _latest(day: dt.date, at: LocalAt, zone: ZoneInfo) -> float:
 
 def _occurrence(day: dt.date, at: LocalAt, zone: ZoneInfo, *, earliest: float) -> float:
     first, second = _walls(day, at, zone)
-    before, after = first.utcoffset(), second.utcoffset()
-    if before is None or after is None or before == after:
+    _refuse_skipped(first, second, zone)
+    if not _repeated(first):
         return first.timestamp()
-    if before < after:
-        start, end = _jump(first, second, zone, before=before, after=after)
-        raise JobError(
-            f"{_clock_text(first)} does not exist on {_date_text(day, year=True)}: "
-            f"clocks go from {start} to {end}. Name another time."
-        )
     if at.fold == 1:
         return second.timestamp()
     if at.fold is None and first.timestamp() < earliest:
         return second.timestamp()
     return first.timestamp()
+
+
+def _refuse_skipped(first: dt.datetime, second: dt.datetime, zone: ZoneInfo) -> None:
+    """Refuse a wall time the spring change skips, naming the day and the jump.
+
+    Read with the offset before the change it would silently become an hour
+    the person did not say, so they are asked for another.
+    """
+    before, after = first.utcoffset(), second.utcoffset()
+    if before is None or after is None or before >= after:
+        return
+    start, end = _jump(first, second, zone, before=before, after=after)
+    raise JobError(
+        f"{_clock_text(first)} does not exist on {_date_text(first.date(), year=True)}: "
+        f"clocks go from {start} to {end}. Name another time."
+    )
 
 
 def _jump(

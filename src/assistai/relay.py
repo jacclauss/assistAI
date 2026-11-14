@@ -14,9 +14,22 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from assistai.agents import AgentSpec, Household
+from assistai.clock import (
+    AT_SCHEMA,
+    DELAY_SCHEMA,
+    EVERY_DAYS_SCHEMA,
+    EVERY_MINUTES_SCHEMA,
+    Delay,
+    HouseholdClock,
+    LocalAt,
+    resolve_at,
+    say_at,
+    say_duration,
+    say_repeat,
+    say_when,
+)
 from assistai.errors import JobError, StoreError
 from assistai.errors import RelayError as RelayError
 from assistai.inference.types import ToolSpec
@@ -32,14 +45,17 @@ RELAY_SPEC = ToolSpec(
     description=(
         "Send a Signal message to the other household member, now or later. "
         "'Remind them in 2 minutes that X' is this tool: body is the sentence "
-        "they should read, in_seconds is 120. Call it. Do not reply that you cannot. "
+        "they should read, delay is minutes 2. Call it. Do not reply that you cannot. "
         "Draft the body. Do not ask them to dictate the wording. "
         "Nothing is sent until they reply yes. "
-        "in_seconds is a delay the server counts. start_at is a named local time "
-        "and needs get_time in this turn. "
+        "delay is a duration the person said, counted by the server from the yes. "
+        "at is a clock time they named, in their words ('tomorrow' is day, a "
+        "calendar date is date, a bare hour is neither), and needs get_time in this turn. "
         "Once they reply yes, that stored text goes out at that time. "
         "Omit both to send as soon as they say yes. "
-        "once defaults to true. Set once false and every_seconds to repeat until they cancel. "
+        "once defaults to true. To repeat until they cancel, set once false and "
+        "every_days with at for a daily or weekly message, or every_minutes. "
+        "If they want it daily and did not name the time of day, ask what time first. "
         "Attachments are not supported yet — ask them to paste a link instead."
     ),
     parameters={
@@ -49,28 +65,14 @@ RELAY_SPEC = ToolSpec(
                 "type": "string",
                 "description": "Draft the other person will read, written by you.",
             },
-            "in_seconds": {
-                "type": "integer",
-                "description": (
-                    "Delay until the send, in seconds, measured by the server. "
-                    "At least 60. Omit start_at when you set this."
-                ),
-            },
-            "start_at": {
-                "type": "string",
-                "description": (
-                    "Named send time, local ISO-8601 without a timezone suffix. "
-                    "Requires get_time in this turn."
-                ),
-            },
+            "at": AT_SCHEMA,
+            "delay": DELAY_SCHEMA,
             "once": {
                 "type": "boolean",
                 "description": "Send once, then stop. Defaults to true for a future message.",
             },
-            "every_seconds": {
-                "type": "integer",
-                "description": "Gap between repeats after the first send. 86400 is daily.",
-            },
+            "every_days": EVERY_DAYS_SCHEMA,
+            "every_minutes": EVERY_MINUTES_SCHEMA,
             "name": {
                 "type": "string",
                 "description": (
@@ -87,20 +89,26 @@ InjectFn = Callable[[AgentSpec, str], Awaitable[None]]
 
 _ACTIVE_AGENT: ContextVar[AgentSpec | None] = ContextVar("assistai_relay_agent", default=None)
 _ACTIVE_TAINT: ContextVar[bool] = ContextVar("assistai_relay_tainted", default=False)
+_ACTIVE_COMMIT: ContextVar[bool] = ContextVar("assistai_relay_commit", default=False)
 
 
 @contextmanager
-def using_agent(agent: AgentSpec, *, tainted: bool = False) -> Iterator[None]:
-    """Bind the confirming agent, and whether its conversation is tainted, for one handler call.
+def using_agent(
+    agent: AgentSpec, *, tainted: bool = False, committing: bool = False
+) -> Iterator[None]:
+    """Bind the confirming agent, its taint, and whether a yes is running, for one handler call.
 
     A handler that stores text for later reads the taint here. The model's
-    arguments cannot clear it.
+    arguments cannot clear it, and they cannot claim a yes either: only the
+    broker's commit sets ``committing``.
     """
     token = activate_agent(agent)
     taint_token = _ACTIVE_TAINT.set(tainted)
+    commit_token = _ACTIVE_COMMIT.set(committing)
     try:
         yield
     finally:
+        _ACTIVE_COMMIT.reset(commit_token)
         _ACTIVE_TAINT.reset(taint_token)
         reset_agent(token)
 
@@ -123,6 +131,16 @@ def active_agent() -> AgentSpec:
 def active_taint() -> bool:
     """True when the conversation running this handler holds untrusted text."""
     return _ACTIVE_TAINT.get()
+
+
+def active_commit() -> bool:
+    """True while a handler runs a stored call the person said yes to.
+
+    A named time can pass between the preview and the yes. Only then is a
+    passed time moved to the next run or sent at the yes; a call the model
+    makes directly with a passed time is still refused.
+    """
+    return _ACTIVE_COMMIT.get()
 
 
 def format_outbound(from_name: str, body: str) -> str:
@@ -156,85 +174,81 @@ def parse_body(arguments: dict[str, Any], *, from_name: str | None = None) -> st
 
 @dataclass(frozen=True)
 class RelayWhen:
-    """A future send. Absent fields mean the relay goes out on yes."""
+    """A future send. ``first`` is the named time or the delay the person said."""
 
     name: str
-    every_seconds: int
     once: bool
-    in_seconds: int | None
-    start_at: str | None
+    first: LocalAt | Delay | None
+    every_days: int | None = None
+    every_minutes: int | None = None
+
+
+# Any of these makes a relay a later send, so it goes through the job parser.
+# An old in_seconds or start_at must be refused there, not read as "send now".
+_WHEN_FIELDS = (
+    "at",
+    "delay",
+    "every_days",
+    "every_minutes",
+    "every_seconds",
+    "in_seconds",
+    "start_at",
+)
 
 
 def parse_relay_when(arguments: dict[str, Any]) -> RelayWhen | None:
     """Timing for a later relay, or None when yes should send now.
 
-    A start_at that is present but not text used to fall through to an
-    immediate send. Yes would deliver now, which is the opposite of a
-    named time.
+    The job parser's rules hold here too: a daily relay with no named hour
+    is refused so the person is asked what time, and the old time arguments
+    are refused instead of falling through to an immediate send, which is
+    the opposite of a named time.
     """
     from assistai.jobs import parse_create
 
-    in_raw = arguments.get("in_seconds") if arguments.get("in_seconds") is not None else None
-    if "start_at" in arguments and arguments.get("start_at") is not None:
-        start_raw = arguments.get("start_at")
-        if not isinstance(start_raw, str) or not start_raw.strip():
-            raise RelayError("start_at must be an ISO-8601 date and time")
-    else:
-        start_raw = None
-    if in_raw is None and start_raw is None:
+    if all(arguments.get(field) is None for field in _WHEN_FIELDS):
         return None
     name = arguments.get("name") if arguments.get("name") is not None else _DEFAULT_RELAY_NAME
     once = True if arguments.get("once") is None else arguments.get("once")
-    every = 86400 if arguments.get("every_seconds") is None else arguments.get("every_seconds")
     try:
         spec = parse_create(
             {
+                **{field: arguments[field] for field in _WHEN_FIELDS if field in arguments},
                 "kind": "schedule",
                 "name": name,
                 "prompt": "relay",
-                "every_seconds": every,
                 "once": once,
                 "verbatim": True,
-                **({"in_seconds": in_raw} if in_raw is not None else {}),
-                **(
-                    {"start_at": start_raw}
-                    if isinstance(start_raw, str) and start_raw.strip()
-                    else {}
-                ),
             }
         )
     except JobError as exc:
         raise RelayError(str(exc)) from exc
     return RelayWhen(
         name=spec.name,
-        every_seconds=spec.every_seconds,
         once=spec.once,
-        in_seconds=spec.in_seconds,
-        start_at=spec.start_at,
+        first=spec.first,
+        every_days=spec.every_days,
+        every_minutes=spec.every_minutes,
     )
 
 
-def when_phrase(when: RelayWhen) -> str:
-    """Preview text. The clock is resolved again when they say yes."""
-    if when.in_seconds is not None:
-        return f"{_delay_phrase(when.in_seconds)} after you confirm"
-    return f"at {when.start_at} local time"
+def when_phrase(when: RelayWhen, *, clock: HouseholdClock) -> str:
+    """Preview text. A staged at already carries its date; a delay counts from the yes.
 
-
-def _delay_phrase(seconds: int) -> str:
-    if seconds % 86400 == 0:
-        count = seconds // 86400
-        unit = "day" if count == 1 else "days"
-        return f"{count} {unit}"
-    if seconds % 3600 == 0:
-        count = seconds // 3600
-        unit = "hour" if count == 1 else "hours"
-        return f"{count} {unit}"
-    if seconds % 60 == 0:
-        count = seconds // 60
-        unit = "minute" if count == 1 else "minutes"
-        return f"{count} {unit}"
-    return f"{seconds} seconds"
+    A named time that cannot be resolved any more, because it has passed,
+    is shown as the person named it rather than not at all.
+    """
+    if isinstance(when.first, Delay):
+        return f"{say_duration(when.first.seconds)} after you reply yes"
+    if isinstance(when.first, LocalAt):
+        try:
+            return say_when(resolve_at(when.first, clock=clock), clock=clock)
+        except JobError:
+            return say_at(when.first)
+    if when.every_minutes is not None:
+        # A minute repeat with no first time starts one gap after the yes.
+        return f"{say_duration(when.every_minutes * 60)} after you reply yes"
+    return "as soon as you reply yes"
 
 
 async def deliver_stored_relay(
@@ -285,6 +299,7 @@ def bind_relay(
     inject: InjectFn,
     store: Any = None,
     timezone: str = "UTC",
+    staging_ttl_seconds: float = 600.0,
 ) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """Handler closed over the live household and Signal client.
 
@@ -292,55 +307,74 @@ def bind_relay(
     The channel owns that write so it can take her history lock and keep the
     in-memory cache aligned with SQLite. A future relay stores the body and
     sends those bytes when it is due. Yes is the only confirmation.
+    ``staging_ttl_seconds`` is how long a proposal lives, which bounds how
+    late a confirmed one-time relay may be and still go out at the yes.
     """
+    from assistai.jobs import late_send_seconds
+
+    late_seconds = late_send_seconds(staging_ttl_seconds)
+
+    async def send_now(sender: AgentSpec, body: str) -> dict[str, object]:
+        await deliver_stored_relay(
+            household=household,
+            signal=signal,
+            inject=inject,
+            sender=sender,
+            body=body,
+        )
+        return {"ok": True, "to": _peer(household, sender), "from": sender.name}
 
     async def relay(arguments: dict[str, Any]) -> str:
         sender = active_agent()
         body = parse_body(arguments, from_name=sender.name)
         when = parse_relay_when(arguments)
         if when is None:
-            await deliver_stored_relay(
-                household=household,
-                signal=signal,
-                inject=inject,
-                sender=sender,
-                body=body,
-            )
-            return json.dumps(
-                {"ok": True, "to": _peer(household, sender), "from": sender.name},
-                ensure_ascii=False,
-            )
+            return json.dumps(await send_now(sender, body), ensure_ascii=False)
         if store is None:
             raise RelayError("a future relay cannot be stored")
         from assistai.jobs import (
             Job,
-            current_time,
+            confirmed_first_run,
             describe_saved_reminder,
+            household_clock,
             new_job_id,
+            passed_when_confirmed,
             require_representable,
-            resolve_start_at,
-            schedule_from_seconds,
-            start_at_clock,
+            schedule_for,
         )
 
-        now = current_time()
-        if when.in_seconds is not None:
-            first_run = now + when.in_seconds
-        elif when.start_at is not None:
-            try:
-                first_run = resolve_start_at(when.start_at, now=now, timezone=timezone)
-            except JobError as exc:
-                raise RelayError(str(exc)) from exc
-        else:
-            raise RelayError("a future relay needs in_seconds or start_at")
+        try:
+            clock = household_clock(timezone)
+            now = clock.now()
+            start = confirmed_first_run(
+                when.first,
+                clock=clock,
+                once=when.once,
+                every_days=when.every_days,
+                every_minutes=when.every_minutes,
+                late_seconds=late_seconds,
+            )
+        except JobError as exc:
+            raise RelayError(str(exc)) from exc
+        if start.passed is not None and when.once:
+            # The yes is the send time now, so the bytes go out the way a
+            # relay with no time does, not on the next poll.
+            sent = await send_now(sender, body)
+            sent["say"] = (
+                f"{passed_when_confirmed(start.passed, clock=clock)}; "
+                f'I sent it to the other phone now: "{body}"'
+            )
+            return json.dumps(sent, ensure_ascii=False)
+        first_run = start.at
         try:
             require_representable(first_run, timezone)
-            schedule = schedule_from_seconds(
-                zone=ZoneInfo(timezone),
+            schedule = schedule_for(
+                zone=clock.zone,
                 first_run=first_run,
-                every_seconds=when.every_seconds,
                 once=when.once,
-                at_local=start_at_clock(when.start_at) if when.start_at is not None else None,
+                first=when.first,
+                every_days=when.every_days,
+                every_minutes=when.every_minutes,
             )
         except JobError as exc:
             raise RelayError(str(exc)) from exc
@@ -356,7 +390,7 @@ def bind_relay(
             kind="schedule",
             name=job_name,
             prompt=body,
-            every_seconds=when.every_seconds,
+            every_seconds=_every_seconds(when),
             ttl_seconds=None,
             created_at=now,
             expires_at=None,
@@ -379,10 +413,11 @@ def bind_relay(
         say = describe_saved_reminder(
             prompt=body,
             fires_at=first_run,
-            now=now,
-            timezone=timezone,
+            clock=clock,
             audience="the other phone",
             name=job.name,
+            repeats=say_repeat(schedule, clock=clock) if schedule.repeats else None,
+            passed=start.passed,
         )
         return json.dumps(
             {"ok": True, "scheduled": True, "id": job.id, "name": job.name, "say": say},
@@ -390,6 +425,15 @@ def bind_relay(
         )
 
     return relay
+
+
+def _every_seconds(when: RelayWhen) -> int:
+    """The gap written beside the schedule for an older build; a day for a one-time send."""
+    if when.every_days is not None:
+        return when.every_days * 86400
+    if when.every_minutes is not None:
+        return when.every_minutes * 60
+    return 86400
 
 
 def _relay_job_name(store: Any, agent_name: str, requested: str, *, explicit: bool) -> str:

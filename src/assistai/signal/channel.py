@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Literal
 
@@ -21,10 +22,12 @@ from assistai.inference.loop import run_turn
 from assistai.inference.tools import bind_clock
 from assistai.inference.types import Message, ToolCall
 from assistai.jobs import (
+    JOB_CREATE,
     Job,
     JobOutcome,
     bind_jobs,
     empty_report_is_real,
+    household_clock,
     is_nothing,
     job_user_prompt,
     look_again_prompt,
@@ -37,7 +40,13 @@ from assistai.signal.envelopes import InboundText, parse_inbound
 from assistai.signal.numbers import is_uuid
 from assistai.signal.policy import AccessPolicy
 from assistai.signal.ratelimit import RateLimiter
-from assistai.staging import Proposal, format_executed, format_proposal, parse_decision
+from assistai.staging import (
+    JobFinder,
+    Proposal,
+    format_executed,
+    format_proposal,
+    parse_decision,
+)
 from assistai.store import Store
 
 log = structlog.get_logger(__name__)
@@ -104,11 +113,19 @@ class SignalChannel:
                 inject=self._inject_relay,
                 store=store,
                 timezone=self._timezone,
+                staging_ttl_seconds=settings.staging_ttl_seconds,
             ),
         )
-        for name, handler in bind_jobs(store, timezone=self._timezone).items():
+        jobs = bind_jobs(
+            store, timezone=self._timezone, staging_ttl_seconds=settings.staging_ttl_seconds
+        )
+        for name, handler in jobs.items():
             broker.bind(name, handler)
         broker.bind("get_time", bind_clock(self._timezone))
+        # A staged time is fixed on the clock the job handlers read, so the
+        # date in the preview is the date the yes runs.
+        self._clock = household_clock(self._timezone)
+        broker.use_clock(self._clock)
         self._histories: dict[str, list[Message]] = {}
         self._open_turns: list[BoundSurface] = []
         self._locks: dict[str, asyncio.Lock] = {}
@@ -283,12 +300,16 @@ class SignalChannel:
         return self._job_sends.would_allow(agent.name)
 
     def holds_job(self, job_id: str) -> bool:
-        """A reminder saved by a turn still running waits for that turn.
+        """A reminder saved or moved by a turn still running waits for that turn.
 
         Otherwise it can reach the phone before the reply that confirms it,
-        or before a failed turn cancels it.
+        or before a failed turn cancels it. A one-time move confirmed late
+        is due at the yes, so it waits like a new reminder.
         """
-        return any(job_id in surface.saved_job_ids for surface in self._open_turns)
+        return any(
+            job_id in surface.saved_job_ids or job_id in surface.moved_job_ids
+            for surface in self._open_turns
+        )
 
     async def notify_job(self, agent: AgentSpec, text: str, *, untrusted: bool) -> NotifyStatus:
         """Send a job report. History is persisted separately after delivery is recorded."""
@@ -400,6 +421,11 @@ class SignalChannel:
                     self._cancel_turn_jobs(surface)
                     await self._safe_send(inbound.sender, _UNAVAILABLE)
                     return
+                for tool in _delays_beside_a_named_clock(inbound.text, messages[baseline:]):
+                    # Shadow mode: the owner reads these before deciding whether
+                    # a delay beside a clock time should be refused. Nothing of
+                    # the message is logged; it may be private.
+                    log.info("jobs.delay_with_named_clock", agent=agent.name, tool=tool)
                 reply = last_assistant_text(messages)
                 if surface.saved_reminders:
                     # The model announced 12:44pm after saving that guess, so the
@@ -420,7 +446,12 @@ class SignalChannel:
                 proposal: Proposal | Literal["keep"] = "keep"
                 if staged:
                     now = time.time()
-                    preview = format_proposal(staged, tainted=surface.tainted)
+                    preview = format_proposal(
+                        staged,
+                        tainted=surface.tainted,
+                        clock=self._clock,
+                        jobs=self._job_finder(agent.name),
+                    )
                     if surface.saved_reminders:
                         preview = reply + "\n\n" + preview
                     # The preview quotes staged prompts and relay bodies; in a
@@ -561,6 +592,14 @@ class SignalChannel:
                 return
         log.info("staging.discarded", agent=agent.name)
         await self._safe_send(inbound.sender, _DISCARDED)
+
+    def _job_finder(self, agent_name: str) -> JobFinder:
+        """This person's jobs, so a reschedule preview names the run the yes keeps."""
+
+        def find(*, name: str | None, job_id: str | None) -> Job | None:
+            return self._store.find_job(agent_name, name=name, job_id=job_id)
+
+        return find
 
     def _cancel_turn_jobs(self, surface: BoundSurface) -> None:
         """Drop reminders saved during a turn the person will be told failed.
@@ -753,3 +792,65 @@ def _names_another_time(reply: str, said: str) -> bool:
 
 def _clock_key(text: str) -> str:
     return re.sub(r"[\s.]", "", text).lower()
+
+
+# What a person writes for a time on the clock: "8:53pm", "7 a.m.", "7:05",
+# "at 8", "9 o'clock", "noon", "midnight". Durations ("in 2 hours") and
+# dates ("December 9") are not clock times. It reads only what the person
+# sent, not the model's reply, and it is separate from ``_CLOCK_TIME``,
+# which decides whether a reply is dropped.
+_NAMED_CLOCK = re.compile(
+    r"\b\d{1,2}(?::[0-5]\d)?\s*[ap]\.?m\b"
+    r"|\b(?:[01]?\d|2[0-3]):[0-5]\d\b"
+    r"|\bat\s+\d{1,2}(?![\d%])(?!\s*(?:minutes?|mins?|hours?|hrs?|days?|weeks?)\b)"
+    r"|\b\d{1,2}\s*o'?clock\b"
+    r"|\b(?:noon|midnight)\b",
+    re.IGNORECASE,
+)
+# job_reschedule takes no delay, so only these two can carry one.
+_DELAY_TOOLS = frozenset({JOB_CREATE, RELAY_TOOL})
+
+
+def _names_a_clock_time(text: str) -> bool:
+    """True when the person's message names a time on the clock, not a duration."""
+    return _NAMED_CLOCK.search(text) is not None
+
+
+def _delays_beside_a_named_clock(text: str, turn: Sequence[Message]) -> list[str]:
+    """Tools the turn saved or staged with a delay and no at, when the person named a clock time.
+
+    A delay the model worked out from "8:53pm" is arithmetic on a clock it
+    may have misread. The ``say`` line shows the result, but only a log
+    shows how often it happens. A call the broker refused is not counted.
+    """
+    if not _names_a_clock_time(text):
+        return []
+    results = {message.tool_call_id: message.content for message in turn if message.role == "tool"}
+    tools: list[str] = []
+    for message in turn:
+        if message.role != "assistant":
+            continue
+        for call in message.tool_calls:
+            if call.name not in _DELAY_TOOLS or _was_refused(results.get(call.id)):
+                continue
+            try:
+                arguments: object = json.loads(call.arguments) if call.arguments else {}
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(arguments, dict)
+                and arguments.get("delay") is not None
+                and arguments.get("at") is None
+            ):
+                tools.append(call.name)
+    return tools
+
+
+def _was_refused(content: str | None) -> bool:
+    if content is None:
+        return True
+    try:
+        parsed: object = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and "error" in parsed

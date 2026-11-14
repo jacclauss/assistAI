@@ -16,6 +16,7 @@ from assistai.shared.tools import SHARED_CHANGE, SHARED_LISTS, bind_shared
 from assistai.staging import format_proposal
 from assistai.store import Store
 from tests.agent_fakes import agent
+from tests.clock_fakes import chicago, chicago_clock
 from tests.fakes import tool_call
 
 
@@ -128,6 +129,7 @@ def test_a_private_preview_does_not_call_the_list_shared() -> None:
     preview = format_proposal(
         (tool_call(SHARED_CHANGE, '{"list": "gifts", "add": ["book"], "private": true}'),),
         tainted=False,
+        clock=chicago_clock(chicago(2026, 10, 30, 15)),
     )
     assert "private list" in preview
     assert "shared list" not in preview
@@ -152,7 +154,9 @@ def test_shared_change_stages_and_jobs_cannot_see_it() -> None:
             surface.execute(tool_call(SHARED_CHANGE, '{"list": "shopping", "add": ["milk"]}'))
         )
     assert "staged" in staged.content
-    assert "shopping" in format_proposal(surface.take_staged(), tainted=True)
+    assert "shopping" in format_proposal(
+        surface.take_staged(), tainted=True, clock=chicago_clock(chicago(2026, 10, 30, 15))
+    )
     report = ToolBroker(catalog, home.broker).for_agent(jacob, report_only=True)
     assert SHARED_CHANGE not in {spec.name for spec in report.specs()}
     assert SHARED_LISTS in {spec.name for spec in report.specs()}

@@ -1,0 +1,20 @@
+# Spec 016 AC7: job_list gives the next run in household words, and the
+# answer uses them. It once read a timestamp and said 2:00 PM, the UTC hour.
+# job_list is written by the production formatter from the row below.
+id = "job-list-when"
+tags = ["jobs", "time", "regression"]
+user = "When is my mgmplus reminder?"
+now = 2026-10-30T15:04:00
+timezone = "America/Chicago"
+
+[[jobs]]
+name = "mgmplus cancel reminder"
+prompt = "Cancel MGM+ before the rate goes up."
+next_run = 2026-12-10T08:00:00
+every_days = 1
+
+[expect]
+calls = ["job_list"]
+no_staged = ["job_create", "job_reschedule", "job_cancel"]
+reply_contains = ["December 10", "8:00 AM"]
+reply_excludes = ["2:00 PM", "14:00"]

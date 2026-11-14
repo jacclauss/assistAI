@@ -1,0 +1,21 @@
+# Spec 016 AC3: moving a daily reminder to another hour names only the
+# hour. It does not restate the repeat, which the job already keeps.
+id = "job-reschedule-hour"
+tags = ["jobs", "staging", "time", "regression"]
+user = "Move my mgmplus reminder to 9am"
+now = 2026-10-30T15:04:00
+timezone = "America/Chicago"
+
+[[jobs]]
+name = "mgmplus cancel reminder"
+prompt = "Cancel MGM+ before the rate goes up."
+next_run = 2026-12-10T08:00:00
+every_days = 1
+
+[expect]
+staged = ["job_reschedule"]
+no_staged = ["job_create", "job_cancel"]
+
+[expect.arguments.job_reschedule]
+equals = { "at.hour" = 9 }
+absent = ["every_days"]

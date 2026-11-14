@@ -129,7 +129,14 @@ of a single-box household appliance, not something the broker can fix.
 The shared calendar is the exception: one Apple ID that can see that calendar,
 one app-specific password, and the calendar's display name. The model does
 not choose another calendar. A read lists one day. Adding an event stages
-and waits for a yes; it does not invite anyone. "Today" is a day in `ASSISTAI_TIMEZONE`. iCloud is asked to expand
+and waits for a yes; it does not invite anyone. "Today" is a day in `ASSISTAI_TIMEZONE`. An added event's times
+are read on the household clock when it is staged: a time the spring change
+skips is refused with the reason a job gets ("2:30 AM does not exist on
+Sunday, March 14, 2027: clocks go from 2:00 to 3:00"), a time the fall-back
+hour repeats is the first one and the preview names it ("1:30 AM CDT"), the
+default end is one real hour later, and the ten-year bound is counted from
+the household's date, not the UTC one. The event is written as those
+instants. iCloud is asked to expand
 recurrences into that local day. Event text is untrusted, because an invite is
 attacker-controlled text. The app-specific password is not stored in the repo
 or in `.env`. The Mac gateway reads it from the Keychain; the Pi reads a
@@ -201,6 +208,30 @@ Properties that matter:
   content was in context. The human is the check, so they should know that a
   page or a mail is what asked for this.
 - A scheduled job never stages and waits. Jobs report.
+- A named time is stored resolved. The preview is shown now and the yes
+  runs later, so "tomorrow" shown at 11:58 PM would be another day at a
+  12:03 AM yes. When `job_create`, `job_reschedule`, or `relay` stages, the
+  broker fixes `at` to the date it means on the household clock, plus
+  `fold` for an hour the clocks repeat, and changes nothing else in the
+  arguments. A reschedule's bare hour is fixed against the job it moves,
+  to the date that job keeps, so the preview names the date the yes runs. It never adds an `at` the model did not send, and a `delay`
+  stays a delay that the preview says counts from the yes. The staged
+  result the model reads, the preview, and the yes all use that copy; the
+  model's own call stays in history. Without a household clock a named
+  time is not staged at all. A proposal stored before `at` and `delay`
+  existed is refused at the yes with "ask again", since its preview no
+  longer describes what this build would run.
+- A named time can pass while the preview waits. The broker's commit marks
+  the handler call as a yes (`relay.active_commit()`, beside the agent and
+  the taint), and only then is a passed `at` read as late rather than
+  refused; see § Jobs. The proposal is still consumed before the handlers
+  run, as for any other yes.
+- Every time in a preview is in the server's words on the household clock.
+  A job or relay, alone or in a bundle, names its first run ("First run:
+  tomorrow at 8:00 AM (Saturday, October 31)", or "2 hours after you reply
+  yes" for a `delay`) and its repeat ("every day at 8:00 AM", or "once"). A
+  reschedule names the next run the yes keeps, worked out from the job it
+  moves. A calendar add names its day relative to today.
 
 ## Jobs
 
@@ -242,10 +273,46 @@ row stores that as `tainted`. The reminder text, the relay confirmation,
 the digest report, and the failure and expiry notices of a tainted job are
 stored untrusted, and so are a tainted turn's proposal preview and the
 summary after its yes, so none of them can outlive the page that shaped
-them as the assistant's own words. A
-delay is `in_seconds`, added to the server clock. A named
-`start_at` is refused unless `get_time` ran in that same turn, and it has
-no timezone suffix. The Signal reply starts with the time the server stored
+them as the assistant's own words.
+
+The model names a time in the person's words, never as an instant. `at`
+is an hour and minute, with `day` (`today`, `tomorrow`, or a weekday) for
+"tomorrow at 8", `date` (YYYY-MM-DD) for "December 7 at 9", and neither
+for a bare "at 8". The server resolves it in the household zone: a weekday
+is today while that time is still ahead, a bare hour is the next time the
+clock shows it, a time the spring change skips is refused with the jump,
+and a time the fall-back hour repeats is the occurrence still ahead.
+`fold` is written by the server, not the model. A named `at` in
+`job_create`, `job_reschedule`, or `relay` is refused unless `get_time`
+ran in that same turn. `get_time` returns the local time, the weekday,
+and today's date in words. `delay` is a spoken duration in days, hours,
+and minutes, at least one minute, counted on the server clock from when the
+call runs. The repeat is `every_days` (whole days, which keeps the local
+time in `at`) or `every_minutes` (elapsed time). `every_days` without
+`at`, including with only a `delay`, is refused with "Ask them what time":
+a daily or weekly job cannot exist without an hour the person named, so
+"every morning" gets a question back and nothing is staged or saved. A
+number of minutes that makes whole days is refused for the same reason.
+The refusal is in the parser that staging, a clean reminder's save, and a
+relay all run first. The pre-016 arguments `every_seconds`, `in_seconds`,
+and `start_at` are refused with the names that replace them and logged as
+`jobs.legacy_arguments_refused`, because old calls stay in history for two
+weeks and the model may copy one. When the person's message names a clock
+time ("8:53pm", "at 8", "7:05", "noon") and the turn still saved or staged
+a `job_create` or `relay` with `delay` and no `at`, the
+channel logs `jobs.delay_with_named_clock` with the agent and tool, not the
+text. Nothing is refused; the log shows how often the model does that
+arithmetic before anyone decides to refuse it. `job_reschedule` takes the same `at`,
+`every_days`, and `every_minutes`. Only a new repeat leaves the next run
+where it is and re-anchors the grid on it, so moving the December 7
+reminder to weekly keeps December 7 at 8:00 AM, and asking for the repeat
+it already has moves nothing. A whole-day job that only changes its days
+keeps its stored hour, and a job becomes whole-day only with an `at`, by
+the same rule. A new `at` is the next run. A bare hour on a whole-day or
+one-time job keeps the date of the stored next run, or the day after once
+that hour has passed there; a `day` or `date` moves the date; on a minute
+repeat a bare hour is the next time the clock shows it, as in
+`job_create`. The Signal reply starts with the time the server stored
 and the name to cancel, then the rest of the model's answer; the tool result
 tells the model not to restate the time, and an answer that names any other
 clock time is dropped. A turn that fails after the save cancels that
@@ -253,9 +320,21 @@ reminder, and the runner skips a reminder until the turn or the yes that
 saved it has ended, so it cannot reach the phone before that reply.
 `once` cancels the job after that send, and it has to say `verbatim` true
 or false; a default would turn a one-time digest into a text that skips the
-yes. `every_seconds` is the gap after
-the first run, at least 60 seconds, with no maximum. Nothing is sent before
-that first run. A reminder has to name it, with `in_seconds` or `start_at`.
+yes. A one-time job has no repeat. `every_days` or `every_minutes` is the
+gap after the first run, at least a minute, with no maximum. Nothing is
+sent before that first run. A reminder has to name it, with `at` or
+`delay`; a minute repeat with neither starts one gap from now.
+A first run named with `at` that passed between the preview and the yes
+is not refused at the yes. A repeating job or relay starts at its next
+slot on the same grid ("Today at 8:00 AM had passed when you said yes; I
+will text you tomorrow at 8:00 AM ..."). A one-time reminder or relay
+that is no more than `staging_ttl_seconds` plus a minute late, the most a
+live preview allows, goes out at the yes: the reminder is saved due now
+for the runner, the relay is sent by its handler as an untimed one is,
+and the sentence says the named time had passed. Anything later is
+refused with that sentence. A confirmed `job_reschedule` whose new `at`
+passed follows the same rule. Outside a yes, a passed `at` is refused as
+before.
 A job cannot be an instruction to create another job; that check applies to
 digests, because a reminder's sentence is texted and never run. A watch
 cannot be a reminder. A digest, which writes its own report, still waits for a yes. A
@@ -271,15 +350,26 @@ restart inside that window can repeat one. A second message whose name is
 the default gets the next free name. A reminder's Signal text is the
 stored sentence alone.
 
+Every household time the model or the person reads is put into words by
+`clock.py`, and only there; `tests/test_invariants.py` fails on a
+`strftime`, `fromtimestamp`, or `replace(tzinfo=` elsewhere that does not
+name UTC. No Unix number reaches the model. `job_create` returns
+`first_run` ("Thursday, December 10 at 8:00 AM"), `repeats`, and a `say`
+sentence for every job, not only reminders. `job_list` returns `next_run`,
+`repeats`, and `ends` for a watch. `job_reschedule` returns `next_run`,
+`repeats`, and a `say` sentence, and `job_cancel`'s `say` names the run
+that will not happen. After a yes the person is shown those `say`
+sentences. `calendar_today` adds `day`, the date with its weekday and
+"today", "tomorrow", or "yesterday", so a date read in the wrong zone is
+visible. The system prompt's clock and `get_time` give the local wall time
+and weekday from the same module.
+
 Each job row stores its schedule in the household zone
 ([decision 0002](decisions/0002-daily-repeats-keep-local-time.md)): the
 zone, an anchor (the instant of the first scheduled run), and either a
-number of days with the local time `HH:MM`, or a gap in seconds. A gap of
-whole days is stored as days at the clock time the person named for the
-first run, or that run's clock time when they named none, so it can keep
-that hour across daylight saving. A named time the spring change skips
-resolves to an instant an hour later, and the stored time is still the
-named one, so only that first day runs late. Any other gap is elapsed time. A
+number of days with the local time `HH:MM`, or a gap in seconds.
+`every_days` is stored as days at the clock time named in `at`, so it keeps
+that hour across daylight saving. `every_minutes` is elapsed time. A
 one-time job has an anchor and no repeat. `next_run_at` stays as the cached
 next run the runner polls, and `every_seconds` is still written, as days
 times 86,400 for a whole-day job, so the previous image can step a row

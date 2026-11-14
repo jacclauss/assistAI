@@ -9,12 +9,14 @@ Signal DM; an organizer process is not a Signal identity.
 from __future__ import annotations
 
 import re
+import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from assistai.clock import HouseholdClock, local_text, weekday_of
 from assistai.config import Settings
 from assistai.errors import HouseholdConfigError
 from assistai.signal.numbers import InvalidNumberError, normalize_e164
@@ -93,17 +95,23 @@ def local_agent(name: str, *, tools: tuple[str, ...] = ("get_time",)) -> AgentSp
     )
 
 
-def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
-    """Identity the model sees. Distinct per agent so routing is observable."""
+def system_prompt_for(
+    agent: AgentSpec, *, timezone: str = "", now: Callable[[], float] | None = None
+) -> str:
+    """Identity the model sees. Distinct per agent so routing is observable.
+
+    ``now`` is the wall clock unless an eval case stops it, so the prompt's
+    local time and the case's ``get_time`` name the same moment.
+    """
     return (
         f"You are AssistAI agent '{agent.name}', a concise household assistant. "
-        + _local_clock(timezone)
+        + _local_clock(timezone, now)
         + (
             "If they ask to remind, text, or tell the other person, now or later, "
             "call relay before you answer. "
             "'Remind them in 2 minutes that the reminders are working' is relay with "
-            "body 'Reminders are now working.' and in_seconds 120. "
-            "A named time uses start_at after get_time in this turn. "
+            "body 'Reminders are now working.' and delay with minutes 2. "
+            "A named time uses at after get_time in this turn. "
             "job_create only texts the person in this chat. "
             "Do not say reminders only work for you. "
             "If an earlier reply said that, it was wrong. "
@@ -121,7 +129,7 @@ def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
         )
         + (
             " When they want to tell the other person something, including later, "
-            "draft it and call relay with in_seconds or start_at. "
+            "draft it and call relay with delay or at. "
             "Do not ask them to write the exact message. "
             "Nothing is sent until they reply yes. Yes stores the text and it "
             "goes out at that time. Omitting the time sends it as soon as they say yes."
@@ -154,18 +162,21 @@ def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
             "It is saved immediately. Do not ask them to reply yes, and do not "
             "say it is only proposed. The prompt is the exact Signal text, such as "
             "'Don't forget to put the cleaner in the pool.' "
-            "For a delay ('in two minutes', 'in 50 days'), set in_seconds and omit "
-            "start_at. Do not invent a clock time. "
-            "For a named clock time, call get_time and read its result before "
-            "job_create, then set start_at to local ISO-8601 with no timezone "
-            "suffix, taken from get_time's local "
-            f"field, in {timezone or 'the household timezone'}. "
-            "A start_at sent before that result is rejected and nothing is saved. "
-            "Call job_create again after get_time. Do not ask them what time. "
-            "A repeating check with no named hour, such as every morning, is "
-            "verbatim false, every_seconds 86400, and no start_at. "
-            "For a repeating reminder, set once false, verbatim true, and "
-            "every_seconds to the gap after the first run. "
+            "Copy their words for the time into at: day for 'tomorrow' or a "
+            "weekday, date (YYYY-MM-DD) for a calendar date, and neither for a "
+            "bare hour such as 'at 8'. Call get_time and read its result before "
+            "any call with at, in "
+            f"{timezone or 'the household timezone'}. "
+            "An at sent before that result is rejected and nothing is saved. "
+            "Call job_create again after get_time. "
+            "Use delay only for a duration they said ('in two minutes', 'in 50 days'). "
+            "Do not invent a clock time, and do not turn a clock time into a delay. "
+            "A daily or weekly job is every_days with at, and it keeps that time of "
+            "day. If they did not name the time of day, such as every morning, ask "
+            "them what time and call no tool until they answer. "
+            "For a repeating reminder, set once false, verbatim true, at for the "
+            "first text, and every_days for the days between texts. every_minutes "
+            "is for a gap of minutes or hours, and may start with delay. "
             "Nothing is sent before that first text. "
             "Do not create a job whose prompt creates another job. "
             "The time you tell them is the tool's say field. Do not calculate one. "
@@ -177,7 +188,7 @@ def system_prompt_for(agent: AgentSpec, *, timezone: str = "") -> str:
     )
 
 
-def _local_clock(timezone: str) -> str:
+def _local_clock(timezone: str, now: Callable[[], float] | None) -> str:
     """Fresh each turn. A cached prompt is how a guessed clock survives."""
     if not timezone:
         return ""
@@ -185,8 +196,10 @@ def _local_clock(timezone: str) -> str:
         zone = ZoneInfo(timezone)
     except ZoneInfoNotFoundError:
         return ""
-    local = datetime.now(zone).strftime("%Y-%m-%dT%H:%M:%S")
-    return f"Local time now is {local} in {timezone}. "
+    instant = now() if now is not None else time.time()
+    clock = HouseholdClock(zone=zone, now=lambda: instant)
+    local = local_text(instant, clock=clock)
+    return f"Local time now is {local}, a {weekday_of(clock.today())}, in {timezone}. "
 
 
 def resolve_household_path(settings: Settings) -> Path:

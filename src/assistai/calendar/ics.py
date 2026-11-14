@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from icalendar import Calendar, Event
 
@@ -11,8 +10,13 @@ from assistai.calendar.draft import CalendarDraft
 from assistai.errors import CalendarError
 
 
-def render_event(draft: CalendarDraft, *, uid: str, zone: ZoneInfo, stamp: datetime) -> str:
-    """ICS for ``draft``. All-day end is stored as the exclusive next day."""
+def render_event(draft: CalendarDraft, *, uid: str, stamp: datetime) -> str:
+    """ICS for ``draft``. All-day end is stored as the exclusive next day.
+
+    A timed event is written as the instants the draft holds. Reading a
+    floating time again here is how a skipped hour reached the calendar as
+    one the person never said (F-3).
+    """
     calendar = Calendar()
     calendar.add("prodid", "-//AssistAI//EN")
     calendar.add("version", "2.0")
@@ -24,8 +28,10 @@ def render_event(draft: CalendarDraft, *, uid: str, zone: ZoneInfo, stamp: datet
         event.add("dtstart", _day(draft.start))
         event.add("dtend", _day(draft.end) + timedelta(days=1))
     elif isinstance(draft.start, datetime) and isinstance(draft.end, datetime):
-        event.add("dtstart", _aware(draft.start, zone).astimezone(UTC))
-        event.add("dtend", _aware(draft.end, zone).astimezone(UTC))
+        if draft.start.tzinfo is None or draft.end.tzinfo is None:
+            raise CalendarError("a timed event needs the household zone")
+        event.add("dtstart", draft.start.astimezone(UTC))
+        event.add("dtend", draft.end.astimezone(UTC))
     else:
         raise CalendarError("start needs a time")
     if draft.location:
@@ -43,9 +49,3 @@ def _day(value: date | datetime) -> date:
     if isinstance(value, datetime):
         return value.date()
     return value
-
-
-def _aware(moment: datetime, zone: ZoneInfo) -> datetime:
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=zone)
-    return moment.astimezone(zone)

@@ -1,8 +1,14 @@
-# PRD success: a daily email job can be created from Signal; it stages first.
+# PRD success: a daily email job can be created from Signal. With no hour
+# named, the assistant asks what time and creates nothing (spec 016, AC2a).
+# This reverses 0.1.8, where asking was graded as a failure. The clock is
+# 9:12 PM, when the same request once saved a job that ran at 9:12 PM (C-2).
 id = "job-morning-email"
 tags = ["jobs", "staging", "regression"]
 user = "Every morning, check my email and tell me if anything important came in."
+now = 2026-10-30T21:12:00
+timezone = "America/Chicago"
 
 [expect]
-staged = ["job_create"]
-no_staged = ["mail_file", "relay"]
+no_calls = ["job_create"]
+no_staged = ["job_create", "mail_file", "relay"]
+reply_contains = ["time"]
